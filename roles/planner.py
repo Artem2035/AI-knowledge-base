@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from gemini.client import GeminiClient
+from llm.base import LLMClient
 from gemini.schemas import PlanOutput
 from storage.models import Plan, Subtopic, Task, TaskStatus
 
@@ -17,7 +17,7 @@ SYSTEM_INSTRUCTION = (
 )
 
 
-def build_plan(task: Task, client: GeminiClient, status: TaskStatus) -> Plan:
+def build_plan(task: Task, client: LLMClient, status: TaskStatus) -> Plan:
     prompt = (
         f"Запрос пользователя: {task.raw_query!r}\n\n"
         "Построй план исследования этой темы: 5-9 подтем, покрывающих тему "

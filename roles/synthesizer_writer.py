@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from gemini.client import GeminiClient
+from llm.base import LLMClient
 from gemini.schemas import SynthesisOutput
 from storage.models import (
     DraftNote,
@@ -45,7 +45,7 @@ def synthesize_and_write(
     evidence: list[Evidence],
     sources: list[SourceCandidate],
     existing_notes: list[ExistingNote],
-    client: GeminiClient,
+    client: LLMClient,
     status: TaskStatus,
     default_folder: str,
 ) -> tuple[list[DraftNote], list[Relationship]]:

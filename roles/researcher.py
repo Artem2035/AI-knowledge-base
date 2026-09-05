@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from gemini.client import GeminiClient
+from llm.base import LLMClient
 from gemini.schemas import SourceSelectionOutput
 from storage.models import Plan, SourceCandidate, TaskStatus
 from tools.web_fetch import fetch_clean_text
@@ -37,7 +37,7 @@ def collect_raw_candidates(
 
 def select_relevant_sources(
     candidates: list[SourceCandidate],
-    client: GeminiClient,
+    client: LLMClient,
     status: TaskStatus,
     max_per_subtopic: int,
 ) -> list[SourceCandidate]:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from gemini.client import GeminiClient
+from llm.base import LLMClient
 from gemini.schemas import DedupDecisionOutput
 from retrieval.search import RetrievalHit, VaultSearcher
 from storage.models import Evidence, ExistingNote, Plan, TaskStatus
@@ -21,7 +21,7 @@ def find_existing_notes_for_plan(
     plan: Plan,
     evidence: list[Evidence],
     searcher: VaultSearcher,
-    client: GeminiClient,
+    client: LLMClient,
     status: TaskStatus,
     high_threshold: float,
     low_threshold: float,
@@ -68,7 +68,7 @@ def find_existing_notes_for_plan(
 
 
 def _resolve_ambiguous(
-    concept: str, note: ExistingNote, client: GeminiClient, status: TaskStatus
+    concept: str, note: ExistingNote, client: LLMClient, status: TaskStatus
 ) -> str:
     prompt = (
         f"Новая концепция из исследования: {concept!r}\n\n"

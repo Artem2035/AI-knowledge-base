@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import logging
 
-from gemini.client import GeminiClient
 from gemini.schemas import EvidenceBatchOutput
+from llm.base import LLMClient
 from llm.groq_client import GroqPromptTooLargeError, GroqSchemaError, _estimate_tokens
 from storage.models import Evidence, Plan, SourceCandidate, TaskStatus
 
@@ -32,7 +32,7 @@ _MAX_SPLIT_DEPTH = 2
 def extract_evidence_from_source(
     source: SourceCandidate,
     plan: Plan,
-    client: GeminiClient,
+    client: LLMClient,
     status: TaskStatus,
     max_chars: int = 8000,
 ) -> list[Evidence]:
@@ -85,7 +85,7 @@ def extract_evidence_from_source(
 
 def _resolve_chunk_char_budget(
     *,
-    client: GeminiClient,
+    client: LLMClient,
     plan: Plan,
     source: SourceCandidate,
     concepts: str,
@@ -160,7 +160,7 @@ def _extract_from_chunk(
     source: SourceCandidate,
     plan: Plan,
     concepts: str,
-    client: GeminiClient,
+    client: LLMClient,
     status: TaskStatus,
     depth: int,
 ) -> list[Evidence]:
@@ -220,7 +220,7 @@ def _split_and_retry(
     source: SourceCandidate,
     plan: Plan,
     concepts: str,
-    client: GeminiClient,
+    client: LLMClient,
     status: TaskStatus,
     depth: int,
 ) -> list[Evidence]:
