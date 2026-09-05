@@ -1,0 +1,37 @@
+[project]
+name = "obsidian-ai-kb"
+version = "0.1.0"
+description = "Персональная AI-система управления знаниями для Obsidian (Gemini Free Tier only)"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "google-genai>=0.3.0",
+    "openai>=1.30",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "python-dotenv>=1.0",
+    "typer>=0.12",
+    "rich>=13.7",
+    "ddgs>=9.0",
+    "httpx>=0.27",
+    "trafilatura>=1.9",
+    "tenacity>=8.2",
+    "python-frontmatter>=1.1",
+    "PyYAML>=6.0",
+    "markdown-it-py>=3.0",
+    "rank-bm25>=0.2.2",
+    "sentence-transformers>=3.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.14",
+]
+
+[project.scripts]
+obsidian-ai-kb = "cli.main:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

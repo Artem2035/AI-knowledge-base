@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.obsidian_ai_kb/
+*.sqlite3
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.DS_Store
