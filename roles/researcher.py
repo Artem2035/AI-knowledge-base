@@ -7,6 +7,7 @@ from gemini.schemas import SourceSelectionOutput
 from storage.models import Plan, SourceCandidate, TaskStatus
 from tools.web_fetch import fetch_clean_text
 from tools.web_search import deduplicate_by_url, search_web
+from llm.chunking import split_items_into_batches
 
 logger = logging.getLogger(__name__)
 
@@ -41,41 +42,65 @@ def select_relevant_sources(
     status: TaskStatus,
     max_per_subtopic: int,
 ) -> list[SourceCandidate]:
-    """1 Gemini-вызов на отбор релевантных источников из уже собранных кандидатов."""
+    """Отбор релевантных источников. Кандидаты делятся на батчи под
+    доступный TPM-бюджет клиента (см. llm/chunking.py) — так мы не теряем
+    хвост списка при авто-обрезке промпта, как это было раньше при
+    большом количестве кандидатов. Каждый батч — отдельный вызов
+    generate_structured; индекс в ответе локальный для батча и
+    резолвится обратно через сам объект-кандидат (без глобального offset,
+    т.к. каждый батч — это свой list[SourceCandidate])."""
     if not candidates:
         return []
 
-    listing = "\n".join(
-        f"[{i}] Подтема: {c.subtopic}\nЗаголовок: {c.title}\nСниппет: {c.snippet}\nURL: {c.url}\n"
-        for i, c in enumerate(candidates)
-    )
-    prompt = (
-        f"Список кандидатов-источников (индекс в квадратных скобках):\n\n{listing}\n\n"
+    static_overhead = (
+        "Список кандидатов-источников (индекс в квадратных скобках):\n\n\n\n"
         "Верни для каждого источника, который стоит оставить, его индекс, "
         "relevance_score и keep=true. Источники с keep=false можно не включать в ответ."
     )
-    output: SourceSelectionOutput = client.generate_structured(
-        role="researcher_selection",
-        prompt=prompt,
-        response_model=SourceSelectionOutput,
-        status=status,
+
+    def _render(c: SourceCandidate) -> str:
+        return f"[0] Подтема: {c.subtopic}\nЗаголовок: {c.title}\nСниппет: {c.snippet}\nURL: {c.url}\n"
+
+    batches = split_items_into_batches(
+        candidates,
+        client=client,
         system_instruction=SYSTEM_INSTRUCTION,
+        response_model=SourceSelectionOutput,
+        render_item=_render,
+        static_overhead_text=static_overhead,
     )
+
+    kept: list[SourceCandidate] = []
+    for batch in batches:
+        listing = "\n".join(
+            f"[{i}] Подтема: {c.subtopic}\nЗаголовок: {c.title}\nСниппет: {c.snippet}\nURL: {c.url}\n"
+            for i, c in enumerate(batch)
+        )
+        prompt = (
+            f"Список кандидатов-источников (индекс в квадратных скобках):\n\n{listing}\n\n"
+            "Верни для каждого источника, который стоит оставить, его индекс, "
+            "relevance_score и keep=true. Источники с keep=false можно не включать в ответ."
+        )
+        output: SourceSelectionOutput = client.generate_structured(
+            role="researcher_selection",
+            prompt=prompt,
+            response_model=SourceSelectionOutput,
+            status=status,
+            system_instruction=SYSTEM_INSTRUCTION,
+        )
+        for item in output.items:
+            if item.keep and 0 <= item.index < len(batch):
+                cand = batch[item.index]
+                cand.relevance_score = item.relevance_score
+                kept.append(cand)
 
     selected: list[SourceCandidate] = []
     by_subtopic_count: dict[str, int] = {}
-    kept_items = sorted(
-        (item for item in output.items if item.keep and 0 <= item.index < len(candidates)),
-        key=lambda it: it.relevance_score,
-        reverse=True,
-    )
-    for item in kept_items:
-        cand = candidates[item.index]
+    for cand in sorted(kept, key=lambda c: c.relevance_score, reverse=True):
         count = by_subtopic_count.get(cand.subtopic, 0)
         if count >= max_per_subtopic:
             continue
         cand.selected = True
-        cand.relevance_score = item.relevance_score
         selected.append(cand)
         by_subtopic_count[cand.subtopic] = count + 1
 
