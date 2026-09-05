@@ -49,6 +49,18 @@ python -m cli.main pending
 
 # Применить (после ручной проверки!) изменения к реальному Vault
 python -m cli.main approve <task_id>
+
+python -m cli.main ask "Изучи тему RAG"
+  → останавливается на лимите
+  → "Продолжить: python -m cli.main resume <task_id>"
+
+python -m cli.main in-progress
+  → список: этап, попыток, обработано источников, всего вызовов Gemini
+
+python -m cli.main resume <task_id>
+  → пропускает planning/researching/fetching (уже посчитано)
+  → в extraction пропускает уже обработанные источники
+  → продолжает с первого недоделанногоs
 ```
 
 **Важно**: команда `ask` НИКОГДА не пишет в реальный Vault. Она доводит

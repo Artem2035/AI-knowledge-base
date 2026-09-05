@@ -8,8 +8,10 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from config.settings import get_settings
-from orchestrator.state_machine import Orchestrator
+
+from orchestrator.state_machine import Orchestrator, OrchestratorStopped
 from staging.changeset import list_pending_tasks, load_changeset, staging_task_dir
+from staging.checkpoint import list_resumable_tasks
 from staging.commit import commit_changeset
 from staging.diff import render_diff_summary
 
@@ -19,34 +21,27 @@ console = Console()
 logging.basicConfig(level=logging.WARNING)
 
 
-@app.command()
-def ask(query: str = typer.Argument(..., help="Запрос на естественном языке, напр. 'Изучи тему RAG'")):
-    """Запустить полный workflow: анализ -> план -> исследование -> ... -> staging."""
-    settings = get_settings()
-    orch = Orchestrator(settings)
+def _run_and_report(orch: Orchestrator, *, raw_query: str | None, resume_task_id: str | None, settings) -> None:
+    """Общая логика запуска (новая задача или resume) + единый вывод
+    результата в консоль. Вынесена из ask()/resume(), чтобы поведение не
+    расходилось между двумя командами."""
 
-    console.print(Panel(f"Задача: {query}", title="obsidian-ai-kb", style="cyan"))
-
-    def progress_cb(stage: str, _p={"task": None, "prog": None}):
+    def progress_cb(stage: str):
         console.print(f"[dim]→[/dim] {stage}")
 
     try:
         with console.status("Выполняется…", spinner="dots"):
-            result = orch.run(query, progress_cb=progress_cb)
+            result = orch.run(
+                raw_query=raw_query, resume_task_id=resume_task_id, progress_cb=progress_cb
+            )
     finally:
         orch.close()
 
     if result.stopped:
+        console.print(Panel(result.message, title="⏸ Задача остановлена", style="yellow"))
         console.print(
-            Panel(
-                result.message,
-                title="⏸ Задача остановлена",
-                style="yellow",
-            )
-        )
-        console.print(
-            f"Прогресс сохранён локально (потрачено вызовов Gemini: "
-            f"{result.status.gemini_calls_used}/{settings.max_gemini_calls_per_task})."
+            f"Потрачено вызовов Gemini за эту сессию: "
+            f"{result.status.gemini_calls_used}/{settings.max_gemini_calls_per_task}."
         )
         raise typer.Exit(code=2)
 
@@ -64,6 +59,51 @@ def ask(query: str = typer.Argument(..., help="Запрос на естеств�
     console.print(
         f"Чтобы применить изменения к реальному Vault: "
         f"[bold]python -m cli.main approve {result.task_id}[/bold]"
+    )
+
+
+@app.command()
+def ask(query: str = typer.Argument(..., help="Запрос на естественном языке, напр. 'Изучи тему RAG'")):
+    """Запустить полный workflow: анализ -> план -> исследование -> ... -> staging."""
+    settings = get_settings()
+    orch = Orchestrator(settings)
+
+    console.print(Panel(f"Задача: {query}", title="obsidian-ai-kb", style="cyan"))
+    _run_and_report(orch, raw_query=query, resume_task_id=None, settings=settings)
+
+
+@app.command()
+def resume(task_id: str = typer.Argument(..., help="task_id остановленной задачи (см. 'resumable')")):
+    """Продолжить ранее остановленную (по лимиту Gemini) задачу с последнего
+    сохранённого шага — без повторного прохождения уже сделанной работы."""
+    settings = get_settings()
+    orch = Orchestrator(settings)
+
+    console.print(Panel(f"Продолжение задачи: {task_id}", title="obsidian-ai-kb", style="cyan"))
+
+    try:
+        _run_and_report(orch, raw_query=None, resume_task_id=task_id, settings=settings)
+    except OrchestratorStopped as exc:
+        console.print(Panel(str(exc), title="Не удалось продолжить", style="red"))
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def resumable():
+    """Показать задачи, остановленные по лимиту Gemini и доступные для resume."""
+    settings = get_settings()
+    checkpoints = list_resumable_tasks(settings.checkpoint_dir)
+    if not checkpoints:
+        console.print("Нет задач, ожидающих продолжения.")
+        return
+    for cp in checkpoints:
+        preview = cp.raw_query if len(cp.raw_query) <= 60 else cp.raw_query[:57] + "…"
+        console.print(
+            f"- [bold]{cp.task_id}[/bold]  шаг: {cp.last_completed_stage}  "
+            f"«{preview}»  (всего потрачено Gemini-вызовов: {cp.total_gemini_calls_used})"
+        )
+    console.print(
+        "\nПродолжить: [bold]python -m cli.main resume <task_id>[/bold]"
     )
 
 

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "task_id": "9fbe92730264",
+  "raw_query": "изучи тему pyenv и виртуальное окружение в python",
+  "language": "ru",
+  "last_completed_stage": "created",
+  "status": {
+    "task_id": "9fbe92730264",
+    "stage": "started",
+    "gemini_calls_used": 0,
+    "gemini_calls_log": [],
+    "stopped_reason": null,
+    "finished": false
+  },
+  "total_gemini_calls_used": 0,
+  "plan": null,
+  "raw_candidates_done": false,
+  "raw_candidates": [],
+  "sources_selected_done": false,
+  "selected_sources": [],
+  "sources_fetched_done": false,
+  "fetched_sources": [],
+  "extraction_done": false,
+  "extracted_source_ids": [],
+  "evidence": [],
+  "vault_analysis_done": false,
+  "existing_notes": [],
+  "synthesis_done": false,
+  "drafts": [],
+  "relationships": [],
+  "updated_at": "2026-09-05T21:20:58.788126+00:00"
+}
