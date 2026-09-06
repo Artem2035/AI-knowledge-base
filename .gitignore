@@ -8,4 +8,4 @@ __pycache__/
 venv/
 *.egg-info/
 .DS_Store
-staging/*/*.json
+checkpoints/*.json

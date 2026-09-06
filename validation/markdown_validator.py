@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from markdown_it import MarkdownIt
-from storage.models import DraftNote, ValidationIssue
+from storage.models import DraftNote, ValidationIssue, NoteAction
 
 _md = MarkdownIt("commonmark")
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)

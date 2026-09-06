@@ -54,7 +54,7 @@ python -m cli.main ask "Изучи тему RAG"
   → останавливается на лимите
   → "Продолжить: python -m cli.main resume <task_id>"
 
-python -m cli.main in-progress
+python -m cli.main resumable
   → список: этап, попыток, обработано источников, всего вызовов Gemini
 
 python -m cli.main resume <task_id>
