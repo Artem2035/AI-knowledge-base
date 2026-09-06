@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     git_enabled: bool = Field(default=False)
     max_sources_per_subtopic: int = Field(default=4, ge=1)
     max_search_results_per_query: int = Field(default=6, ge=1)
-    checkpoint_dir:Path = Field(default=Path("./staging/1"))
+    checkpoint_dir:Path = Field(default=Path("./staging/checkpoints"))
 
     @field_validator("vault_path", "workdir", "staging_dir", "db_path", mode="before")
     @classmethod

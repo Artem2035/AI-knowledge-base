@@ -14,8 +14,12 @@ import yaml
 from storage.models import DraftNote
 
 _INVALID_FS_CHARS = re.compile(r'[\\/:*?"<>|#^\[\]]')
+_NESTED_WIKILINK_RE = re.compile(r'\[{2,}([^\[\]]+)\]{2,}')
 
-
+_DASH_VARIANTS = {
+    "\u2010": "-", "\u2011": "-", "\u2012": "-",
+    "\u2013": "-", "\u2014": "-", "\u2015": "-",
+}
 def slugify_filename(title: str) -> str:
     """
     Делает безопасное имя файла для Obsidian, сохраняя кириллицу
@@ -53,10 +57,11 @@ def render_markdown(draft: DraftNote) -> str:
     if draft.source_refs:
         fm.setdefault("sources", draft.source_refs)
 
-    parts = [render_frontmatter(fm), "\n", draft.body_md.strip(), "\n"]
+    body = sanitize_wikilinks(draft.body_md.strip())
+    parts = [render_frontmatter(fm), "\n", body, "\n"]
 
     if draft.links_out:
-        related = "\n".join(f"- [[{t}]]" for t in draft.links_out)
+        related = "\n".join(f"- [[{sanitize_wikilinks(t)}]]" for t in draft.links_out)
         parts.append(f"\n## Связанные заметки\n\n{related}\n")
 
     return "".join(parts)
@@ -75,3 +80,27 @@ def insert_wikilinks(body_md: str, titles_to_link: list[str]) -> str:
         pattern = re.compile(rf"(?<!\[)\b{re.escape(title)}\b(?!\])")
         result, n = pattern.subn(f"[[{title}]]", result, count=1)
     return result
+
+def sanitize_wikilinks(text: str) -> str:
+    """Убирает случайное дублирование скобок ([[[[X]]]] -> [[X]]),
+    которое иногда генерирует LLM при вложенной подстановке шаблона ссылки."""
+    if not text:
+        return text
+    previous = None
+    result = text
+    # применяем повторно на случай тройной/четверной вложенности
+    while previous != result:
+        previous = result
+        result = _NESTED_WIKILINK_RE.sub(r'[[\1]]', result)
+    return result
+
+
+def normalize_link_title(title: str) -> str:
+    """Нормализует заголовок для СРАВНЕНИЯ ссылок с реальными файлами:
+    NFC-нормализация + унификация вариантов дефиса/тире. НЕ используется
+    для отображения — только чтобы понять, ссылается ли LLM на уже
+    существующую заметку под слегка другим написанием дефиса."""
+    normalized = unicodedata.normalize("NFC", title).strip()
+    for variant, replacement in _DASH_VARIANTS.items():
+        normalized = normalized.replace(variant, replacement)
+    return normalized

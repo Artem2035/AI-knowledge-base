@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from storage.models import DraftNote, NoteAction
-from tools.markdown_tools import render_markdown
+from tools.markdown_tools import render_markdown, sanitize_wikilinks
 
 
 @dataclass
@@ -53,7 +53,7 @@ class VaultWriter:
 
             if draft.append_section:
                 existing = full_path.read_text(encoding="utf-8")
-                new_content = existing.rstrip() + "\n\n" + draft.append_section.strip() + "\n"
+                new_content = existing.rstrip() + "\n\n" + sanitize_wikilinks(draft.append_section.strip()) + "\n"
                 full_path.write_text(new_content, encoding="utf-8")
             else:
                 full_path.write_text(render_markdown(draft), encoding="utf-8")

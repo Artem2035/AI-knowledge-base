@@ -14,7 +14,7 @@ from storage.models import (
     SourceCandidate,
     TaskStatus,
 )
-from tools.markdown_tools import build_note_path
+from tools.markdown_tools import build_note_path, normalize_link_title, sanitize_wikilinks
 
 SYSTEM_INSTRUCTION = (
     "Ты одновременно выполняешь роли Synthesizer и Obsidian Writer. "
@@ -33,10 +33,21 @@ SYSTEM_INSTRUCTION = (
     "— их не переводить). Каждая заметка должна ссылаться на источники в "
     "своём содержании (упоминать откуда факт), но НЕ копировать текст "
     "источника дословно — только пересказ своими словами."
-    
     "Для action=create обязательно верни body_md с полным содержимым новой заметки."
     "Для action=update обязательно верни existing_path и append_section с новым материалом."
     "Для action=update поле body_md можно не возвращать: существующее содержимое заметки необходимо сохранить без переписывания."
+    "Правила по ссылкам: используй заголовок существующей заметки ТОЧНО "
+    "так, как он дан в списке существующих заметок (включая дефисы). "
+    "Ссылку на ЕЩЁ НЕ созданную заметку ([[Новая тема]]) добавляй только "
+    "для действительно самостоятельной темы, которая может стать отдельной "
+    "группой заметок — не для каждого незнакомого термина и не для "
+    "терминов, являющихся составной частью текущей темы. "
+    "Правила по объёму: каждая заметка с action=create должна содержать "
+    "минимум 3 содержательных абзаца (не считая заголовков/фронтматтера); "
+    "если материал по смежным подтемам умещается в 1 абзац каждый — "
+    "объедини его в ОДНУ заметку со структурой из подзаголовков, а не "
+    "создавай несколько коротких заметок. Где уместно, добавляй примеры "
+    "кода с указанием языка (```python, ```cmd, ```json и т.д.)."
 )
 
 
@@ -79,6 +90,14 @@ def synthesize_and_write(
         system_instruction=SYSTEM_INSTRUCTION,
     )
 
+    # Карта "нормализованный заголовок" -> "точное написание в Vault",
+    # чтобы поймать случаи вроде разных Unicode-дефисов в
+    # заметках и снапнуть ссылку на реальное имя файла, а не флагать её
+    # как битую.
+    existing_by_normalized = {
+        normalize_link_title(n.title): n.title for n in existing_notes
+    }
+
     now_iso = datetime.now(timezone.utc).date().isoformat()
     drafts: list[DraftNote] = []
     for note_out in output.notes:
@@ -100,6 +119,12 @@ def synthesize_and_write(
             path = build_note_path(note_out.folder or default_folder, note_out.title)
             action = NoteAction.CREATE
 
+        links_out_fixed = []
+        for raw_link in note_out.links_out:
+            link = sanitize_wikilinks(raw_link).strip()
+            canonical = existing_by_normalized.get(normalize_link_title(link))
+            links_out_fixed.append(canonical or link)
+
         drafts.append(
             DraftNote(
                 action=action,
@@ -107,13 +132,20 @@ def synthesize_and_write(
                 title=note_out.title,
                 folder=note_out.folder or default_folder,
                 frontmatter=frontmatter,
-                body_md=note_out.body_md,
+                body_md=sanitize_wikilinks(note_out.body_md),
                 tags=note_out.tags,
-                links_out=note_out.links_out,
+                links_out=links_out_fixed,
                 source_refs=[s.url for s in sources],
-                append_section=note_out.append_section or None,
+                append_section=sanitize_wikilinks(note_out.append_section) or None,
             )
         )
+
+    draft_titles_normalized = {normalize_link_title(d.title): d.title for d in drafts}
+    for d in drafts:
+        d.links_out = [
+            draft_titles_normalized.get(normalize_link_title(t), existing_by_normalized.get(normalize_link_title(t), t))
+            for t in d.links_out
+        ]
 
     relationships = _build_relationships(drafts)
     return drafts, relationships
