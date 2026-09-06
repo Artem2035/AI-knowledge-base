@@ -31,6 +31,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from gemini.schemas import NotePlanOutput
 from storage.models import (
     DraftNote,
     Evidence,
@@ -91,7 +92,13 @@ class TaskCheckpoint(BaseModel):
     existing_notes: list[ExistingNote] = Field(default_factory=list)
 
     synthesis_done: bool = False
-    drafts: list[DraftNote] = Field(default_factory=list)
+    # Map-reduce: шаг 1 (план заметок) и шаг 2 (запись по одной заметке)
+    # персистятся отдельно — резюм не должен пересчитывать ни план, ни уже
+    # написанные заметки (аналогично extracted_source_ids для extraction).
+    note_plan_done: bool = False
+    note_plan: NotePlanOutput | None = None
+    written_note_indices: list[int] = Field(default_factory=list)
+    drafts: list[DraftNote] = Field(default_factory=list)  # накапливается по одной заметке
     relationships: list[Relationship] = Field(default_factory=list)
 
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

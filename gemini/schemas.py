@@ -104,3 +104,22 @@ class DraftNoteOutput(BaseModel):
 
 class SynthesisOutput(BaseModel):
     notes: list[DraftNoteOutput] = Field(default_factory=list)
+
+# ---------------------------------------------------------------------------
+# Synthesizer — Note Planner (шаг 1 map-reduce)
+# ---------------------------------------------------------------------------
+
+class NotePlanItem(BaseModel):
+    title: str
+    action: Literal["create", "update"]
+    existing_path: str = ""  # обязателен при action="update"
+    folder: str = ""
+    # Индексы в списке evidence, переданном в промпте (0-based) — не даём
+    # модели самой формулировать concept-строки для сопоставления, чтобы
+    # избежать рассинхрона между шагом планирования и шагом записи.
+    evidence_indices: list[int] = Field(default_factory=list)
+    tags_hint: list[str] = Field(default_factory=list)
+
+
+class NotePlanOutput(BaseModel):
+    notes: list[NotePlanItem] = Field(default_factory=list)

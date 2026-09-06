@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     free_only: bool = Field(default=True, description="Жёсткий флаг: только бесплатные провайдеры")
 
     # Общий бюджет вызовов на задачу — не зависит от того, какой провайдер активен
-    max_gemini_calls_per_task: int = Field(default=15, ge=1)
+    max_gemini_calls_per_task: int = Field(default=40, ge=1)
     max_gemini_retries: int = Field(default=3, ge=0)
 
     # ---- Vault ----

@@ -237,23 +237,52 @@ class Orchestrator:
                 existing_notes = checkpoint.existing_notes
                 report("Анализ Vault уже выполнен (из чекпоинта) — пропускаем.")
 
-            # -- Synthesis + Writer -----------------------------------------
+            # -- Synthesis (planning) + Writer, map-reduce ------------------
             if not checkpoint.synthesis_done:
-                report("Синтез структуры знаний и написание заметок (Gemini)…")
                 status.stage = "synthesizing"
-                drafts, relationships = synthesizer_writer.synthesize_and_write(
-                    plan,
-                    evidence,
-                    fetched,
-                    existing_notes,
-                    self.gemini,
-                    status,
-                    default_folder=self.settings.default_notes_folder,
+
+                if not checkpoint.note_plan_done:
+                    report("Планирование структуры заметок (Gemini)…")
+                    note_plan = synthesizer_writer.plan_notes(
+                        plan, evidence, existing_notes, self.gemini, status,
+                    )
+                    checkpoint.note_plan = note_plan
+                    checkpoint.note_plan_done = True
+                    persist("note_plan_done")
+                else:
+                    note_plan = checkpoint.note_plan
+                    report("План заметок уже построен (из чекпоинта) — пропускаем.")
+
+                known_titles, title_map = synthesizer_writer.prepare_linking_context(
+                    note_plan, existing_notes
                 )
-                checkpoint.drafts = drafts
-                checkpoint.relationships = relationships
+                already_written = set(checkpoint.written_note_indices)
+                drafts = list(checkpoint.drafts)
+                remaining_items = [
+                    (i, item) for i, item in enumerate(note_plan.notes) if i not in already_written
+                ]
+                if remaining_items and already_written:
+                    report(
+                        f"Пропускаем {len(note_plan.notes) - len(remaining_items)} уже "
+                        "написанных заметок (из чекпоинта)."
+                    )
+                for i, item in remaining_items:
+                    report(f"Написание заметки «{item.title}» (Gemini)…")
+                    draft = synthesizer_writer.write_note(
+                        item, evidence, known_titles, title_map, fetched,
+                        self.gemini, status, default_folder=self.settings.default_notes_folder,
+                    )
+                    drafts.append(draft)
+                    checkpoint.drafts = drafts
+                    checkpoint.written_note_indices.append(i)
+                    # Персист ПОСЛЕ КАЖДОЙ заметки — именно на этом шаге
+                    # теперь самый частый риск упереться в бюджет вызовов.
+                    persist("synthesizing")
+
+                checkpoint.relationships = synthesizer_writer.build_relationships(drafts)
                 checkpoint.synthesis_done = True
                 persist("synthesis_done")
+                relationships = checkpoint.relationships
             else:
                 drafts = checkpoint.drafts
                 relationships = checkpoint.relationships
