@@ -61,6 +61,12 @@ class EvidenceItem(BaseModel):
     statement: str
     confidence: float = Field(ge=0.0, le=1.0)
     is_definition: bool = False
+    # Индекс "единицы" (чанка ОДНОГО источника) в списке, переданном в
+    # промпте текущего батча — позволяет батчить чанки НЕСКОЛЬКИХ разных
+    # источников в одном вызове и корректно приписать каждое утверждение
+    # его настоящему source_id в коде-обвязке (см. roles/extractor_critic.py
+    # :: _to_evidence_list), а не доверять LLM формулировать source_id самой.
+    unit_index: int = 0
     contradicts_indices: list[int] = Field(default_factory=list)
     critic_note: str = ""
 

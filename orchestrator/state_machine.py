@@ -26,7 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from config.settings import Settings
-from llm.factory import budget_limits_for_provider, create_llm_client
+from llm.factory import budget_limits_for_provider, create_llm_client, extraction_budget_limits, \
+    create_extraction_llm_client
 from orchestrator.budget import GeminiBudget, GeminiFreeLimitReached, GeminiTaskBudgetExceeded
 
 from retrieval.search import VaultSearcher
@@ -80,6 +81,20 @@ class Orchestrator:
         # settings.llm_provider — roles/* работают с ним только через
         # generate_structured(...), тип провайдера им не важен.
         self.gemini = create_llm_client(settings, self.budget)
+        # Отдельный клиент+бюджет для extraction (см. llm/factory.py) — на
+        # Groq использует другую модель (compound-mini) с другим TPM/RPD,
+        # поэтому не может делить лимитер с self.gemini. Оба бюджета читают
+        # и пишут в один и тот же status.gemini_calls_used (передаётся при
+        # каждом вызове run()), так что MAX_GEMINI_CALLS_PER_TASK продолжает
+        # работать как ОБЩИЙ потолок на задачу независимо от того, какой из
+        # двух клиентов расходует вызовы.
+        ext_rpm, ext_rpd = extraction_budget_limits(settings)
+        self.extraction_budget = GeminiBudget(
+            max_calls_per_task=settings.max_gemini_calls_per_task,
+            rpm_soft_limit=ext_rpm,
+            rpd_soft_limit=ext_rpd,
+        )
+        self.extraction_client = create_extraction_llm_client(settings, self.extraction_budget)
 
     def close(self) -> None:
         self.db.close()
@@ -184,29 +199,29 @@ class Orchestrator:
                 fetched = checkpoint.fetched_sources
                 report("Тексты источников уже загружены (из чекпоинта) — пропускаем.")
 
-            # -- Extracting: самый "дорогой" шаг — гранулярность по источнику
+            # -- Extracting: батчинг чанков МЕЖДУ источниками, гранулярность
+            # resume — по отдельной единице (чанку одного источника), а не
+            # по источнику целиком (см. roles/extractor_critic.py).
             if not checkpoint.extraction_done:
-                report("Извлечение фактов и проверка (Gemini)…")
+                report("Извлечение фактов и проверка (Gemini/Groq)…")
                 status.stage = "extracting"
-                already_done = set(checkpoint.extracted_source_ids)
+                already_done_units = set(checkpoint.extracted_unit_ids)
                 evidence: list = list(checkpoint.evidence)
-                remaining = [s for s in fetched if s.source_id not in already_done]
-                if remaining and already_done:
-                    report(
-                        f"Пропускаем {len(fetched) - len(remaining)} уже "
-                        "обработанных источников (из чекпоинта)."
-                    )
-                for source in remaining:
-                    source_evidence = extractor_critic.extract_evidence_from_source(
-                        source, plan, self.gemini, status
-                    )
-                    evidence.extend(source_evidence)
+
+                def _on_batch_done(unit_ids: list[str], new_evidence: list) -> None:
+                    evidence.extend(new_evidence)
                     checkpoint.evidence = evidence
-                    checkpoint.extracted_source_ids.append(source.source_id)
-                    # Персист ПОСЛЕ КАЖДОГО источника — именно здесь чаще
-                    # всего происходит остановка по бюджету, и именно тут
-                    # resume даёт наибольший выигрыш.
+                    checkpoint.extracted_unit_ids.extend(unit_ids)
+                    # Персист ПОСЛЕ КАЖДОГО батча — именно здесь чаще всего
+                    # происходит остановка по бюджету.
                     persist("extracting")
+
+                extractor_critic.extract_evidence_from_sources(
+                    fetched, plan, self.extraction_client, status,
+                    already_done_unit_ids=already_done_units,
+                    on_batch_done=_on_batch_done,
+                    max_units_per_source=self.settings.max_chunks_per_source,
+                )
                 checkpoint.extraction_done = True
                 persist("extraction_done")
             else:
