@@ -459,9 +459,20 @@ class GroqClient:
                     # заблокированным на это время, чтобы никто не влез.
                     self._limiter.force_wait(retry_after)
                 raise GroqRateLimitError(str(exc), retry_after=retry_after) from exc
+            if _is_request_too_large_error(exc):
+                #Превращаем в тот жетип ошибки, что и предварительная проверка бюджета —
+                # вызывающий код (extractor_critic) уже умеет на неё
+                # реагировать бисекцией батча, не роняя всю задачу.
+                raise GroqPromptTooLargeError(
+                    f"Groq вернул 413 Request Entity Too Large: {exc}"
+                ) from exc
             raise
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return "429" in text or "rate limit" in text or "rate_limit" in text
+
+def _is_request_too_large_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "413" in text or "request_too_large" in text or "request entity too large" in text
