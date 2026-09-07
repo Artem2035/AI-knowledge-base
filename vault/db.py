@@ -144,6 +144,20 @@ class VaultDB:
     def get_all_paths(self) -> set[str]:
         return {r["path"] for r in self.conn.execute("SELECT path FROM notes").fetchall()}
 
+    def get_distinct_folders(self) -> list[str]:
+        """Список папок (без имени файла), уже встречающихся в индексе
+        Vault — используется Synthesizer-ом (Note Planner), чтобы
+        предлагать переиспользование существующей структуры папок вместо
+        того, чтобы все новые заметки по умолчанию складывались в один
+        плоский default_notes_folder."""
+        rows = self.conn.execute("SELECT path FROM notes").fetchall()
+        folders: set[str] = set()
+        for r in rows:
+            path = r["path"]
+            if "/" in path:
+                folders.add(path.rsplit("/", 1)[0])
+        return sorted(folders)
+
     # -- links -----------------------------------------------------------
 
     def set_links(self, source_path: str, links: list[tuple[str | None, str, str]]) -> None:

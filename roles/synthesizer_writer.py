@@ -15,7 +15,12 @@ from storage.models import (
     SourceCandidate,
     TaskStatus,
 )
-from tools.markdown_tools import build_note_path, normalize_link_title, sanitize_wikilinks
+from tools.markdown_tools import (
+    build_note_path,
+    normalize_link_title,
+    sanitize_wikilinks,
+    strip_wikilink_brackets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,18 +34,31 @@ logger = logging.getLogger(__name__)
 PLAN_SYSTEM_INSTRUCTION = (
     "Ты — Synthesizer (этап планирования) в системе управления знаниями "
     "Obsidian. Тебе даны тема исследования, пронумерованный список "
-    "извлечённых фактов и список существующих заметок Vault, похожих на "
-    "новые концепции (с decision: reuse/extend/distinct). Раздели материал "
-    "на атомарные заметки: одна заметка = одна самостоятельная концепция, "
-    "без избыточного дробления (смежные мелкие подтемы объединяй в одну "
-    "заметку со структурой из подзаголовков). Для каждой заметки укажи: "
-    "заголовок; action='update' И existing_path (ТОЧНО совпадающий с path "
-    "из списка существующих заметок), если для концепции есть существующая "
-    "заметка с decision='reuse' или 'extend' — иначе action='create'; "
-    "evidence_indices — номера фактов из списка, относящихся к этой "
+    "извлечённых фактов, список существующих заметок Vault, похожих на "
+    "новые концепции (с decision: reuse/extend/distinct), список уже "
+    "существующих папок в Vault и папка по умолчанию для этой темы. "
+    "Раздели материал на атомарные заметки: одна заметка = одна "
+    "самостоятельная концепция, без избыточного дробления (смежные мелкие "
+    "подтемы объединяй в одну заметку со структурой из подзаголовков). Для "
+    "каждой заметки укажи:\n"
+    "— title: заголовок ЗАМЕТКИ на РУССКОМ языке (заголовок становится "
+    "именем файла), кроме общепринятых технических терминов и названий "
+    "(например SQL, Python, Windows, Unix, Docker, Git, RAG) — их не "
+    "переводить и не транслитерировать;\n"
+    "— action='update' И existing_path (ТОЧНО совпадающий с path из списка "
+    "существующих заметок), если для концепции есть существующая заметка с "
+    "decision='reuse' или 'extend' — иначе action='create';\n"
+    "— folder: папка внутри Vault для этой заметки. Для action='update' "
+    "обязательно укажи папку СУЩЕСТВУЮЩЕГО файла (часть existing_path до "
+    "последнего '/'). Для action='create' — переиспользуй одну из уже "
+    "существующих папок из списка ниже, если тема заметки ей соответствует; "
+    "если ни одна не подходит — используй папку по умолчанию, указанную в "
+    "запросе. Не придумывай новые папки произвольно, если существующая "
+    "структура уже покрывает тему;\n"
+    "— evidence_indices: номера фактов из списка, относящихся к этой "
     "заметке (каждый релевантный факт должен войти хотя бы в одну заметку, "
-    "один факт может относиться к нескольким заметкам). Здесь НЕ нужно "
-    "писать текст заметки — только план."
+    "один факт может относиться к нескольким заметкам).\n"
+    "Здесь НЕ нужно писать текст заметки — только план."
 )
 
 # ---------------------------------------------------------------------------
@@ -51,10 +69,12 @@ PLAN_SYSTEM_INSTRUCTION = (
 
 WRITE_SYSTEM_INSTRUCTION = (
     "Ты — Obsidian Writer в системе управления знаниями. Тебе дано задание "
-    "написать ОДНУ конкретную заметку по уже составленному плану (заголовок "
-    "и action заданы и не обсуждаются). Для action='create' сформируй "
-    "frontmatter_extra, tags, body_md (минимум 3 содержательных абзаца, "
-    "примеры кода с указанием языка где уместно) и links_out. Для "
+    "написать ОДНУ конкретную заметку по уже составленному плану (заголовок, "
+    "action и папка заданы и не обсуждаются). Для action='create' сформируй "
+    "tags, body_md (минимум 3 содержательных абзаца, примеры кода с "
+    "указанием языка где уместно) и links_out. Свойства заметки (YAML "
+    "frontmatter), кроме title/tags/created, система не использует — не "
+    "пытайся предложить другие. Для "
     "action='update' верни append_section — новый материал для добавления "
     "к существующей заметке (НЕ переписывай и не повторяй существующее "
     "содержимое; body_md можно не возвращать). Пиши на русском языке "
@@ -77,6 +97,8 @@ def plan_notes(
     existing_notes: list[ExistingNote],
     client: LLMClient,
     status: TaskStatus,
+    existing_folders: list[str] | None = None,
+    default_folder: str = "",
 ) -> NotePlanOutput:
     evidence_listing = "\n".join(
         f"[{i}] [{e.concept}] {e.statement}" for i, e in enumerate(evidence)
@@ -86,6 +108,7 @@ def plan_notes(
         f"(похоже на концепцию {n.matched_concept!r}, similarity={n.similarity_score:.2f})"
         for n in existing_notes
     ) or "(похожих существующих заметок не найдено)"
+    folders_listing = "\n".join(f"- {f}" for f in (existing_folders or [])) or "(папок пока нет)"
 
     prompt = (
         f"Тема: {plan.topic_title}\n"
@@ -93,7 +116,11 @@ def plan_notes(
         f"Подтемы: {', '.join(s.title for s in plan.subtopics)}\n\n"
         f"Факты (номер в квадратных скобках):\n{evidence_listing}\n\n"
         f"Существующие заметки в Vault, похожие на новые концепции:\n{existing_listing}\n\n"
-        "Составь план заметок (create/update, заголовки, распределение фактов по индексам)."
+        f"Уже существующие папки в Vault:\n{folders_listing}\n\n"
+        f"Папка по умолчанию для новых заметок этой темы, если ни одна "
+        f"существующая папка не подходит: {default_folder or '(не задана)'}\n\n"
+        "Составь план заметок (create/update, заголовки на русском, папки, "
+        "распределение фактов по индексам)."
     )
 
     output: NotePlanOutput = client.generate_structured(
@@ -200,11 +227,19 @@ def _to_draft_note(
 
     now_iso = datetime.now(timezone.utc).date().isoformat()
     frontmatter = {"created": now_iso}
-    for f in output.frontmatter_extra:
-        frontmatter[f.key] = f.value
+    # frontmatter_extra от модели намеренно игнорируется — состав
+    # frontmatter ограничен title/tags/created на уровне кода (см.
+    # tools/markdown_tools.py::render_frontmatter), это единственная точка
+    # правды, а не промпт.
 
     def _resolve_link(raw: str) -> str:
-        link = sanitize_wikilinks(raw).strip()
+        # strip_wikilink_brackets, а НЕ sanitize_wikilinks: модель иногда
+        # кладёт в links_out саму строку '[[Title]]' вместо чистого
+        # 'Title'. sanitize_wikilinks оставила бы одну пару скобок как
+        # "уже валидную", а render_markdown обернул бы её в [[...]] ещё
+        # раз, давая [[[[Title]]]]. strip_wikilink_brackets убирает скобки
+        # полностью, так что обёртка происходит ровно один раз.
+        link = strip_wikilink_brackets(raw).strip()
         return title_map.get(normalize_link_title(link), link)
 
     links_out_fixed = [_resolve_link(t) for t in output.links_out]
@@ -243,13 +278,17 @@ def synthesize_and_write(
     client: LLMClient,
     status: TaskStatus,
     default_folder: str,
+    existing_folders: list[str] | None = None,
 ) -> tuple[list[DraftNote], list[Relationship]]:
     """Удобная обёртка без чекпоинтинга — оба шага map-reduce одним вызовом
     функции. Используется там, где резюмируемость не нужна (тесты, прямой
     вызов вне Orchestrator). Сам Orchestrator использует plan_notes()/
     write_note() по отдельности, чтобы персистить прогресс после каждой
     заметки — см. orchestrator/state_machine.py."""
-    note_plan = plan_notes(plan, evidence, existing_notes, client, status)
+    note_plan = plan_notes(
+        plan, evidence, existing_notes, client, status,
+        existing_folders=existing_folders, default_folder=default_folder,
+    )
     known_titles, title_map = prepare_linking_context(note_plan, existing_notes)
 
     drafts = [

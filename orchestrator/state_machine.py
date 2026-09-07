@@ -36,6 +36,7 @@ from staging.changeset import save_changeset
 from staging.checkpoint import save_checkpoint, delete_checkpoint, TaskCheckpoint, load_checkpoint
 from storage.models import StagingChangeset, Task, TaskStatus
 from tools.dedup import try_create_embedder
+from tools.markdown_tools import slugify_filename
 from validation import run_validation
 from vault.db import VaultDB
 from vault.index import VaultIndexer
@@ -256,10 +257,21 @@ class Orchestrator:
             if not checkpoint.synthesis_done:
                 status.stage = "synthesizing"
 
+                # Папка для заметок этой задачи: переиспользуем существующую
+                # структуру папок Vault там, где это уместно (см.
+                # PLAN_SYSTEM_INSTRUCTION), а иначе — тематическая подпапка
+                # под default_notes_folder, а не сам default_notes_folder
+                # "плоско" на все темы подряд.
+                existing_folders = self.db.get_distinct_folders()
+                topic_folder = (
+                    f"{self.settings.default_notes_folder}/{slugify_filename(plan.topic_title)}"
+                ).strip("/")
+
                 if not checkpoint.note_plan_done:
                     report("Планирование структуры заметок (Gemini)…")
                     note_plan = synthesizer_writer.plan_notes(
                         plan, evidence, existing_notes, self.gemini, status,
+                        existing_folders=existing_folders, default_folder=topic_folder,
                     )
                     checkpoint.note_plan = note_plan
                     checkpoint.note_plan_done = True
@@ -285,7 +297,7 @@ class Orchestrator:
                     report(f"Написание заметки «{item.title}» (Gemini)…")
                     draft = synthesizer_writer.write_note(
                         item, evidence, known_titles, title_map, fetched,
-                        self.gemini, status, default_folder=self.settings.default_notes_folder,
+                        self.gemini, status, default_folder=topic_folder,
                     )
                     drafts.append(draft)
                     checkpoint.drafts = drafts
