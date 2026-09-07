@@ -49,6 +49,9 @@ from config.settings import Settings
 from orchestrator.budget import GeminiBudget, GeminiFreeLimitReached
 from storage.models import TaskStatus
 
+import httpx
+from openai import APIConnectionError, APITimeoutError
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
@@ -232,9 +235,21 @@ class GroqClient:
         from openai import OpenAI  # локальный импорт — модуль не требует пакет,
         # если Groq вообще не используется (LLM_PROVIDER=gemini)
 
+        # keepalive_expiry ограничивает, сколько секунд httpx готов держать
+        # простаивающее TLS-соединение в пуле перед новым запросом. Если он
+        # меньше, чем keep-alive timeout сервера/прокси, httpx сам закроет и
+        # откроет свежее соединение вместо попытки переиспользовать протухшее
+        # (что и даёт UNEXPECTED_EOF_WHILE_READING при долгих паузах между
+        # вызовами ролей — веб-поиск/fetch между ними может занимать минуты).
+        _http_client = httpx.Client(
+            limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=20.0),
+            http2=False,  # HTTP/2-мультиплексирование чаще ловит EOF на нестабильных сетях/прокси
+        )
+
         self._client = OpenAI(
             api_key=settings.groq_api_key,
             base_url="https://api.groq.com/openai/v1",
+            http_client=_http_client,
         )
 
     def available_prompt_budget_tokens(
@@ -387,14 +402,20 @@ class GroqClient:
                     f"Исходная ошибка: {first_exc}; после repair: {second_exc}"
                 ) from second_exc
 
+    _RETRYABLE_EXCEPTIONS = (
+        GroqRateLimitError,
+        APIConnectionError,  # включает обёрнутые httpx.ConnectError / SSL EOF
+        APITimeoutError,
+    )
+
     @retry(
-        retry=retry_if_exception_type(GroqRateLimitError),
-        wait=wait_random_exponential(multiplier=1, max=30),
+        retry=retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
+        wait=wait_random_exponential(multiplier=1, max=15),
         stop=stop_after_attempt(4),
         reraise=True,
     )
     def _call_with_retry(
-        self, *, prompt: str, system_instruction: str, estimated_tokens: int
+            self, *, prompt: str, system_instruction: str, estimated_tokens: int
     ) -> str:
         # Блокируемся, пока в TPM-окне не появится место. Это сериализует
         # ВСЕ вызовы через этот клиент (включая параллельные потоки),

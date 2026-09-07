@@ -85,7 +85,8 @@ class TaskCheckpoint(BaseModel):
     fetched_sources: list[SourceCandidate] = Field(default_factory=list)
 
     extraction_done: bool = False
-    extracted_source_ids: list[str] = Field(default_factory=list)
+    # unit_id = f"{source_id}#{chunk_index}" — см. roles/extractor_critic.py::ExtractionUnit
+    extracted_unit_ids: list[str] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
 
     vault_analysis_done: bool = False
