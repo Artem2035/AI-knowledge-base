@@ -28,6 +28,7 @@ def slugify_filename(title: str) -> str:
     по ТЗ имена заметок по умолчанию на русском, если запрос на русском).
     """
     normalized = unicodedata.normalize("NFC", title).strip()
+    normalized = re.sub(r"[\\/]+", " ", normalized)
     normalized = _INVALID_FS_CHARS.sub("", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized or "Без названия"

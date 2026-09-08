@@ -19,7 +19,7 @@ from tools.markdown_tools import (
     build_note_path,
     normalize_link_title,
     sanitize_wikilinks,
-    strip_wikilink_brackets,
+    strip_wikilink_brackets, slugify_filename,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,7 +72,8 @@ WRITE_SYSTEM_INSTRUCTION = (
     "написать ОДНУ конкретную заметку по уже составленному плану (заголовок, "
     "action и папка заданы и не обсуждаются). Для action='create' сформируй "
     "tags, body_md (минимум 3 содержательных абзаца, примеры кода с "
-    "указанием языка где уместно) и links_out. Свойства заметки (YAML "
+    "указанием языка где уместно) и links_out. links_out — это ТОЛЬКО заголовки заметок Vault, "
+    "никогда не URL источников (для источников уже есть отдельное поле). Свойства заметки (YAML "
     "frontmatter), кроме title/tags/created, система не использует — не "
     "пытайся предложить другие. Для "
     "action='update' верни append_section — новый материал для добавления "
@@ -130,6 +131,14 @@ def plan_notes(
         status=status,
         system_instruction=PLAN_SYSTEM_INSTRUCTION,
     )
+
+    # КРИТИЧНО: заголовок заметки становится её именем файла (build_note_path
+    # тоже вызывает slugify_filename) — делаем это здесь, ОДИН раз, чтобы
+    # title, filename и текст [[wikilink]] везде дальше по пайплайну
+    # (title_map, DraftNote.title, frontmatter) были идентичны и ссылки
+    # реально резолвились в существующие файлы.
+    for item in output.notes:
+        item.title = slugify_filename(item.title)
 
     _warn_on_unassigned_evidence(output, evidence)
     return output
@@ -232,17 +241,24 @@ def _to_draft_note(
     # tools/markdown_tools.py::render_frontmatter), это единственная точка
     # правды, а не промпт.
 
-    def _resolve_link(raw: str) -> str:
-        # strip_wikilink_brackets, а НЕ sanitize_wikilinks: модель иногда
-        # кладёт в links_out саму строку '[[Title]]' вместо чистого
-        # 'Title'. sanitize_wikilinks оставила бы одну пару скобок как
-        # "уже валидную", а render_markdown обернул бы её в [[...]] ещё
-        # раз, давая [[[[Title]]]]. strip_wikilink_brackets убирает скобки
-        # полностью, так что обёртка происходит ровно один раз.
+    def _resolve_link(raw: str) -> str | None:
         link = strip_wikilink_brackets(raw).strip()
+        if not link:
+            return None
+        if "://" in link or link.startswith("www."):
+            # Модель по ошибке положила ссылку на источник в links_out —
+            # туда должны попадать только заголовки заметок Vault.
+            logger.warning(
+                "Игнорируем URL-подобное значение в links_out (это не "
+                "заголовок заметки): %r", link,
+            )
+            return None
         return title_map.get(normalize_link_title(link), link)
 
-    links_out_fixed = [_resolve_link(t) for t in output.links_out]
+    links_out_fixed = [
+        resolved for raw in output.links_out
+        if (resolved := _resolve_link(raw)) is not None
+    ]
 
     return DraftNote(
         action=action,
