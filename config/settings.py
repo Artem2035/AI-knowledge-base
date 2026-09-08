@@ -42,24 +42,19 @@ class Settings(BaseSettings):
     groq_rpm_soft_limit: int = Field(default=25, ge=1)
     groq_rpd_soft_limit: int = Field(default=10000, ge=1)
 
-    # ---- Groq: гибридная модель для extraction ----
-    # extraction — единственная роль, где регулярно не хватает TPM Groq
-    # gpt-oss (8000) из-за объёма текста источников. groq/compound-mini
-    # имеет TPM=70000, но заметно меньший RPD (250 против 1000 у gpt-oss),
-    # поэтому используется ТОЛЬКО для этой роли — остальные роли (planner,
-    # researcher, vault_dedup, synthesizer) продолжают использовать
-    # settings.groq_model как обычно. У compound-mini свой собственный
-    # RPD-счётчик на стороне API — отдельный от gpt-oss, поэтому вынос
-    # extraction на неё увеличивает СУММАРНЫЙ дневной бюджет вызовов,
-    # а не делит один и тот же пул.
-    # ВАЖНО: compound-mini — агентная модель Groq (со встроенными tool
-    # calls). Перед боевым использованием стоит проверить на реальном
-    # API, что она действительно возвращает валидный JSON через
-    # response_format={"type": "json_object"} и не пытается сама
-    # вызывать инструменты вместо структурированного ответа.
-    groq_extraction_model: str = Field(default="groq/compound-mini")
-    groq_extraction_tpm_limit: int = Field(default=70000, ge=1)
-    groq_extraction_rpd_soft_limit: int = Field(default=200, ge=1)  # запас от реального лимита 250
+    # ---- Groq: модель для extraction ----
+    # ИЗМЕНЕНО: раньше здесь стоял groq/compound-mini (заявленный TPM=70000),
+    # но на практике compound-mini маршрутизирует запросы на llama-3.3-70b
+    # -versatile с отдельным, скрытым от клиента лимитом (наблюдалось
+    # Limit=12000 в реальном логе 429) — заявленные 70K не отражают реальный
+    # бюджет, из-за чего TokenRateLimiter калибровался неверно и давал
+    # массовые 429 (12 из 13 запросов). openai/gpt-oss-120b имеет более
+    # скромный, но ЧЕСТНЫЙ TPM=8000 — свой, прямой, без скрытой прослойки —
+    # и официально поддерживает strict json_schema (constrained decoding),
+    # что даёт гарантированно валидный JSON вместо best-effort JSON mode.
+    groq_extraction_model: str = Field(default="openai/gpt-oss-120b")
+    groq_extraction_tpm_limit: int = Field(default=8000, ge=1)
+    groq_extraction_rpd_soft_limit: int = Field(default=900, ge=1)  # запас от реального лимита 1000
 
     free_only: bool = Field(default=True, description="Жёсткий флаг: только бесплатные провайдеры")
 

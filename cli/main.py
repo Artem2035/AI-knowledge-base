@@ -38,7 +38,7 @@ def _run_and_report(orch: Orchestrator, *, raw_query: str | None, resume_task_id
         orch.close()
 
     if result.stopped:
-        console.print(Panel(result.message, title="⏸ Задача остановлена", style="yellow"))
+        console.print(Panel(result.message, title="⏸ Задача остановлена", style="dark_orange3"))
         console.print(
             f"Потрачено вызовов Gemini за эту сессию: "
             f"{result.status.gemini_calls_used}/{settings.max_gemini_calls_per_task}."
@@ -116,7 +116,7 @@ def approve(task_id: str):
         console.print(f"[red]Задача {task_id} не найдена в staging.[/red]")
         raise typer.Exit(code=1)
 
-    console.print(Panel(render_diff_summary(changeset), title="Изменения к применению", style="yellow"))
+    console.print(Panel(render_diff_summary(changeset), title="Изменения к применению", style="dark_orange3"))
 
     if changeset.validation and not changeset.validation.ok:
         console.print("[red]Changeset не прошёл валидацию, commit заблокирован.[/red]")

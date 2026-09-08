@@ -150,6 +150,58 @@ def _repair_json(raw: str) -> str:
 
     return text
 
+# Модели, для которых Groq поддерживает constrained decoding
+# (response_format={"type": "json_schema", "json_schema": {"strict": True, ...}}) —
+# гарантированно валидный JSON на уровне токенов, а не best-effort JSON mode.
+# Для остальных моделей strict=True либо игнорируется, либо приводит к ошибке
+# (см. https://console.groq.com/docs/structured-outputs) — поэтому включаем
+# его только для моделей из этого списка, для остальных используем прежний
+# json_object + текстовое описание схемы в системном промпте.
+_STRICT_SCHEMA_SUPPORTED_MODELS = {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
+
+
+def _to_strict_json_schema(schema: dict) -> dict:
+    """Рекурсивно приводит JSON Schema из Pydantic model_json_schema() к виду,
+    требуемому Groq strict-режимом: у каждого object-узла additionalProperties=False
+    и required содержит ВСЕ ключи properties (Groq strict не поддерживает частично
+    опциональные объекты — поля с default в Pydantic всё равно будут возвращены
+    моделью, это не мешает валидации, т.к. Pydantic просто примет присланное
+    значение). Рекурсия проходит properties, items (массивы), $defs/definitions
+    (вложенные Pydantic-модели) и ветки anyOf/oneOf/allOf (Optional[...] в
+    Pydantic v2 компилируется в anyOf с веткой {"type": "null"})."""
+    schema = dict(schema)
+
+    for defs_key in ("$defs", "definitions"):
+        if defs_key in schema:
+            schema[defs_key] = {k: _to_strict_json_schema(v) for k, v in schema[defs_key].items()}
+
+    if schema.get("type") == "object" and "properties" in schema:
+        schema["properties"] = {
+            k: _to_strict_json_schema(v) for k, v in schema["properties"].items()
+        }
+        schema["additionalProperties"] = False
+        schema["required"] = list(schema["properties"].keys())
+
+    if "items" in schema:
+        schema["items"] = _to_strict_json_schema(schema["items"])
+
+    for combinator in ("anyOf", "oneOf", "allOf"):
+        if combinator in schema:
+            schema[combinator] = [_to_strict_json_schema(s) for s in schema[combinator]]
+
+    return schema
+
+
+def _is_schema_unsupported_error(exc: Exception) -> bool:
+    """Отличает 'схема отклонена API' (invalid_request/unsupported feature —
+    см. известные проблемы gpt-oss-120b с regex/e164 в JSON Schema) от
+    остальных ошибок — на эту категорию имеет смысл ОДНОКРАТНО откатиться на
+    json_object в рамках того же вызова, а не ронять всю задачу."""
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("unsupported_feature", "invalid json schema", "response_format")
+    )
 
 class TokenRateLimiter:
     """Клиентский sliding-window limiter по токенам в минуту (TPM).
@@ -231,6 +283,7 @@ class GroqClient:
 
         tpm_limit = getattr(settings, "groq_tpm_limit", None) or self.DEFAULT_TPM_LIMIT
         self._limiter = TokenRateLimiter(tpm_limit=tpm_limit)
+        self._strict_schema_supported = settings.groq_model in _STRICT_SCHEMA_SUPPORTED_MODELS
 
         from openai import OpenAI  # локальный импорт — модуль не требует пакет,
         # если Groq вообще не используется (LLM_PROVIDER=gemini)
@@ -281,26 +334,14 @@ class GroqClient:
         self.budget.check_rpd_soft_limit()
         self.budget.wait_if_needed_for_rpm()
 
-        schema_hint = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
-        full_system = (
-            (system_instruction or "").strip()
-            + "\n\nОтвечай СТРОГО валидным JSON-объектом, соответствующим "
-              "следующей JSON Schema. Никакого текста до/после JSON, никакой "
-              "markdown-разметки (```), только сырой JSON. Все числовые поля "
-              "(например confidence) пиши ТОЛЬКО цифрами в формате 0.9, "
-              "НИКОГДА не пиши число словами (не пиши 'Nine', не пиши "
-              "'девять') и не ставь пробел между целой и дробной частью.\n\n"
-              "JSON Schema:\n"
-            + schema_hint
+        response_format, full_system = self._build_response_format_and_system(
+            response_model, system_instruction
         )
 
         system_tokens = _estimate_tokens(full_system)
         max_prompt_tokens = self._limiter._limit - self.RESERVED_OUTPUT_TOKENS - system_tokens
 
         if max_prompt_tokens <= 200:
-            # Даже без пользовательского prompt (голая система+схема) уже
-            # не влезаем ни при каком раскладе — это не решается обрезкой
-            # текста, это ошибка конфигурации (модель/лимит/схема).
             raise GroqPromptTooLargeError(
                 f"Системный промпт+схема (~{system_tokens} токенов) сами по "
                 f"себе не влезают в TPM-бюджет (~{self._limiter._limit}). "
@@ -321,6 +362,7 @@ class GroqClient:
                 prompt=prompt,
                 system_instruction=full_system,
                 estimated_tokens=estimated + self.RESERVED_OUTPUT_TOKENS,
+                response_format=response_format,
             )
             parsed = self._parse_with_repair(raw_json, response_model)
             self.budget.register_call(status, role=role, ok=True)
@@ -337,6 +379,49 @@ class GroqClient:
         except Exception as exc:
             self.budget.register_call(status, role=role, ok=False, error=str(exc))
             raise
+
+    def _build_response_format_and_system(
+        self, response_model: type[BaseModel], system_instruction: str | None
+    ) -> tuple[dict, str]:
+        """Строгий json_schema для gpt-oss-20b/120b (constrained decoding,
+        схема НЕ дублируется текстом в промпте — Groq применяет её сам).
+        Для остальных моделей — прежний json_object + текстовая схема
+        как подсказка (best-effort)."""
+        base_instruction = (system_instruction or "").strip()
+
+        if self._strict_schema_supported:
+            schema = _to_strict_json_schema(response_model.model_json_schema())
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_model.__name__,
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
+            full_system = (
+                base_instruction
+                + "\n\nОтвечай валидным JSON-объектом. Формат ответа принудительно "
+                  "проверяется API согласно заданной схеме — не добавляй markdown-"
+                  "разметку (```), текст до/после JSON и не придумывай поля, "
+                  "которых нет в схеме."
+            )
+            return response_format, full_system
+
+        response_format = {"type": "json_object"}
+        schema_hint = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+        full_system = (
+            base_instruction
+            + "\n\nОтвечай СТРОГО валидным JSON-объектом, соответствующим "
+              "следующей JSON Schema. Никакого текста до/после JSON, никакой "
+              "markdown-разметки (```), только сырой JSON. Все числовые поля "
+              "(например confidence) пиши ТОЛЬКО цифрами в формате 0.9, "
+              "НИКОГДА не пиши число словами (не пиши 'Nine', не пиши "
+              "'девять') и не ставь пробел между целой и дробной частью.\n\n"
+              "JSON Schema:\n"
+            + schema_hint
+        )
+        return response_format, full_system
 
     def _auto_truncate_prompt(
         self, prompt: str, max_prompt_tokens: int, *, role: str
@@ -415,11 +500,8 @@ class GroqClient:
         reraise=True,
     )
     def _call_with_retry(
-            self, *, prompt: str, system_instruction: str, estimated_tokens: int
+        self, *, prompt: str, system_instruction: str, estimated_tokens: int, response_format: dict
     ) -> str:
-        # Блокируемся, пока в TPM-окне не появится место. Это сериализует
-        # ВСЕ вызовы через этот клиент (включая параллельные потоки),
-        # что и решает проблему "запросы идут часто и превышают rpm/tpm".
         self._limiter.wait_and_reserve(estimated_tokens)
 
         try:
@@ -429,15 +511,13 @@ class GroqClient:
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": prompt},
                 ],
-                response_format={"type": "json_object"},
+                response_format=response_format,
                 timeout=self.settings.groq_timeout_seconds,
             )
             content = response.choices[0].message.content
             if content is None:
                 raise RuntimeError("Groq вернул пустой ответ (content=None)")
 
-            # Если Groq вернул реальный usage — используем его, чтобы лимитер
-            # со временем становился точнее вместо грубой char-based оценки.
             usage = getattr(response, "usage", None)
             actual_total = getattr(usage, "total_tokens", None) if usage else None
             if actual_total:
@@ -445,24 +525,35 @@ class GroqClient:
 
             return content
         except Exception as exc:
+            # Известная редкая регрессия: API отклоняет саму schema (не
+            # ошибка сети/лимита) — одноразовый откат на json_object В ЭТОМ
+            # ЖЕ вызове, без повторного прохождения через budget/лимитер
+            # заново (счётчик Gemini-вызовов не должен расти вдвое из-за
+            # внутреннего фолбэка).
+            if response_format.get("type") == "json_schema" and _is_schema_unsupported_error(exc):
+                logger.warning(
+                    "Groq отклонил strict json_schema (%s) — разовый откат "
+                    "на json_object без constrained decoding для этого вызова.",
+                    exc,
+                )
+                fallback_format = {"type": "json_object"}
+                return self._call_with_retry(
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                    estimated_tokens=estimated_tokens,
+                    response_format=fallback_format,
+                )
+
             logger.exception(
-                "Groq request failed: type=%s, message=%s",
-                type(exc).__name__,
-                str(exc),
+                "Groq request failed: type=%s, message=%s", type(exc).__name__, str(exc)
             )
 
             if _is_rate_limit_error(exc):
                 retry_after = _parse_retry_after(str(exc))
                 if retry_after is not None:
-                    # Groq явно сказал, сколько ждать — уважаем это вместо
-                    # случайного exponential backoff, и держим лимитер
-                    # заблокированным на это время, чтобы никто не влез.
                     self._limiter.force_wait(retry_after)
                 raise GroqRateLimitError(str(exc), retry_after=retry_after) from exc
             if _is_request_too_large_error(exc):
-                #Превращаем в тот жетип ошибки, что и предварительная проверка бюджета —
-                # вызывающий код (extractor_critic) уже умеет на неё
-                # реагировать бисекцией батча, не роняя всю задачу.
                 raise GroqPromptTooLargeError(
                     f"Groq вернул 413 Request Entity Too Large: {exc}"
                 ) from exc
