@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     dedup_high_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
     dedup_low_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
 
+    # ---- Synthesizer / Writer ----
+    max_notes_per_task: int = Field(
+        default=6, ge=1,
+        description="Мягкий потолок количества заметок (create+update), которые Note Planner может предложить за одну задачу",
+    )
+
     # ---- Прочее ----
     language: str = Field(default="ru")
     allow_delete: bool = Field(default=False)

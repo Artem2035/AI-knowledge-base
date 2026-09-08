@@ -38,7 +38,10 @@ def _install_fake_openai(monkeypatch, create_impl):
             self.completions = FakeCompletions()
 
     class FakeOpenAI:
-        def __init__(self, api_key, base_url):
+        def __init__(self, api_key, base_url, **kwargs):
+            # **kwargs — чтобы принимать http_client и любые другие параметры,
+            # которые GroqClient передаёт в OpenAI(...) сейчас или в будущем,
+            # не ломая тест при каждом изменении конструктора клиента.
             self.api_key = api_key
             self.base_url = base_url
             self.chat = FakeChat()
@@ -46,7 +49,6 @@ def _install_fake_openai(monkeypatch, create_impl):
     fake_module = types.ModuleType("openai")
     fake_module.OpenAI = FakeOpenAI
     monkeypatch.setitem(sys.modules, "openai", fake_module)
-
 
 def _make_response(content: str):
     message = types.SimpleNamespace(content=content)
@@ -65,7 +67,12 @@ def test_groq_missing_api_key_raises(monkeypatch):
 
 def test_groq_successful_structured_call(monkeypatch):
     def fake_create(**kwargs):
-        assert kwargs["response_format"] == {"type": "json_object"}
+        # gpt-oss-120b (модель по умолчанию) поддерживает strict json_schema
+        # (см. _STRICT_SCHEMA_SUPPORTED_MODELS в groq_client.py) — этот тест
+        # проверяет только успешный happy path вызова и парсинга ответа,
+        # а не конкретный response_format; за формат отвечают отдельные
+        # тесты ниже.
+        assert kwargs["response_format"]["type"] in ("json_object", "json_schema")
         return _make_response('{"value": "ok"}')
 
     _install_fake_openai(monkeypatch, fake_create)
@@ -82,6 +89,47 @@ def test_groq_successful_structured_call(monkeypatch):
     )
     assert result.value == "ok"
     assert status.gemini_calls_used == 1
+
+
+def test_groq_uses_strict_json_schema_for_supported_model(monkeypatch):
+    def fake_create(**kwargs):
+        assert kwargs["response_format"]["type"] == "json_schema"
+        assert kwargs["response_format"]["json_schema"]["strict"] is True
+        return _make_response('{"value": "ok"}')
+
+    _install_fake_openai(monkeypatch, fake_create)
+
+    from llm.groq_client import GroqClient
+
+    settings = _settings(groq_model="openai/gpt-oss-120b")
+    budget = GeminiBudget(3, 100, 100)
+    client = GroqClient(settings=settings, budget=budget)
+    status = TaskStatus(task_id="g1s")
+
+    result = client.generate_structured(
+        role="test_role", prompt="hi", response_model=_DummyOutput, status=status
+    )
+    assert result.value == "ok"
+
+
+def test_groq_uses_json_object_for_unsupported_model(monkeypatch):
+    def fake_create(**kwargs):
+        assert kwargs["response_format"] == {"type": "json_object"}
+        return _make_response('{"value": "ok"}')
+
+    _install_fake_openai(monkeypatch, fake_create)
+
+    from llm.groq_client import GroqClient
+
+    settings = _settings(groq_model="qwen/qwen3.8-27b")
+    budget = GeminiBudget(3, 100, 100)
+    client = GroqClient(settings=settings, budget=budget)
+    status = TaskStatus(task_id="g1o")
+
+    result = client.generate_structured(
+        role="test_role", prompt="hi", response_model=_DummyOutput, status=status
+    )
+    assert result.value == "ok"
 
 
 def test_groq_persistent_429_stops_without_paid_fallback(monkeypatch):

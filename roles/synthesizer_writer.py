@@ -100,6 +100,7 @@ def plan_notes(
     status: TaskStatus,
     existing_folders: list[str] | None = None,
     default_folder: str = "",
+    max_notes: int = 6,
 ) -> NotePlanOutput:
     evidence_listing = "\n".join(
         f"[{i}] [{e.concept}] {e.statement}" for i, e in enumerate(evidence)
@@ -120,6 +121,10 @@ def plan_notes(
         f"Уже существующие папки в Vault:\n{folders_listing}\n\n"
         f"Папка по умолчанию для новых заметок этой темы, если ни одна "
         f"существующая папка не подходит: {default_folder or '(не задана)'}\n\n"
+        f"ВАЖНО: предложи МАКСИМУМ {max_notes} заметок (create+update суммарно). "
+        f"Если тем/фактов больше, чем {max_notes} — объединяй смежные концепции "
+        f"в более крупные, структурированные заметки с подзаголовками, а не "
+        f"дроби на отдельные мелкие заметки.\n\n"
         "Составь план заметок (create/update, заголовки на русском, папки, "
         "распределение фактов по индексам)."
     )

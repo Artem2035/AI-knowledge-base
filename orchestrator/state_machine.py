@@ -272,6 +272,7 @@ class Orchestrator:
                     note_plan = synthesizer_writer.plan_notes(
                         plan, evidence, existing_notes, self.gemini, status,
                         existing_folders=existing_folders, default_folder=topic_folder,
+                        max_notes=self.settings.max_notes_per_task,
                     )
                     checkpoint.note_plan = note_plan
                     checkpoint.note_plan_done = True

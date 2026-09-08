@@ -200,7 +200,14 @@ def _is_schema_unsupported_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return any(
         marker in text
-        for marker in ("unsupported_feature", "invalid json schema", "response_format")
+        for marker in (
+            "unsupported_feature",
+            "invalid json schema",
+            "response_format",
+            "json_validate_failed",
+            "does not validate",
+            "missing properties",
+        )
     )
 
 class TokenRateLimiter:
