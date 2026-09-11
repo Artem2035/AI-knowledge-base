@@ -125,6 +125,15 @@ class NotePlanItem(BaseModel):
     # избежать рассинхрона между шагом планирования и шагом записи.
     evidence_indices: list[int] = Field(default_factory=list)
     tags_hint: list[str] = Field(default_factory=list)
+    # Ориентир объёма заметки, определяется Planner-ом (шаг 1) на основе
+    # количества и содержательности назначенных evidence_indices.
+    # "standard" — дефолт и ожидаемое большинство заметок (~1 страница).
+    # "long" — только если материала объективно больше (~2 страницы) — см.
+    # PLAN_SYSTEM_INSTRUCTION в roles/synthesizer_writer.py. НЕ используется
+    # как жёсткая граница валидации (validation/markdown_validator.py
+    # проверяет единый минимум в 3 абзаца независимо от depth_hint) —
+    # только как целевой диапазон слов в промпте write_note().
+    depth_hint: Literal["standard", "long"] = "standard"
 
 
 class NotePlanOutput(BaseModel):

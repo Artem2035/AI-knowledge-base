@@ -125,6 +125,11 @@ class DraftNote(BaseModel):
     source_refs: list[str] = Field(default_factory=list)  # url источников
     # для UPDATE: что именно добавляется (append-блок), чтобы не перезаписывать всё
     append_section: str | None = None
+    # Перенесено из NotePlanItem.depth_hint (roles/synthesizer_writer.py) —
+    # чисто для трассируемости/отладки (видно в staging/changeset.json,
+    # какой объём подразумевался при генерации). НЕ участвует в
+    # validation/markdown_validator.py — там единый порог для всех заметок.
+    depth_hint: str = "standard"
 
 
 class Relationship(BaseModel):

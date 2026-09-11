@@ -115,3 +115,19 @@ def test_duplicate_path_in_same_changeset_is_error(tmp_path):
     assert not report.ok
     assert any(i.code == "duplicate_path_in_changeset" for i in report.errors)
     db.close()
+
+def test_draft_note_depth_hint_defaults_to_standard(tmp_path):
+    """Регрессия: старые вызовающие места (тесты, ручное конструирование
+    DraftNote без depth_hint) не должны ломаться после добавления поля."""
+    db = _db(tmp_path)
+    draft = DraftNote(
+        action=NoteAction.CREATE,
+        path="Знания/Без depth_hint.md",
+        title="Без depth_hint",
+        body_md="Первый абзац текста.\n\nВторой абзац текста.\n\nТретий абзац текста.",
+    )
+    assert draft.depth_hint == "standard"
+    changeset = StagingChangeset(task_id="t9", creates=[draft])
+    report = run_validation(changeset, db, allow_delete=False)
+    assert report.ok
+    db.close()
