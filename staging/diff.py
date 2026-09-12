@@ -1,6 +1,20 @@
 from __future__ import annotations
 
-from storage.models import StagingChangeset
+from storage.models import StagingChangeset, DraftNote
+
+
+def _note_markers(d: DraftNote) -> str:
+    """Строит короткие пометки для заметки: knowledge-режим (нет проверяемых
+    источников) и/или незавершённое критик-ревью — оба сигнала явно нужны
+    пользователю ДО approve, а не только где-то в логах."""
+    markers = []
+    if d.frontmatter.get("source") == "model-knowledge":
+        markers.append("⚠ без внешних источников (конспект по знаниям модели)")
+    if d.needs_review:
+        markers.append(
+            f"⚠ критик не одобрил после {d.critic_rounds} попыт(ки/ок) переписывания — проверьте вручную"
+        )
+    return "  ".join(markers)
 
 
 def render_diff_summary(changeset: StagingChangeset) -> str:
@@ -17,6 +31,9 @@ def render_diff_summary(changeset: StagingChangeset) -> str:
             lines.append(f"      теги: {tags}")
             if d.links_out:
                 lines.append(f"      связи: {', '.join(f'[[{t}]]' for t in d.links_out)}")
+            markers = _note_markers(d)
+            if markers:
+                lines.append(f"      {markers}")
         lines.append("")
 
     if changeset.updates:
@@ -26,6 +43,9 @@ def render_diff_summary(changeset: StagingChangeset) -> str:
             if d.append_section:
                 preview = d.append_section.strip().splitlines()[0][:80]
                 lines.append(f"      добавляется секция, начинается с: {preview}…")
+            markers = _note_markers(d)
+            if markers:
+                lines.append(f"      {markers}")
         lines.append("")
 
     if changeset.deletes:

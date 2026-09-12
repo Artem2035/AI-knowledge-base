@@ -43,16 +43,22 @@ def build_note_path(folder: str, title: str) -> str:
 
 
 # Единственный источник истины по составу frontmatter — сознательно
-# ограничен тремя ключами по требованию продукта (не плодить произвольные
+# ограничен четырьмя ключами по требованию продукта (не плодить произвольные
 # YAML-свойства, которые может насочинять LLM через frontmatter_extra).
 # Контроль на уровне кода, а не промпта: даже если Writer-роль или её
 # промпт в будущем изменятся и снова начнут предлагать другие ключи,
 # лишнее сюда не попадёт.
-_ALLOWED_FRONTMATTER_KEYS = ("title", "tags", "created")
+#
+# "source" добавлен для RESEARCH_MODE=knowledge (см. config/settings.py) —
+# roles/synthesizer_writer.py::_to_draft_note проставляет
+# frontmatter["source"] = "model-knowledge", когда заметка написана без
+# внешних источников, чтобы это было видно прямо в самой заметке в
+# Obsidian, а не только в diff при approve (см. staging/diff.py).
+_ALLOWED_FRONTMATTER_KEYS = ("title", "tags", "created", "source")
 
 
 def render_frontmatter(frontmatter: dict) -> str:
-    # sort_keys=False — сохраняем порядок ключей: title/tags/created.
+    # sort_keys=False — сохраняем порядок ключей: title/tags/created/source.
     ordered = {
         k: frontmatter[k]
         for k in _ALLOWED_FRONTMATTER_KEYS
@@ -68,7 +74,10 @@ def render_frontmatter(frontmatter: dict) -> str:
 def render_sources_block(source_refs: list[str]) -> str:
     """Источники — простой список ссылок в НАЧАЛЕ тела заметки (сразу
     после frontmatter), а не свойство YAML: см. render_frontmatter, которая
-    сознательно не пропускает 'sources' в frontmatter."""
+    сознательно не пропускает произвольные ключи, кроме
+    title/tags/created/source, в frontmatter. В RESEARCH_MODE=knowledge
+    source_refs всегда пуст (нет внешних источников) — тогда этот блок
+    просто не рендерится, см. вызов ниже."""
     if not source_refs:
         return ""
     lines = "\n".join(f"- {url}" for url in source_refs)

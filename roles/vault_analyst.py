@@ -1,20 +1,11 @@
 from __future__ import annotations
 
 from llm.base import LLMClient
+from gemini.prompts.vault_analyst import SYSTEM_INSTRUCTION
 from gemini.schemas import DedupDecisionOutput
 from retrieval.search import RetrievalHit, VaultSearcher
 from storage.models import Evidence, ExistingNote, Plan, TaskStatus
 from tools.dedup import classify_similarity
-
-SYSTEM_INSTRUCTION = (
-    "Ты — Vault Analyst. Тебе даны концепция/факт из нового исследования и "
-    "существующая заметка из личной базы знаний пользователя (её заголовок, "
-    "теги и краткое содержание). Определи: это та же концепция (её стоит "
-    "переиспользовать/дополнить), или это разные, самостоятельные концепции "
-    "(нужна отдельная новая заметка). Главное правило: не плодить дубликаты — "
-    "если сомневаешься между 'reuse' и 'distinct', выбирай 'extend' "
-    "(дополнить существующую заметку новым материалом)."
-)
 
 
 def find_existing_notes_for_plan(

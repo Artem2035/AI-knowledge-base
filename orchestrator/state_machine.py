@@ -11,6 +11,16 @@ Orchestrator — не LLM. Чистый Python state machine, который:
 - никогда сам не пишет в реальный Vault (это staging/commit.py, только
   после явного approve).
 
+RESEARCH_MODE (см. config/settings.py):
+- "web" — прежний путь: Researcher (веб-поиск + fetch) → Extractor/Critic
+  извлекает evidence из реального текста источников.
+- "knowledge" (дефолт) — Researcher/Extractor полностью пропускаются;
+  Elaborator (roles/elaborator.py) генерирует evidence по каждой подтеме
+  плана из знаний модели, без сетевого I/O. Заметки в этом режиме
+  помечаются frontmatter.source="model-knowledge" (см.
+  roles/synthesizer_writer.py::_to_draft_note) — это ЧЕРНОВОЙ конспект без
+  проверяемых источников, а не исследование.
+
 ВАЖНО про бюджет при resume: MAX_GEMINI_CALLS_PER_TASK — это лимит на
 ОДНУ СЕССИЮ/ПОПЫТКУ (status.gemini_calls_used обнуляется в начале каждого
 вызова run(), в т.ч. при resume), а не на задачу за всё её время жизни.
@@ -31,7 +41,7 @@ from llm.factory import budget_limits_for_provider, create_llm_client, extractio
 from orchestrator.budget import GeminiBudget, GeminiFreeLimitReached, GeminiTaskBudgetExceeded
 
 from retrieval.search import VaultSearcher
-from roles import extractor_critic, planner, researcher, synthesizer_writer, vault_analyst
+from roles import critic, elaborator, extractor_critic, planner, researcher, synthesizer_writer, vault_analyst
 from staging.changeset import save_changeset
 from staging.checkpoint import save_checkpoint, delete_checkpoint, TaskCheckpoint, load_checkpoint
 from storage.models import StagingChangeset, Task, TaskStatus
@@ -42,6 +52,14 @@ from vault.db import VaultDB
 from vault.index import VaultIndexer
 
 logger = logging.getLogger(__name__)
+
+# Пометка frontmatter.source (см. tools/markdown_tools.py) для заметок,
+# написанных в RESEARCH_MODE=knowledge — без внешних проверяемых
+# источников. Совпадает с roles.elaborator.MODEL_KNOWLEDGE_SOURCE_ID по
+# смыслу, но это отдельная константа: одна — маркер source_id у Evidence
+# (внутренний), другая — человекочитаемое значение во frontmatter заметки
+# (видимое пользователю в Obsidian).
+KNOWLEDGE_MODE_FRONTMATTER_SOURCE = "model-knowledge"
 
 
 class OrchestratorStopped(Exception):
@@ -82,13 +100,17 @@ class Orchestrator:
         # settings.llm_provider — roles/* работают с ним только через
         # generate_structured(...), тип провайдера им не важен.
         self.gemini = create_llm_client(settings, self.budget)
-        # Отдельный клиент+бюджет для extraction (см. llm/factory.py) — на
-        # Groq использует другую модель (compound-mini) с другим TPM/RPD,
-        # поэтому не может делить лимитер с self.gemini. Оба бюджета читают
-        # и пишут в один и тот же status.gemini_calls_used (передаётся при
-        # каждом вызове run()), так что MAX_GEMINI_CALLS_PER_TASK продолжает
-        # работать как ОБЩИЙ потолок на задачу независимо от того, какой из
-        # двух клиентов расходует вызовы.
+        # Отдельный клиент+бюджет для extraction/elaboration (см.
+        # llm/factory.py) — на Groq использует другую модель
+        # (compound-mini/gpt-oss-120b) с другим TPM/RPD, поэтому не может
+        # делить лимитер с self.gemini. Используется как в web-режиме
+        # (extractor_critic), так и в knowledge-режиме (elaborator) — в
+        # обоих случаях это самый частый по числу вызовов шаг. Оба бюджета
+        # читают и пишут в один и тот же status.gemini_calls_used
+        # (передаётся при каждом вызове run()), так что
+        # MAX_GEMINI_CALLS_PER_TASK продолжает работать как ОБЩИЙ потолок
+        # на задачу независимо от того, какой из двух клиентов расходует
+        # вызовы.
         ext_rpm, ext_rpd = extraction_budget_limits(settings)
         self.extraction_budget = GeminiBudget(
             max_calls_per_task=settings.max_gemini_calls_per_task,
@@ -136,7 +158,7 @@ class Orchestrator:
         def persist(stage_label: str) -> None:
             """Сохраняет чекпоинт немедленно после успешного завершения
             шага. Вызывается часто (в т.ч. внутри цикла extracting после
-            КАЖДОГО источника) — это и есть механизм resume."""
+            КАЖДОГО источника/подтемы) — это и есть механизм resume."""
             checkpoint.last_completed_stage = stage_label
             checkpoint.status = status
             checkpoint.total_gemini_calls_used = base_total_calls + status.gemini_calls_used
@@ -157,77 +179,104 @@ class Orchestrator:
                 plan = checkpoint.plan
                 report("План уже построен (из чекпоинта) — пропускаем.")
 
-            # -- Researching: сбор сырых кандидатов (без Gemini) ---------
-            if not checkpoint.raw_candidates_done:
-                report("Поиск источников (бесплатный веб-поиск)…")
-                raw_candidates = researcher.collect_raw_candidates(
-                    plan,
-                    max_results_per_query=self.settings.max_search_results_per_query,
-                    max_sources_per_subtopic=self.settings.max_sources_per_subtopic,
+            # -- Researching / Fetching (только RESEARCH_MODE=web) --------
+            if self.settings.research_mode == "web":
+                if not checkpoint.raw_candidates_done:
+                    report("Поиск источников (бесплатный веб-поиск)…")
+                    raw_candidates = researcher.collect_raw_candidates(
+                        plan,
+                        max_results_per_query=self.settings.max_search_results_per_query,
+                        max_sources_per_subtopic=self.settings.max_sources_per_subtopic,
+                    )
+                    checkpoint.raw_candidates = raw_candidates
+                    checkpoint.raw_candidates_done = True
+                    persist("raw_candidates_collected")
+                else:
+                    raw_candidates = checkpoint.raw_candidates
+                    report("Сырые источники уже собраны (из чекпоинта) — пропускаем.")
+
+                if not checkpoint.sources_selected_done:
+                    report("Отбор релевантных источников (Gemini)…")
+                    status.stage = "researching"
+                    selected = researcher.select_relevant_sources(
+                        raw_candidates,
+                        self.gemini,
+                        status,
+                        max_per_subtopic=self.settings.max_sources_per_subtopic,
+                    )
+                    checkpoint.selected_sources = selected
+                    checkpoint.sources_selected_done = True
+                    persist("sources_selected")
+                else:
+                    selected = checkpoint.selected_sources
+                    report("Источники уже отобраны (из чекпоинта) — пропускаем.")
+
+                if not checkpoint.sources_fetched_done:
+                    report("Загрузка и очистка текста источников…")
+                    fetched = researcher.fetch_selected_sources(selected)
+                    checkpoint.fetched_sources = fetched
+                    checkpoint.sources_fetched_done = True
+                    persist("sources_fetched")
+                else:
+                    fetched = checkpoint.fetched_sources
+                    report("Тексты источников уже загружены (из чекпоинта) — пропускаем.")
+            else:
+                report(
+                    "Knowledge-режим (RESEARCH_MODE=knowledge): веб-поиск и "
+                    "загрузка источников пропущены."
                 )
-                checkpoint.raw_candidates = raw_candidates
-                checkpoint.raw_candidates_done = True
-                persist("raw_candidates_collected")
-            else:
-                raw_candidates = checkpoint.raw_candidates
-                report("Сырые источники уже собраны (из чекпоинта) — пропускаем.")
+                fetched = []
 
-            # -- Researching: отбор релевантных (1 Gemini call) ----------
-            if not checkpoint.sources_selected_done:
-                report("Отбор релевантных источников (Gemini)…")
-                status.stage = "researching"
-                selected = researcher.select_relevant_sources(
-                    raw_candidates,
-                    self.gemini,
-                    status,
-                    max_per_subtopic=self.settings.max_sources_per_subtopic,
-                )
-                checkpoint.selected_sources = selected
-                checkpoint.sources_selected_done = True
-                persist("sources_selected")
-            else:
-                selected = checkpoint.selected_sources
-                report("Источники уже отобраны (из чекпоинта) — пропускаем.")
-
-            # -- Fetching (без Gemini) ------------------------------------
-            if not checkpoint.sources_fetched_done:
-                report("Загрузка и очистка текста источников…")
-                fetched = researcher.fetch_selected_sources(selected)
-                checkpoint.fetched_sources = fetched
-                checkpoint.sources_fetched_done = True
-                persist("sources_fetched")
-            else:
-                fetched = checkpoint.fetched_sources
-                report("Тексты источников уже загружены (из чекпоинта) — пропускаем.")
-
-            # -- Extracting: батчинг чанков МЕЖДУ источниками, гранулярность
-            # resume — по отдельной единице (чанку одного источника), а не
-            # по источнику целиком (см. roles/extractor_critic.py).
+            # -- Extracting / Elaborating ----------------------------------
+            # Гранулярность resume — по отдельной единице: в web-режиме это
+            # чанк источника (см. roles/extractor_critic.py::ExtractionUnit),
+            # в knowledge-режиме — целая подтема плана (см.
+            # roles/elaborator.py). Поле checkpoint.extracted_unit_ids
+            # переиспользуется для ОБОИХ режимов как список строковых
+            # идентификаторов уже обработанных единиц — семантика
+            # конкретного идентификатора зависит от режима, но структура
+            # чекпоинта (list[str]) от этого не меняется, поэтому отдельное
+            # поле не заводилось.
             if not checkpoint.extraction_done:
-                report("Извлечение фактов и проверка (Gemini/Groq)…")
                 status.stage = "extracting"
-                already_done_units = set(checkpoint.extracted_unit_ids)
                 evidence: list = list(checkpoint.evidence)
+                already_done = set(checkpoint.extracted_unit_ids)
 
-                def _on_batch_done(unit_ids: list[str], new_evidence: list) -> None:
-                    evidence.extend(new_evidence)
-                    checkpoint.evidence = evidence
-                    checkpoint.extracted_unit_ids.extend(unit_ids)
-                    # Персист ПОСЛЕ КАЖДОГО батча — именно здесь чаще всего
-                    # происходит остановка по бюджету.
-                    persist("extracting")
+                if self.settings.research_mode == "web":
+                    report("Извлечение фактов и проверка по источникам (Gemini/Groq)…")
 
-                extractor_critic.extract_evidence_from_sources(
-                    fetched, plan, self.extraction_client, status,
-                    already_done_unit_ids=already_done_units,
-                    on_batch_done=_on_batch_done,
-                    max_units_per_source=self.settings.max_chunks_per_source,
-                )
+                    def _on_batch_done(unit_ids: list[str], new_evidence: list) -> None:
+                        evidence.extend(new_evidence)
+                        checkpoint.evidence = evidence
+                        checkpoint.extracted_unit_ids.extend(unit_ids)
+                        persist("extracting")
+
+                    extractor_critic.extract_evidence_from_sources(
+                        fetched, plan, self.extraction_client, status,
+                        already_done_unit_ids=already_done,
+                        on_batch_done=_on_batch_done,
+                        max_units_per_source=self.settings.max_chunks_per_source,
+                    )
+                else:
+                    report("Раскрытие подтем из знаний модели (Gemini/Groq)…")
+
+                    def _on_batch_done(subtopic_titles: list[str], new_evidence: list) -> None:
+                        evidence.extend(new_evidence)
+                        checkpoint.evidence = evidence
+                        checkpoint.extracted_unit_ids.extend(subtopic_titles)
+                        persist("extracting")
+
+                    elaborator.elaborate_subtopics(
+                        plan, self.extraction_client, status,
+                        already_done_subtopic_titles=already_done,
+                        on_batch_done=_on_batch_done,
+                    )
+
                 checkpoint.extraction_done = True
                 persist("extraction_done")
             else:
                 evidence = checkpoint.evidence
-                report("Факты уже извлечены (из чекпоинта) — пропускаем.")
+                report("Факты уже получены (из чекпоинта) — пропускаем.")
 
             # -- Vault analysis --------------------------------------------
             if not checkpoint.vault_analysis_done:
@@ -253,7 +302,7 @@ class Orchestrator:
                 existing_notes = checkpoint.existing_notes
                 report("Анализ Vault уже выполнен (из чекпоинта) — пропускаем.")
 
-            # -- Synthesis (planning) + Writer, map-reduce ------------------
+            # -- Synthesis (planning) + Writer + Critic, map-reduce ---------
             if not checkpoint.synthesis_done:
                 status.stage = "synthesizing"
 
@@ -294,17 +343,31 @@ class Orchestrator:
                         f"Пропускаем {len(note_plan.notes) - len(remaining_items)} уже "
                         "написанных заметок (из чекпоинта)."
                     )
+
+                mark_source = (
+                    KNOWLEDGE_MODE_FRONTMATTER_SOURCE
+                    if self.settings.research_mode == "knowledge"
+                    else None
+                )
                 for i, item in remaining_items:
                     report(f"Написание заметки «{item.title}» (Gemini)…")
-                    draft = synthesizer_writer.write_note(
+                    draft = critic.run_critic_cycle(
                         item, evidence, known_titles, title_map, fetched,
                         self.gemini, status, default_folder=topic_folder,
+                        max_rounds=self.settings.max_critic_rounds,
+                        mark_source=mark_source,
                     )
+                    if draft.needs_review:
+                        report(
+                            f"⚠ Критик не одобрил заметку «{item.title}» после "
+                            f"{draft.critic_rounds} попыт(ки/ок) — сохранена как есть."
+                        )
                     drafts.append(draft)
                     checkpoint.drafts = drafts
                     checkpoint.written_note_indices.append(i)
-                    # Персист ПОСЛЕ КАЖДОЙ заметки — именно на этом шаге
-                    # теперь самый частый риск упереться в бюджет вызовов.
+                    # Персист ПОСЛЕ КАЖДОЙ заметки (включая критик-раунды
+                    # внутри неё) — именно на этом шаге теперь самый частый
+                    # риск упереться в бюджет вызовов.
                     persist("synthesizing")
 
                 checkpoint.relationships = synthesizer_writer.build_relationships(drafts)

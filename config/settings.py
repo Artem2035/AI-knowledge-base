@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,7 +25,21 @@ class Settings(BaseSettings):
     # "gemini" | "groq" — единственная точка переключения, всё остальное
     # (roles/*, orchestrator) работает с любым провайдером одинаково,
     # т.к. оба клиента реализуют один и тот же метод generate_structured().
-    llm_provider: str = Field(default="gemini")
+    llm_provider: str = Field(default="groq")
+
+    # ---- Режим исследования ----
+    # "web" — прежний пайплайн: DuckDuckGo-поиск + fetch страниц +
+    #   Extractor/Critic извлекает evidence из реального текста источников.
+    #   Даёт проверяемые source_refs, но зависит от нестабильной сети и
+    #   тратит больше Gemini/Groq-вызовов.
+    # "knowledge" (дефолт) — без веб-поиска: Elaborator (roles/elaborator.py)
+    #   генерирует evidence по каждой подтеме плана из знаний модели.
+    #   Быстрее и надёжнее (нет сетевого I/O к внешним сайтам), но заметки
+    #   не имеют проверяемых источников — помечаются
+    #   frontmatter.source="model-knowledge" (см. tools/markdown_tools.py) и
+    #   должны рассматриваться как черновой конспект, требующий вашей
+    #   проверки, а не как исследование с цитируемыми источниками.
+    research_mode: Literal["web", "knowledge"] = Field(default="knowledge")
 
     # ---- Gemini ----
     gemini_api_key: str = Field(default="", description="Ключ Gemini API (бесплатный тир)")
@@ -85,6 +100,15 @@ class Settings(BaseSettings):
         default=6, ge=1,
         description="Мягкий потолок количества заметок (create+update), которые Note Planner может предложить за одну задачу",
     )
+
+    # ---- Critic ----
+    # Сколько раз Writer имеет право переписать заметку по замечаниям
+    # Critic-а в рамках одной задачи. Жёсткий bounded retry — не цикл до
+    # "ok", а фиксированный потолок попыток (см. roles/critic.py): после
+    # исчерпания заметка идёт в staging как есть, с пометкой
+    # needs_review=true, а не блокирует всю задачу и не тратит вызовы
+    # бесконечно.
+    max_critic_rounds: int = Field(default=1, ge=0)
 
     # ---- Прочее ----
     language: str = Field(default="ru")

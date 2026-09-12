@@ -21,6 +21,10 @@ MAX_GEMINI_CALLS_PER_TASK на этапе extracting — самом "дорог�
   на уровне ОТДЕЛЬНОГО ИСТОЧНИКА: extracted_source_ids хранит source_id
   уже обработанных источников, чтобы при resume не пересчитывать evidence
   по источникам, которые уже были обработаны до остановки.
+- Note Planning — как и Extracting, гранулярность на уровне ОТДЕЛЬНОГО
+  БАТЧА (см. note_plan_batches_done) — на темах с большим числом подтем/
+  фактов один вызов planning может не поместиться в TPM-бюджет Groq так же,
+  как это происходит на этапе extraction.
 """
 from __future__ import annotations
 
@@ -31,7 +35,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from gemini.schemas import NotePlanOutput
+from gemini.schemas import NotePlanItem, NotePlanOutput
 from storage.models import (
     DraftNote,
     Evidence,
@@ -97,6 +101,8 @@ class TaskCheckpoint(BaseModel):
     # персистятся отдельно — резюм не должен пересчитывать ни план, ни уже
     # написанные заметки (аналогично extracted_source_ids для extraction).
     note_plan_done: bool = False
+    note_plan_batches_done: list[str] = Field(default_factory=list)
+    note_plan_items: list[NotePlanItem] = Field(default_factory=list)
     note_plan: NotePlanOutput | None = None
     written_note_indices: list[int] = Field(default_factory=list)
     drafts: list[DraftNote] = Field(default_factory=list)  # накапливается по одной заметке

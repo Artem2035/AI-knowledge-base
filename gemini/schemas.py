@@ -37,7 +37,7 @@ class PlanOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Researcher (отбор источников)
+# Researcher (отбор источников) — используется только в RESEARCH_MODE=web
 # ---------------------------------------------------------------------------
 
 
@@ -52,7 +52,7 @@ class SourceSelectionOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Extractor + Critic (объединены)
+# Extractor + Critic (объединены) — используется только в RESEARCH_MODE=web
 # ---------------------------------------------------------------------------
 
 
@@ -73,6 +73,32 @@ class EvidenceItem(BaseModel):
 
 class EvidenceBatchOutput(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Elaborator — используется только в RESEARCH_MODE=knowledge (см.
+# roles/elaborator.py). В отличие от EvidenceItem/EvidenceBatchOutput выше,
+# здесь нет unit_index/contradicts_indices — не с чем сверять противоречия
+# между "единицами текста источника", т.к. текста источника нет: вход —
+# сама подтема, а не чанк чужого текста.
+# ---------------------------------------------------------------------------
+
+
+class ElaborationItem(BaseModel):
+    concept: str
+    statement: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    is_definition: bool = False
+    critic_note: str = ""
+    # Индекс подтемы в списке, переданном в промпте текущего батча (0-based)
+    # — позволяет раскрывать НЕСКОЛЬКО подтем одним вызовом и корректно
+    # приписать каждый факт к его настоящей подтеме в коде-обвязке (см.
+    # roles/elaborator.py), тот же принцип, что EvidenceItem.unit_index.
+    subtopic_index: int = 0
+
+
+class ElaborationOutput(BaseModel):
+    evidence: list[ElaborationItem] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -129,12 +155,29 @@ class NotePlanItem(BaseModel):
     # количества и содержательности назначенных evidence_indices.
     # "standard" — дефолт и ожидаемое большинство заметок (~1 страница).
     # "long" — только если материала объективно больше (~2 страницы) — см.
-    # PLAN_SYSTEM_INSTRUCTION в roles/synthesizer_writer.py. НЕ используется
-    # как жёсткая граница валидации (validation/markdown_validator.py
-    # проверяет единый минимум в 3 абзаца независимо от depth_hint) —
-    # только как целевой диапазон слов в промпте write_note().
+    # PLAN_SYSTEM_INSTRUCTION в gemini/prompts/synthesizer_writer.py. НЕ
+    # используется как жёсткая граница валидации
+    # (validation/markdown_validator.py проверяет единый минимум в 3 абзаца
+    # независимо от depth_hint) — только как целевой диапазон слов в
+    # промпте write_note().
     depth_hint: Literal["standard", "long"] = "standard"
 
 
 class NotePlanOutput(BaseModel):
     notes: list[NotePlanItem] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Critic — ревью уже написанной заметки (см. roles/critic.py). Работает
+# ПОСЛЕ Writer, на готовом DraftNote, а не на сыром evidence — проверяет
+# итоговый текст.
+# ---------------------------------------------------------------------------
+
+
+class CriticVerdictOutput(BaseModel):
+    verdict: Literal["ok", "rewrite"]
+    # Заполняется только при verdict="rewrite" — конкретные, adresуемые
+    # замечания, которые Writer сможет учесть на повторном проходе (не общие
+    # фразы вроде "сделай лучше", а конкретные пункты: "раздел X дублирует
+    # раздел Y", "утверждение про Z не подкреплено ни одним evidence" и т.п.)
+    feedback: str = ""

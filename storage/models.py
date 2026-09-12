@@ -69,7 +69,8 @@ class SourceCandidate(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Evidence (Extractor + Critic объединены)
+# Evidence (Extractor + Critic объединены в RESEARCH_MODE=web, либо
+# Elaborator в RESEARCH_MODE=knowledge — см. config/settings.py)
 # ---------------------------------------------------------------------------
 
 
@@ -77,11 +78,22 @@ class Evidence(BaseModel):
     evidence_id: str = Field(default_factory=_new_id)
     concept: str
     statement: str
+    # В RESEARCH_MODE=web — ссылается на реальный SourceCandidate.source_id.
+    # В RESEARCH_MODE=knowledge — равен
+    # roles.elaborator.MODEL_KNOWLEDGE_SOURCE_ID ("model_knowledge"), т.к.
+    # реального источника нет (см. verified ниже).
     source_id: str
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
     is_definition: bool = False
     contradicts: list[str] = Field(default_factory=list)  # evidence_id других утверждений
     critic_note: str = ""
+    # True только если factы получены из реального внешнего источника
+    # (RESEARCH_MODE=web). В knowledge-режиме всегда False — сознательно
+    # НЕ выставляется в True автоматически даже если Critic (roles/critic.py)
+    # не нашёл проблем в тексте заметки: ревью критика проверяет
+    # согласованность и полноту, а не фактическую верность против внешней
+    # истины, которой в этом режиме просто нет.
+    verified: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +142,15 @@ class DraftNote(BaseModel):
     # какой объём подразумевался при генерации). НЕ участвует в
     # validation/markdown_validator.py — там единый порог для всех заметок.
     depth_hint: str = "standard"
+    # Сколько раз Critic (roles/critic.py) попросил переписать эту заметку
+    # и Writer переписал её заново, в рамках settings.max_critic_rounds.
+    # 0 — критик не запускался или сразу одобрил. Чисто для трассируемости
+    # (видно в staging/changeset.json и diff), не влияет на validation.
+    critic_rounds: int = 0
+    # True, если после исчерпания max_critic_rounds критик всё ещё просил
+    # переписать (заметка ушла в staging "как есть") — сигнал пользователю
+    # обратить на неё особое внимание при approve. См. staging/diff.py.
+    needs_review: bool = False
 
 
 class Relationship(BaseModel):

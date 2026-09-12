@@ -344,6 +344,18 @@ class GroqClient:
         response_format, full_system = self._build_response_format_and_system(
             response_model, system_instruction
         )
+        # Заранее считаем корректный fallback (json_object + ТЕКСТОВАЯ схема)
+        # на случай, если API отклонит строгую схему (см. _is_schema_unsupported_error).
+        # ВАЖНО: раньше при откате переиспользовался system_instruction строгого
+        # режима, в котором схема НЕ продублирована текстом — модель в
+        # json_object-режиме оставалась без описания полей и начинала их
+        # пропускать (баг, приводивший к GroqSchemaError и краху сессии).
+        fallback_format: dict | None = None
+        fallback_system: str | None = None
+        if self._strict_schema_supported:
+            fallback_format, fallback_system = self._build_response_format_and_system(
+                response_model, system_instruction, force_json_object=True
+            )
 
         system_tokens = _estimate_tokens(full_system)
         max_prompt_tokens = self._limiter._limit - self.RESERVED_OUTPUT_TOKENS - system_tokens
@@ -370,6 +382,8 @@ class GroqClient:
                 system_instruction=full_system,
                 estimated_tokens=estimated + self.RESERVED_OUTPUT_TOKENS,
                 response_format=response_format,
+                fallback_format=fallback_format,
+                fallback_system=fallback_system,
             )
             parsed = self._parse_with_repair(raw_json, response_model)
             self.budget.register_call(status, role=role, ok=True)
@@ -388,15 +402,22 @@ class GroqClient:
             raise
 
     def _build_response_format_and_system(
-        self, response_model: type[BaseModel], system_instruction: str | None
+        self,
+        response_model: type[BaseModel],
+        system_instruction: str | None,
+        *,
+        force_json_object: bool = False,
     ) -> tuple[dict, str]:
         """Строгий json_schema для gpt-oss-20b/120b (constrained decoding,
         схема НЕ дублируется текстом в промпте — Groq применяет её сам).
-        Для остальных моделей — прежний json_object + текстовая схема
-        как подсказка (best-effort)."""
+        Для остальных моделей, а также при force_json_object=True (см.
+        ниже — используется для fallback-вызова после отказа API от
+        строгой схемы) — json_object + текстовая схема как подсказка
+        (best-effort), это ЕДИНСТВЕННЫЙ режим, где модель вообще видит
+        состав полей схемы текстом."""
         base_instruction = (system_instruction or "").strip()
 
-        if self._strict_schema_supported:
+        if self._strict_schema_supported and not force_json_object:
             schema = _to_strict_json_schema(response_model.model_json_schema())
             response_format = {
                 "type": "json_schema",
@@ -411,7 +432,12 @@ class GroqClient:
                 + "\n\nОтвечай валидным JSON-объектом. Формат ответа принудительно "
                   "проверяется API согласно заданной схеме — не добавляй markdown-"
                   "разметку (```), текст до/после JSON и не придумывай поля, "
-                  "которых нет в схеме."
+                  "которых нет в схеме. ОБЯЗАТЕЛЬНО включай ВСЕ поля схемы в "
+                  "ответ, даже если для конкретного случая они неприменимы — "
+                  "используй пустую строку \"\" или пустой список [] вместо "
+                  "того, чтобы пропустить поле целиком (пропуск обязательного "
+                  "поля — ошибка формата, даже если по смыслу роли оно сейчас "
+                  "не нужно)."
             )
             return response_format, full_system
 
@@ -420,7 +446,9 @@ class GroqClient:
         full_system = (
             base_instruction
             + "\n\nОтвечай СТРОГО валидным JSON-объектом, соответствующим "
-              "следующей JSON Schema. Никакого текста до/после JSON, никакой "
+              "следующей JSON Schema. Включай ВСЕ поля из схемы, даже если "
+              "для них нет содержательного значения (используй \"\" или []), "
+              "не пропускай поля. Никакого текста до/после JSON, никакой "
               "markdown-разметки (```), только сырой JSON. Все числовые поля "
               "(например confidence) пиши ТОЛЬКО цифрами в формате 0.9, "
               "НИКОГДА не пиши число словами (не пиши 'Nine', не пиши "
@@ -507,7 +535,14 @@ class GroqClient:
         reraise=True,
     )
     def _call_with_retry(
-        self, *, prompt: str, system_instruction: str, estimated_tokens: int, response_format: dict
+        self,
+        *,
+        prompt: str,
+        system_instruction: str,
+        estimated_tokens: int,
+        response_format: dict,
+        fallback_format: dict | None = None,
+        fallback_system: str | None = None,
     ) -> str:
         self._limiter.wait_and_reserve(estimated_tokens)
 
@@ -532,23 +567,24 @@ class GroqClient:
 
             return content
         except Exception as exc:
-            # Известная редкая регрессия: API отклоняет саму schema (не
-            # ошибка сети/лимита) — одноразовый откат на json_object В ЭТОМ
-            # ЖЕ вызове, без повторного прохождения через budget/лимитер
-            # заново (счётчик Gemini-вызовов не должен расти вдвое из-за
-            # внутреннего фолбэка).
-            if response_format.get("type") == "json_schema" and _is_schema_unsupported_error(exc):
+            if (
+                response_format.get("type") == "json_schema"
+                and _is_schema_unsupported_error(exc)
+                and fallback_format is not None
+            ):
                 logger.warning(
                     "Groq отклонил strict json_schema (%s) — разовый откат "
-                    "на json_object без constrained decoding для этого вызова.",
+                    "на json_object С ТЕКСТОВОЙ JSON Schema в system-промпте "
+                    "(без constrained decoding) для этого вызова.",
                     exc,
                 )
-                fallback_format = {"type": "json_object"}
                 return self._call_with_retry(
                     prompt=prompt,
-                    system_instruction=system_instruction,
+                    system_instruction=fallback_system,
                     estimated_tokens=estimated_tokens,
                     response_format=fallback_format,
+                    # fallback_format/fallback_system не передаём — повторный
+                    # откат не пытаемся делать, чтобы не уйти в рекурсию.
                 )
 
             logger.exception(

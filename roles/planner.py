@@ -1,20 +1,9 @@
 from __future__ import annotations
 
 from llm.base import LLMClient
+from gemini.prompts.planner import SYSTEM_INSTRUCTION
 from gemini.schemas import PlanOutput
 from storage.models import Plan, Subtopic, Task, TaskStatus
-
-SYSTEM_INSTRUCTION = (
-    "Ты — Planner в системе управления знаниями. Твоя задача: по запросу "
-    "пользователя построить структуру исследования темы. Отвечай на русском "
-    "языке, если пользователь пишет на русском. Не выдумывай узкоспециальные "
-    "факты — только структура: подтемы, ключевые концепции, какие типы "
-    "источников имеет смысл искать (например: официальная документация, "
-    "научные статьи, авторитетные технические блоги, обзорные статьи). "
-    "Для каждой подтемы дай 1-3 конкретных поисковых запроса на русском и/или "
-    "английском (для технических тем английские запросы часто дают более "
-    "качественные источники — это нормально)."
-)
 
 
 def build_plan(task: Task, client: LLMClient, status: TaskStatus) -> Plan:
