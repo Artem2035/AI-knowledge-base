@@ -41,7 +41,7 @@ from llm.factory import budget_limits_for_provider, create_llm_client, extractio
 from orchestrator.budget import GeminiBudget, GeminiFreeLimitReached, GeminiTaskBudgetExceeded
 
 from retrieval.search import VaultSearcher
-from roles import critic, elaborator, extractor_critic, planner, researcher, synthesizer_writer, vault_analyst
+from roles import critic, elaborator, outline_planner, synthesizer_writer, vault_analyst
 from staging.changeset import save_changeset
 from staging.checkpoint import save_checkpoint, delete_checkpoint, TaskCheckpoint, load_checkpoint
 from storage.models import StagingChangeset, Task, TaskStatus
@@ -155,6 +155,14 @@ class Orchestrator:
             raw_query=raw_query, resume_task_id=resume_task_id, report=report,
         )
 
+        if self.settings.research_mode == "web":
+            raise OrchestratorStopped(
+                "RESEARCH_MODE=web ещё не мигрирован на новую структуру плана "
+                "(OutlineNote/subpoints) после перехода на Outline Planner. "
+                "Используйте RESEARCH_MODE=knowledge (текущий дефолт).",
+                task_id=task.task_id,
+            )
+
         def persist(stage_label: str) -> None:
             """Сохраняет чекпоинт немедленно после успешного завершения
             шага. Вызывается часто (в т.ч. внутри цикла extracting после
@@ -170,196 +178,102 @@ class Orchestrator:
 
             # -- Planning ------------------------------------------------
             if checkpoint.plan is None:
-                report("Планирование исследования (Gemini)…")
+                report("Планирование конспекта (Groq)…")
                 status.stage = "planning"
-                plan = planner.build_plan(task, self.gemini, status)
+                plan = outline_planner.build_plan(task, self.gemini, status)
                 checkpoint.plan = plan
                 persist("planned")
             else:
                 plan = checkpoint.plan
                 report("План уже построен (из чекпоинта) — пропускаем.")
 
-            # -- Researching / Fetching (только RESEARCH_MODE=web) --------
-            if self.settings.research_mode == "web":
-                if not checkpoint.raw_candidates_done:
-                    report("Поиск источников (бесплатный веб-поиск)…")
-                    raw_candidates = researcher.collect_raw_candidates(
-                        plan,
-                        max_results_per_query=self.settings.max_search_results_per_query,
-                        max_sources_per_subtopic=self.settings.max_sources_per_subtopic,
-                    )
-                    checkpoint.raw_candidates = raw_candidates
-                    checkpoint.raw_candidates_done = True
-                    persist("raw_candidates_collected")
-                else:
-                    raw_candidates = checkpoint.raw_candidates
-                    report("Сырые источники уже собраны (из чекпоинта) — пропускаем.")
-
-                if not checkpoint.sources_selected_done:
-                    report("Отбор релевантных источников (Gemini)…")
-                    status.stage = "researching"
-                    selected = researcher.select_relevant_sources(
-                        raw_candidates,
-                        self.gemini,
-                        status,
-                        max_per_subtopic=self.settings.max_sources_per_subtopic,
-                    )
-                    checkpoint.selected_sources = selected
-                    checkpoint.sources_selected_done = True
-                    persist("sources_selected")
-                else:
-                    selected = checkpoint.selected_sources
-                    report("Источники уже отобраны (из чекпоинта) — пропускаем.")
-
-                if not checkpoint.sources_fetched_done:
-                    report("Загрузка и очистка текста источников…")
-                    fetched = researcher.fetch_selected_sources(selected)
-                    checkpoint.fetched_sources = fetched
-                    checkpoint.sources_fetched_done = True
-                    persist("sources_fetched")
-                else:
-                    fetched = checkpoint.fetched_sources
-                    report("Тексты источников уже загружены (из чекпоинта) — пропускаем.")
-            else:
-                report(
-                    "Knowledge-режим (RESEARCH_MODE=knowledge): веб-поиск и "
-                    "загрузка источников пропущены."
-                )
-                fetched = []
-
-            # -- Extracting / Elaborating ----------------------------------
-            # Гранулярность resume — по отдельной единице: в web-режиме это
-            # чанк источника (см. roles/extractor_critic.py::ExtractionUnit),
-            # в knowledge-режиме — целая подтема плана (см.
-            # roles/elaborator.py). Поле checkpoint.extracted_unit_ids
-            # переиспользуется для ОБОИХ режимов как список строковых
-            # идентификаторов уже обработанных единиц — семантика
-            # конкретного идентификатора зависит от режима, но структура
-            # чекпоинта (list[str]) от этого не меняется, поэтому отдельное
-            # поле не заводилось.
+            # -- Elaborating (только knowledge-режим) --
             if not checkpoint.extraction_done:
                 status.stage = "extracting"
-                evidence: list = list(checkpoint.evidence)
+                evidence = list(checkpoint.evidence)
                 already_done = set(checkpoint.extracted_unit_ids)
 
-                if self.settings.research_mode == "web":
-                    report("Извлечение фактов и проверка по источникам (Gemini/Groq)…")
+                def _on_batch_done(subpoint_ids, new_evidence):
+                    evidence.extend(new_evidence)
+                    checkpoint.evidence = evidence
+                    checkpoint.extracted_unit_ids.extend(subpoint_ids)
+                    persist("extracting")
 
-                    def _on_batch_done(unit_ids: list[str], new_evidence: list) -> None:
-                        evidence.extend(new_evidence)
-                        checkpoint.evidence = evidence
-                        checkpoint.extracted_unit_ids.extend(unit_ids)
-                        persist("extracting")
-
-                    extractor_critic.extract_evidence_from_sources(
-                        fetched, plan, self.extraction_client, status,
-                        already_done_unit_ids=already_done,
-                        on_batch_done=_on_batch_done,
-                        max_units_per_source=self.settings.max_chunks_per_source,
-                    )
-                else:
-                    report("Раскрытие подтем из знаний модели (Gemini/Groq)…")
-
-                    def _on_batch_done(subtopic_titles: list[str], new_evidence: list) -> None:
-                        evidence.extend(new_evidence)
-                        checkpoint.evidence = evidence
-                        checkpoint.extracted_unit_ids.extend(subtopic_titles)
-                        persist("extracting")
-
-                    elaborator.elaborate_subtopics(
-                        plan, self.extraction_client, status,
-                        already_done_subtopic_titles=already_done,
-                        on_batch_done=_on_batch_done,
-                    )
-
+                elaborator.elaborate_outline(
+                    plan, self.extraction_client, status,
+                    already_done_subpoint_ids=already_done,
+                    on_batch_done=_on_batch_done,
+                    max_subpoints_per_batch=self.settings.max_subpoints_per_generation_batch,
+                )
                 checkpoint.extraction_done = True
                 persist("extraction_done")
             else:
                 evidence = checkpoint.evidence
-                report("Факты уже получены (из чекпоинта) — пропускаем.")
 
             # -- Vault analysis --------------------------------------------
             if not checkpoint.vault_analysis_done:
                 report(
                     "Анализ существующих заметок Vault "
-                    "(локально + Gemini для спорных случаев)…"
+                    "(локально + LLM для спорных случаев)…"
                 )
                 status.stage = "vault_analysis"
+                existing_folders = self.db.get_distinct_folders()
+                topic_folder = f"{self.settings.default_notes_folder}/{slugify_filename(plan.topic_title)}".strip("/")
                 searcher = VaultSearcher(self.db, embedder=self.embedder)
-                existing_notes = vault_analyst.find_existing_notes_for_plan(
-                    plan,
-                    evidence,
-                    searcher,
-                    self.gemini,
-                    status,
+                vault_analyst.resolve_notes_against_vault(
+                    plan, searcher, self.gemini, status,
+                    existing_folders=existing_folders, default_folder=topic_folder,
                     high_threshold=self.settings.dedup_high_threshold,
                     low_threshold=self.settings.dedup_low_threshold,
                 )
-                checkpoint.existing_notes = existing_notes
+                checkpoint.plan = plan
                 checkpoint.vault_analysis_done = True
                 persist("vault_analysis_done")
             else:
                 existing_notes = checkpoint.existing_notes
                 report("Анализ Vault уже выполнен (из чекпоинта) — пропускаем.")
 
-            # -- Synthesis (planning) + Writer + Critic, map-reduce ---------
+            # -- Synthesis (без отдельного planning-шага — сразу по plan.notes) --
             if not checkpoint.synthesis_done:
                 status.stage = "synthesizing"
 
-                # Папка для заметок этой задачи: переиспользуем существующую
-                # структуру папок Vault там, где это уместно (см.
-                # PLAN_SYSTEM_INSTRUCTION), а иначе — тематическая подпапка
-                # под default_notes_folder, а не сам default_notes_folder
-                # "плоско" на все темы подряд.
-                existing_folders = self.db.get_distinct_folders()
-                topic_folder = (
-                    f"{self.settings.default_notes_folder}/{slugify_filename(plan.topic_title)}"
-                ).strip("/")
-
-                if not checkpoint.note_plan_done:
-                    report("Планирование структуры заметок (Gemini)…")
-                    note_plan = synthesizer_writer.plan_notes(
-                        plan, evidence, existing_notes, self.gemini, status,
-                        existing_folders=existing_folders, default_folder=topic_folder,
-                        max_notes=self.settings.max_notes_per_task,
-                    )
-                    checkpoint.note_plan = note_plan
-                    checkpoint.note_plan_done = True
-                    persist("note_plan_done")
-                else:
-                    note_plan = checkpoint.note_plan
-                    report("План заметок уже построен (из чекпоинта) — пропускаем.")
-
-                known_titles, title_map = synthesizer_writer.prepare_linking_context(
-                    note_plan, existing_notes
-                )
+                known_titles, title_map = synthesizer_writer.prepare_linking_context(plan.notes)
                 already_written = set(checkpoint.written_note_indices)
                 drafts = list(checkpoint.drafts)
-                remaining_items = [
-                    (i, item) for i, item in enumerate(note_plan.notes) if i not in already_written
-                ]
-                if remaining_items and already_written:
-                    report(
-                        f"Пропускаем {len(note_plan.notes) - len(remaining_items)} уже "
-                        "написанных заметок (из чекпоинта)."
+
+                if already_written:
+                    report(f"Пропускаем {len(already_written)} уже написанных "
+                        "заметок (из чекпоинта)."
                     )
+
 
                 mark_source = (
                     KNOWLEDGE_MODE_FRONTMATTER_SOURCE
                     if self.settings.research_mode == "knowledge"
                     else None
                 )
-                for i, item in remaining_items:
-                    report(f"Написание заметки «{item.title}» (Gemini)…")
+                report(f"-- План конспекта --")
+                for i, note in enumerate(plan.notes):
+                    report(f"({i+1}) «{note.title}» {'написана' if i in already_written else ''}")
+                    count = 1
+                    for title in known_titles:
+                        report(f"{count} {title}")
+                        count += 1
+                report(f"-- конец План конспекта --")
+
+                for i, note in enumerate(plan.notes):
+                    if i in already_written:
+                        continue
+                    report(f"Написание заметки «{note.title}» ({self.settings.llm_provider})…")
                     draft = critic.run_critic_cycle(
-                        item, evidence, known_titles, title_map, fetched,
-                        self.gemini, status, default_folder=topic_folder,
+                        note, evidence, known_titles, title_map,
+                        self.gemini, status,
                         max_rounds=self.settings.max_critic_rounds,
                         mark_source=mark_source,
                     )
                     if draft.needs_review:
                         report(
-                            f"⚠ Критик не одобрил заметку «{item.title}» после "
+                            f"⚠ Критик не одобрил заметку «{note.title}» после "
                             f"{draft.critic_rounds} попыт(ки/ок) — сохранена как есть."
                         )
                     drafts.append(draft)
@@ -392,8 +306,7 @@ class Orchestrator:
                 deletes=[],
                 relationships=relationships,
             )
-            changeset.validation = run_validation(changeset, self.db, self.settings.allow_delete)
-
+            changeset.validation = run_validation(changeset, self.db, self.settings.allow_delete, plan=plan)
             report("Сохранение в staging (Vault пока не тронут)…")
             status.stage = "staged"
             save_changeset(self.settings.staging_dir, changeset)

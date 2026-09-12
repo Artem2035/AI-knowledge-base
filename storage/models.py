@@ -36,19 +36,28 @@ class Task(BaseModel):
     language: str = "ru"
     created_at: str = Field(default_factory=_now)
 
+class OutlineSubpoint(BaseModel):
+    subpoint_id: str = Field(default_factory=_new_id)
+    heading: str
+    covers: str  # техзадание для Elaborator/Writer, не сам текст
 
-class Subtopic(BaseModel):
+class OutlineNote(BaseModel):
+    note_id: str = Field(default_factory=_new_id)
     title: str
-    description: str = ""
-    search_queries: list[str] = Field(default_factory=list)
-
+    subpoints: list[OutlineSubpoint] = Field(default_factory=list)
+    rationale: str = ""
+    # Заполняется roles.vault_analyst.resolve_notes_against_vault() кодом,
+    # без отдельного LLM-вызова на само решение (см. §4) — только "серая
+    # зона" схожести по-прежнему уходит в 1 маленький вызов.
+    action: Literal["create", "update"] = "create"
+    existing_path: str = ""
+    folder: str = ""
 
 class Plan(BaseModel):
     task_id: str
     topic_title: str
     summary: str = ""
-    subtopics: list[Subtopic] = Field(default_factory=list)
-    suggested_source_types: list[str] = Field(default_factory=list)
+    notes: list[OutlineNote] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -76,18 +85,14 @@ class SourceCandidate(BaseModel):
 
 class Evidence(BaseModel):
     evidence_id: str = Field(default_factory=_new_id)
-    concept: str
+    note_id: str
+    subpoint_id: str
     statement: str
-    # В RESEARCH_MODE=web — ссылается на реальный SourceCandidate.source_id.
-    # В RESEARCH_MODE=knowledge — равен
-    # roles.elaborator.MODEL_KNOWLEDGE_SOURCE_ID ("model_knowledge"), т.к.
-    # реального источника нет (см. verified ниже).
-    source_id: str
+    source_id: str = "model_knowledge"
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
     is_definition: bool = False
-    contradicts: list[str] = Field(default_factory=list)  # evidence_id других утверждений
     critic_note: str = ""
-    # True только если factы получены из реального внешнего источника
+    # True только если факты получены из реального внешнего источника
     # (RESEARCH_MODE=web). В knowledge-режиме всегда False — сознательно
     # НЕ выставляется в True автоматически даже если Critic (roles/critic.py)
     # не нашёл проблем в тексте заметки: ревью критика проверяет
@@ -125,6 +130,7 @@ class NoteAction(str, Enum):
 
 class DraftNote(BaseModel):
     draft_id: str = Field(default_factory=_new_id)
+    note_id: str = ""  # для traceability и валидации покрытия заголовков (см. §7)
     action: NoteAction
     # для CREATE — новый путь; для UPDATE — путь существующей заметки
     path: str
@@ -151,7 +157,6 @@ class DraftNote(BaseModel):
     # переписать (заметка ушла в staging "как есть") — сигнал пользователю
     # обратить на неё особое внимание при approve. См. staging/diff.py.
     needs_review: bool = False
-
 
 class Relationship(BaseModel):
     from_note: str

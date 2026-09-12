@@ -4,9 +4,9 @@ import logging
 
 from llm.base import LLMClient
 from gemini.prompts.critic import SYSTEM_INSTRUCTION
-from gemini.schemas import CriticVerdictOutput, NotePlanItem
+from gemini.schemas import CriticVerdictOutput
 from roles import synthesizer_writer
-from storage.models import DraftNote, Evidence, SourceCandidate, TaskStatus
+from storage.models import DraftNote, Evidence, SourceCandidate, TaskStatus, OutlineNote
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ def review_draft(
     доверять без внешних источников."""
     text = draft.append_section or draft.body_md
     evidence_listing = "\n".join(
-        f"- [{e.concept}] {e.statement}" for e in assigned_evidence
+        f"- {e.statement}" for e in assigned_evidence
     ) or "(факты не были назначены явно — заметка опиралась на заголовок и общий контекст)"
 
     prompt = (
@@ -43,14 +43,12 @@ def review_draft(
 
 
 def run_critic_cycle(
-    item: NotePlanItem,
+    note: OutlineNote,
     evidence: list[Evidence],
     known_titles: list[str],
     title_map: dict[str, str],
-    sources: list[SourceCandidate],
     client: LLMClient,
     status: TaskStatus,
-    default_folder: str,
     max_rounds: int,
     mark_source: str | None = None,
 ) -> DraftNote:
@@ -72,31 +70,21 @@ def run_critic_cycle(
     diff (staging/diff.py) перед approve.
     """
     draft = synthesizer_writer.write_note(
-        item, evidence, known_titles, title_map, sources, client, status,
-        default_folder, mark_source=mark_source,
+        note, evidence, known_titles, title_map, client, status, mark_source=mark_source,
     )
-
     if max_rounds <= 0:
         return draft
 
-    assigned_evidence = [evidence[i] for i in item.evidence_indices if 0 <= i < len(evidence)]
-
-    rounds = 0
-    verdict: CriticVerdictOutput | None = None
+    assigned_evidence = [e for e in evidence if e.note_id == note.note_id]
+    rounds, verdict = 0, None
     while rounds < max_rounds:
         verdict = review_draft(draft, assigned_evidence, client, status)
         if verdict.verdict == "ok":
             break
         rounds += 1
-        logger.info(
-            "Critic попросил переписать заметку «%s» (попытка %d/%d): %s",
-            item.title, rounds, max_rounds, verdict.feedback,
-        )
         draft = synthesizer_writer.write_note(
-            item, evidence, known_titles, title_map, sources, client, status,
-            default_folder,
-            extra_instructions=verdict.feedback,
-            mark_source=mark_source,
+            note, evidence, known_titles, title_map, client, status,
+            extra_instructions=verdict.feedback, mark_source=mark_source,
         )
 
     draft.critic_rounds = rounds

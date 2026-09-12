@@ -35,7 +35,6 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from gemini.schemas import NotePlanItem, NotePlanOutput
 from storage.models import (
     DraftNote,
     Evidence,
@@ -51,7 +50,7 @@ logger = logging.getLogger(__name__)
 # Бампать при несовместимых изменениях структуры чекпоинта — старые
 # чекпоинты с другой версией просто не загрузятся (см. load_checkpoint),
 # вместо того чтобы упасть с невнятной ошибкой валидации Pydantic.
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 
 
 class TaskCheckpoint(BaseModel):
@@ -77,7 +76,7 @@ class TaskCheckpoint(BaseModel):
     # однократного исчерпания.
     total_gemini_calls_used: int = 0
 
-    plan: Plan | None = None
+    plan: Plan | None = None # теперь Plan с .notes
 
     raw_candidates_done: bool = False
     raw_candidates: list[SourceCandidate] = Field(default_factory=list)
@@ -93,18 +92,14 @@ class TaskCheckpoint(BaseModel):
     extracted_unit_ids: list[str] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
 
-    vault_analysis_done: bool = False
+    vault_analysis_done: bool = False # мутирует plan.notes напрямую, отдельного списка не нужно
     existing_notes: list[ExistingNote] = Field(default_factory=list)
 
     synthesis_done: bool = False
     # Map-reduce: шаг 1 (план заметок) и шаг 2 (запись по одной заметке)
     # персистятся отдельно — резюм не должен пересчитывать ни план, ни уже
     # написанные заметки (аналогично extracted_source_ids для extraction).
-    note_plan_done: bool = False
-    note_plan_batches_done: list[str] = Field(default_factory=list)
-    note_plan_items: list[NotePlanItem] = Field(default_factory=list)
-    note_plan: NotePlanOutput | None = None
-    written_note_indices: list[int] = Field(default_factory=list)
+    written_note_indices: list[int] = Field(default_factory=list) # индекс в plan.notes
     drafts: list[DraftNote] = Field(default_factory=list)  # накапливается по одной заметке
     relationships: list[Relationship] = Field(default_factory=list)
 

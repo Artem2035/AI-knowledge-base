@@ -62,3 +62,16 @@ def validate_markdown_body(draft: DraftNote) -> list[ValidationIssue]:
             ))
 
     return issues
+
+def validate_headings_coverage(draft: DraftNote, note: "OutlineNote | None") -> list[ValidationIssue]:
+    if note is None:
+        return []
+    text = draft.body_md or draft.append_section or ""
+    return [
+        ValidationIssue(
+            level="warning", code="missing_outline_heading",
+            message=f"Заголовок «{sp.heading}» из плана отсутствует в тексте заметки «{draft.title}»",
+            draft_id=draft.draft_id,
+        )
+        for sp in note.subpoints if f"## {sp.heading}" not in text
+    ]

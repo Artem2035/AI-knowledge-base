@@ -96,9 +96,13 @@ class Settings(BaseSettings):
     dedup_low_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
 
     # ---- Synthesizer / Writer ----
-    max_notes_per_task: int = Field(
+    max_subpoints_per_generation_batch: int = Field(
         default=6, ge=1,
-        description="Мягкий потолок количества заметок (create+update), которые Note Planner может предложить за одну задачу",
+        description=(
+            "Потолок подпунктов заметки на один вызов Elaborator по КАЧЕСТВУ, "
+            "не по токен-бюджету — при большем числе подпунктов в одном вызове "
+            "модель даёт поверхностные однострочные ответы."
+        ),
     )
 
     # ---- Critic ----

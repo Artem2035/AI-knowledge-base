@@ -21,20 +21,21 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 # Planner
 # ---------------------------------------------------------------------------
+class OutlineSubpointOutput(BaseModel):
+    heading: str
+    covers: str
 
 
-class SubtopicOutput(BaseModel):
+class OutlineNoteOutput(BaseModel):
     title: str
-    description: str = ""
-    search_queries: list[str] = Field(default_factory=list)
+    subpoints: list[OutlineSubpointOutput] = Field(default_factory=list)
+    rationale: str = ""
 
 
-class PlanOutput(BaseModel):
+class OutlinePlanOutput(BaseModel):
     topic_title: str
     summary: str = ""
-    subtopics: list[SubtopicOutput] = Field(default_factory=list)
-    suggested_source_types: list[str] = Field(default_factory=list)
-
+    notes: list[OutlineNoteOutput] = Field(default_factory=list)
 
 # ---------------------------------------------------------------------------
 # Researcher (отбор источников) — используется только в RESEARCH_MODE=web
@@ -85,7 +86,6 @@ class EvidenceBatchOutput(BaseModel):
 
 
 class ElaborationItem(BaseModel):
-    concept: str
     statement: str
     confidence: float = Field(ge=0.0, le=1.0)
     is_definition: bool = False
@@ -94,7 +94,7 @@ class ElaborationItem(BaseModel):
     # — позволяет раскрывать НЕСКОЛЬКО подтем одним вызовом и корректно
     # приписать каждый факт к его настоящей подтеме в коде-обвязке (см.
     # roles/elaborator.py), тот же принцип, что EvidenceItem.unit_index.
-    subtopic_index: int = 0
+    unit_index: int = 0
 
 
 class ElaborationOutput(BaseModel):
@@ -140,32 +140,6 @@ class SynthesisOutput(BaseModel):
 # ---------------------------------------------------------------------------
 # Synthesizer — Note Planner (шаг 1 map-reduce)
 # ---------------------------------------------------------------------------
-
-class NotePlanItem(BaseModel):
-    title: str
-    action: Literal["create", "update"]
-    existing_path: str = ""  # обязателен при action="update"
-    folder: str = ""
-    # Индексы в списке evidence, переданном в промпте (0-based) — не даём
-    # модели самой формулировать concept-строки для сопоставления, чтобы
-    # избежать рассинхрона между шагом планирования и шагом записи.
-    evidence_indices: list[int] = Field(default_factory=list)
-    tags_hint: list[str] = Field(default_factory=list)
-    # Ориентир объёма заметки, определяется Planner-ом (шаг 1) на основе
-    # количества и содержательности назначенных evidence_indices.
-    # "standard" — дефолт и ожидаемое большинство заметок (~1 страница).
-    # "long" — только если материала объективно больше (~2 страницы) — см.
-    # PLAN_SYSTEM_INSTRUCTION в gemini/prompts/synthesizer_writer.py. НЕ
-    # используется как жёсткая граница валидации
-    # (validation/markdown_validator.py проверяет единый минимум в 3 абзаца
-    # независимо от depth_hint) — только как целевой диапазон слов в
-    # промпте write_note().
-    depth_hint: Literal["standard", "long"] = "standard"
-
-
-class NotePlanOutput(BaseModel):
-    notes: list[NotePlanItem] = Field(default_factory=list)
-
 
 # ---------------------------------------------------------------------------
 # Critic — ревью уже написанной заметки (см. roles/critic.py). Работает
