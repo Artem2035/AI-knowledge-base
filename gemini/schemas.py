@@ -155,3 +155,13 @@ class CriticVerdictOutput(BaseModel):
     # фразы вроде "сделай лучше", а конкретные пункты: "раздел X дублирует
     # раздел Y", "утверждение про Z не подкреплено ни одним evidence" и т.п.)
     feedback: str = ""
+
+# ---------------------------------------------------------------------------
+# папки для заметок
+# ---------------------------------------------------------------------------
+class FolderAssignmentItem(BaseModel):
+    index: int
+    folder: str
+
+class FolderAssignmentOutput(BaseModel):
+    items: list[FolderAssignmentItem] = Field(default_factory=list)

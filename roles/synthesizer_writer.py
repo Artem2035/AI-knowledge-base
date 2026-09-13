@@ -4,11 +4,7 @@ import logging
 from datetime import datetime, timezone
 
 from llm.base import LLMClient
-from gemini.prompts.synthesizer_writer import (
-    PLAN_SYSTEM_INSTRUCTION,
-    WRITE_SYSTEM_INSTRUCTION,
-    _DEPTH_WORD_RANGES,
-)
+from gemini.prompts.synthesizer_writer import (WRITE_SYSTEM_INSTRUCTION)
 from gemini.schemas import DraftNoteOutput
 from storage.models import DraftNote, Evidence, NoteAction, OutlineNote, Relationship, TaskStatus
 from tools.markdown_tools import (

@@ -8,9 +8,13 @@ _md = MarkdownIt("commonmark")
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
 def _count_substantial_paragraphs(text: str, min_chars: int = 40) -> int:
-    without_code = _CODE_FENCE_RE.sub("", text)
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", without_code) if p.strip()]
-    return sum(1 for p in paragraphs if len(p) >= min_chars and not p.startswith("#"))
+    tokens = _md.parse(text)
+    count = 0
+    for i, tok in enumerate(tokens):
+        if tok.type == "inline" and i > 0 and tokens[i - 1].type == "paragraph_open":
+            if len(tok.content.strip()) >= min_chars:
+                count += 1
+    return count
 
 
 def validate_markdown_body(draft: DraftNote) -> list[ValidationIssue]:
