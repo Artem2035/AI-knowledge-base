@@ -26,6 +26,51 @@ Gemini-стиль response_schema (строгую JSON Schema на сторон�
    ("confidence":0. Nine вместо 0.9). Добавлен regex-репейр наиболее частых
    паттернов перед Pydantic-валидацией + один retry с "усиленным" промптом
    при провале.
+ИЗМЕНЕНИЯ (v3) — снижение простоя из-за TPM rate limit:
+5. TokenRateLimiter теперь leaky-bucket ПОВЕРХ прежнего sliding-window
+   (не вместо него): помимо суммы за скользящее окно 60с, дополнительно
+   ограничивает РАВНОМЕРНЫЙ темп расхода (limit/60 токенов в секунду).
+   Раньше окно разрешало потратить весь минутный бюджет одним всплеском
+   в начале — именно это давало пилообразный график нагрузки и пик выше
+   реального лимита (наблюдалось: Total Tokens подскочил до 10.3K при
+   лимите ~8K, сразу за этим — 429). Leaky-bucket делает такой всплеск
+   структурно невозможным независимо от того, сколько вызовов пришло
+   почти одновременно.
+6. TokenEstimateCalibrator — адаптивная калибровка оценки токенов ОТДЕЛЬНО
+   ПО КАЖДОЙ РОЛИ. Статическая эвристика _chars_per_token() (2.3/4.0
+   симв/токен) систематически ошибается, а после включения Groq prompt
+   caching (см. п.7) реальный расход к тому же ещё и падает по мере
+   кэширования статичного префикса system-промпта — расхождение с
+   "наивной" оценкой становится системным, а не случайным шумом.
+   Калибратор держит EMA отношения факт/оценка по роли и применяет его
+   к будущим оценкам ДО отправки запроса, что снижает и ложные ожидания
+   лимитера, и риск занижения оценки, приведший к 429 на графике.
+7. Groq Prompt Caching (см. https://console.groq.com/docs/prompt-caching).
+   Поддерживается именно для моделей openai/gpt-oss-120b/20b/safeguard-20b
+   (наши groq_model/groq_extraction_model по умолчанию), работает
+   автоматически на стороне Groq без изменений запроса — но КЛИЕНТСКИЙ
+   лимитер про это не знал и резервировал полный объём токенов, как будто
+   кэша нет. Теперь из usage.prompt_tokens_details.cached_tokens
+   вычисляется ЭФФЕКТИВНЫЙ (некэшированный) расход — именно он давит на
+   rate limit согласно документации Groq ("Cached tokens do not count
+   towards your rate limits") — и используется и для коррекции резерва
+   лимитера, и как обучающий сигнал для TokenEstimateCalibrator (п.6).
+   Наши system-промпты (WRITE_SYSTEM_INSTRUCTION, SYSTEM_INSTRUCTION
+   критика/elaborator/vault_dedup + JSON Schema) уже статичны и идут
+   ПЕРВЫМ сообщением, а переменная часть (evidence, заголовки конкретной
+   заметки) — во ВТОРОМ (user) сообщении, то есть структура промпта уже
+   оптимальна для автоматического кэширования Groq без каких-либо правок
+   в roles/* — правки нужны только здесь, в клиенте, чтобы реально
+   воспользоваться эффектом в rate-limit бюджете.
+8. Adaptive safety margin (TokenRateLimiter.register_rate_limit_hit()):
+   после РЕАЛЬНОГО 429 от API (не после локального throttle) эффективный
+   TPM-лимit сразу ужимается множителем (0.85 -> и ниже), а не остаётся
+   прежним на всю сессию — это защита от повторного всплеска на пороге,
+   который уже показал себя недостаточно консервативным. Лимит плавно
+   восстанавливается до базового через 5 минут без новых 429, чтобы
+   единичный всплеск в начале задачи не занижал пропускную способность
+   навсегда.
+
 """
 from __future__ import annotations
 
@@ -103,7 +148,12 @@ def _estimate_tokens(text: str) -> int:
     """Грубая оценка количества токенов без внешних зависимостей.
     Для кириллицы токенизаторы в среднем дают ~2.2-2.5 символа/токен
     (хуже, чем для английского ~4 символа/токен), поэтому оцениваем
-    консервативно по доле кириллицы в тексте, чтобы не занижать расход."""
+    консервативно по доле кириллицы в тексте, чтобы не занижать расход.
+
+    Это "сырая" (naive) оценка ДО калибровки по роли — см.
+    TokenEstimateCalibrator ниже, который корректирует именно эту оценку
+    по факту предыдущих вызовов конкретной роли (учитывая, в т.ч.,
+    эффект Groq prompt caching)."""
     if not text:
         return 0
     return int(len(text) / _chars_per_token(text)) + 1
@@ -157,6 +207,14 @@ def _repair_json(raw: str) -> str:
 # (см. https://console.groq.com/docs/structured-outputs) — поэтому включаем
 # его только для моделей из этого списка, для остальных используем прежний
 # json_object + текстовое описание схемы в системном промпте.
+#
+# Это ТЕ ЖЕ модели, для которых Groq поддерживает prompt caching (см.
+# https://console.groq.com/docs/prompt-caching) — совпадение неслучайно
+# полезно: наш системный промпт для этих моделей статичен (system_instruction
+# + фиксированная строка про формат, БЕЗ текстовой схемы — см.
+# _build_response_format_and_system) и идёт первым сообщением, что уже
+# является оптимальной структурой для кэширования Groq без каких-либо
+# дополнительных правок в промптах ролей.
 _STRICT_SCHEMA_SUPPORTED_MODELS = {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
 
 
@@ -210,19 +268,149 @@ def _is_schema_unsupported_error(exc: Exception) -> bool:
         )
     )
 
-class TokenRateLimiter:
-    """Клиентский sliding-window limiter по токенам в минуту (TPM).
 
-    Цель: предотвратить 429/413 ДО отправки запроса, а не реагировать
-    постфактум. Один инстанс на процесс/GroqClient — все вызовы идут через
-    один лок, поэтому конкурентные запросы из разных потоков сериализуются
-    и не съедают TPM-бюджет одновременно.
+class TokenEstimateCalibrator:
+    """Адаптивная калибровка "наивной" оценки токенов ОТДЕЛЬНО ПО КАЖДОЙ РОЛИ
+    (вариант 1 из обсуждения простоя по TPM).
+
+    Зачем отдельно по роли, а не глобально: роли сильно различаются по
+    соотношению статичного (system_instruction + JSON Schema) и
+    динамического (сам prompt) текста. Например:
+    - synthesizer_write / critic — большой статичный system-промпт,
+      почти целиком кэшируется Groq после первого вызова роли в задаче
+      (см. GroqClient._call_with_retry, где cached_tokens вычитается из
+      эффективного расхода) — реальный расход быстро падает намного ниже
+      "сырой" оценки по символам.
+    - researcher_selection / elaborator — промпт почти целиком уникален
+      на каждый вызов (список источников/подтем меняется), кэш почти не
+      помогает, "сырая" оценка ближе к реальности.
+    Общий (не per-role) коэффициент усреднял бы эти два принципиально
+    разных случая и был бы неточным для обоих.
+
+    Используется EMA (экспоненциальное скользящее среднее), а не простое
+    среднее по всем вызовам — это позволяет коэффициенту "забывать"
+    старые оценки и быстро адаптироваться, если поведение роли изменилось
+    (например, включился/остыл кэш Groq в течение задачи).
+    """
+
+    _EMA_ALPHA = 0.3  # вес нового наблюдения; выше — быстрее адаптация, но шумнее
+    # Не даём коэффициенту улетать в крайности от одного нетипичного вызова
+    # (например, первый вызов роли в задаче — заведомо без кэша, cache_ratio=0,
+    # но это не значит, что и ВСЕ следующие вызовы будут без кэша).
+    _MIN_RATIO = 0.05
+    _MAX_RATIO = 1.5
+
+    def __init__(self) -> None:
+        self._ratio_by_role: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def correct(self, role: str, naive_estimate: int) -> int:
+        """Возвращает скорректированную оценку. Пока нет ни одного
+        наблюдения по роли — возвращает наивную оценку как есть (безопасный
+        дефолт, эквивалентный прежнему поведению до внедрения калибровки)."""
+        with self._lock:
+            ratio = self._ratio_by_role.get(role)
+        if ratio is None:
+            return naive_estimate
+        return max(int(naive_estimate * ratio), 1)
+
+    def observe(self, role: str, naive_estimate: int, actual_effective_tokens: int) -> None:
+        """actual_effective_tokens — уже ПОСЛЕ вычета cached_tokens (см.
+        GroqClient._call_with_retry) — то есть то, что реально стоило
+        роли по TPM-бюджету, а не то, что было формально в prompt_tokens."""
+        if naive_estimate <= 0:
+            return
+        sample_ratio = actual_effective_tokens / naive_estimate
+        sample_ratio = max(min(sample_ratio, self._MAX_RATIO), self._MIN_RATIO)
+        with self._lock:
+            prev = self._ratio_by_role.get(role)
+            new_ratio = (
+                sample_ratio if prev is None
+                else self._EMA_ALPHA * sample_ratio + (1 - self._EMA_ALPHA) * prev
+            )
+            self._ratio_by_role[role] = new_ratio
+            logger.debug(
+                "TokenEstimateCalibrator[%s]: наблюдение ratio=%.3f -> EMA=%.3f "
+                "(naive=%d, effective=%d)",
+                role, sample_ratio, new_ratio, naive_estimate, actual_effective_tokens,
+            )
+
+class TokenRateLimiter:
+    """Клиентский лимитер по токенам в минуту (TPM).
+
+    Комбинирует ДВА независимых ограничения (вариант 4 — leaky-bucket):
+
+    1. Sliding-window (как раньше) — жёсткая защита: сумма зарезервированных
+       токенов за последние 60 секунд никогда не превышает self._limit.
+       Сам по себе этот механизм НЕ запрещает потратить весь лимит одним
+       всплеском в начале окна — именно так возник пик на графике Total
+       Tokens (почти вертикальный взлёт почти до 10.3K при лимите ~8K).
+
+    2. Leaky-bucket (новое) — ограничивает РАВНОМЕРНЫЙ темп расхода
+       (limit/60 токенов в секунду) поверх sliding-window. Запрос
+       разрешается, только если накопленный с начала текущей "минуты
+       темпа" расход не опережает то, что должно было быть потрачено при
+       равномерном темпе (+15% буфер гибкости, чтобы редкие короткие
+       вызовы не спотыкались об идеально линейный график). Это делает
+       структурно невозможным сам всплеск, а не только реагирует на него
+       постфактум.
+
+    Также реализует adaptive safety margin (вариант 3):
+    register_rate_limit_hit() ужимает эффективный лимит сразу после
+    РЕАЛЬНОГО 429 от API, с плавным восстановлением через
+    _RECOVERY_AFTER_SECONDS секунд без новых 429.
     """
 
     def __init__(self, tpm_limit: int, safety_margin: float = 0.85):
-        self._limit = max(int(tpm_limit * safety_margin), 1)
+        self._base_limit = max(int(tpm_limit * safety_margin), 1)
+        self._limit = self._base_limit
         self._window: deque[tuple[float, int]] = deque()
         self._lock = threading.RLock()
+
+        # -- leaky-bucket state --
+        self._bucket_start = time.monotonic()
+        self._bucket_spent = 0
+        self._BUCKET_SLACK_RATIO = 0.15  # допустимый "буфер темпа" сверх линии
+
+        # -- adaptive safety margin state (вариант 3) --
+        self._margin_penalty = 1.0  # текущий множитель к self._base_limit
+        self._last_penalty_at: float | None = None
+        self._RECOVERY_AFTER_SECONDS = 300.0
+        self._PENALTY_FACTOR = 0.8
+        self._MIN_PENALTY = 0.5
+
+    # -- вариант 3: adaptive safety margin --------------------------------
+
+    def register_rate_limit_hit(self) -> None:
+        """Вызывается GroqClient сразу после РЕАЛЬНОГО 429 от API (не после
+        локального throttle внутри этого же лимитера) — ужимает эффективный
+        TPM-лимит, чтобы не наступать на те же грабли повторно в рамках
+        этой же сессии/задачи."""
+        with self._lock:
+            self._margin_penalty = max(self._margin_penalty * self._PENALTY_FACTOR, self._MIN_PENALTY)
+            self._last_penalty_at = time.monotonic()
+            self._limit = max(int(self._base_limit * self._margin_penalty), 1)
+            logger.warning(
+                "TokenRateLimiter: получен реальный 429 от Groq — эффективный "
+                "TPM-лимит ужат до %d (%.0f%% от базового %d) до восстановления "
+                "через %.0fс без новых 429.",
+                self._limit, 100 * self._margin_penalty, self._base_limit,
+                self._RECOVERY_AFTER_SECONDS,
+            )
+
+    def _maybe_recover_margin(self, now: float) -> None:
+        if self._margin_penalty >= 1.0 or self._last_penalty_at is None:
+            return
+        if now - self._last_penalty_at >= self._RECOVERY_AFTER_SECONDS:
+            self._margin_penalty = 1.0
+            self._limit = self._base_limit
+            self._last_penalty_at = None
+            logger.info(
+                "TokenRateLimiter: TPM-лимит восстановлен до базового значения %d "
+                "(нет 429 последние %.0fс).", self._limit, self._RECOVERY_AFTER_SECONDS,
+            )
+
+    # -- sliding window -----------------------------------------------------
 
     def _prune(self, now: float) -> int:
         while self._window and now - self._window[0][0] > 60:
@@ -231,36 +419,79 @@ class TokenRateLimiter:
 
     def available_tokens(self) -> int:
         with self._lock:
-            used = self._prune(time.monotonic())
+            now = time.monotonic()
+            self._maybe_recover_margin(now)
+            used = self._prune(now)
             return max(self._limit - used, 0)
 
+    # -- вариант 4: leaky-bucket ---------------------------------------------
+
+    def _leaky_bucket_check(self, now: float, estimated_tokens: int) -> tuple[bool, float]:
+        """Возвращает (allowed, sleep_hint_seconds). НЕ владеет локом сама —
+        вызывается изнутри wait_and_reserve, который уже держит self._lock."""
+        elapsed = now - self._bucket_start
+        if elapsed > 60:
+            # Сбрасываем "бюджет темпа" раз в минуту, чтобы не копить
+            # неиспользованный запас бесконечно — иначе после долгой паузы
+            # между вызовами ролей (веб-поиск/fetch между ними может занимать
+            # минуты) система разрешила бы новый всплеск на весь накопленный
+            # простой, что как раз и является проблемой, которую чиним.
+            self._bucket_start = now
+            self._bucket_spent = 0
+            elapsed = 0.0
+
+        rate_per_second = self._limit / 60.0
+        allowed_by_now = rate_per_second * elapsed
+        slack = self._limit * self._BUCKET_SLACK_RATIO
+        if self._bucket_spent + estimated_tokens <= allowed_by_now + slack:
+            return True, 0.0
+        deficit = self._bucket_spent + estimated_tokens - allowed_by_now - slack
+        return False, deficit / rate_per_second
+
     def wait_and_reserve(self, estimated_tokens: int) -> None:
-        """Блокирует поток, пока в скользящем окне не появится место
-        под estimated_tokens. Резервирует место сразу (оптимистично);
+        """Блокирует поток, пока не появится место И по sliding-window, И
+        по leaky-bucket темпу. Резервирует место сразу (оптимистично);
         реальный расход корректируется через adjust_last_reservation()."""
         with self._lock:
             while True:
                 now = time.monotonic()
+                self._maybe_recover_margin(now)
                 used = self._prune(now)
-                if used + estimated_tokens <= self._limit:
+
+                sliding_ok = used + estimated_tokens <= self._limit
+                bucket_ok, bucket_sleep = self._leaky_bucket_check(now, estimated_tokens)
+
+                if sliding_ok and bucket_ok:
                     self._window.append((now, estimated_tokens))
+                    self._bucket_spent += estimated_tokens
                     return
-                oldest_ts, _ = self._window[0]
-                sleep_for = max(60 - (now - oldest_ts) + 0.1, 0.2)
+
+                if not sliding_ok:
+                    oldest_ts, _ = self._window[0]
+                    sleep_for = max(60 - (now - oldest_ts) + 0.1, 0.2)
+                else:
+                    sleep_for = max(bucket_sleep, 0.2)
+
                 logger.info(
-                    "TokenRateLimiter: ждём %.1fs (used=%d, limit=%d, need=%d)",
-                    sleep_for, used, self._limit, estimated_tokens,
+                    "TokenRateLimiter: ждём %.1fs (used=%d, limit=%d, need=%d, "
+                    "bucket_ok=%s, margin=%.0f%%)",
+                    sleep_for, used, self._limit, estimated_tokens, bucket_ok,
+                    100 * self._margin_penalty,
                 )
                 time.sleep(min(sleep_for, 5.0))  # спим короткими интервалами,
                 # чтобы не залипать надолго при неточной оценке
 
     def adjust_last_reservation(self, actual_tokens: int) -> None:
-        """Подменяет оценочный резерв фактическим расходом из response.usage,
-        если он доступен — повышает точность лимитера со временем."""
+        """Подменяет оценочный резерв ЭФФЕКТИВНЫМ расходом (уже за вычетом
+        закэшированных Groq токенов — см. GroqClient._call_with_retry),
+        повышая точность и sliding-window, и leaky-bucket бюджета со
+        временем."""
         with self._lock:
             if self._window:
-                ts, _ = self._window[-1]
+                ts, reserved = self._window[-1]
+                delta = actual_tokens - reserved
                 self._window[-1] = (ts, actual_tokens)
+                self._bucket_spent = max(self._bucket_spent + delta, 0)
 
     def force_wait(self, seconds: float) -> None:
         """Используется, когда Groq всё же вернул 429 с явным retry-after —
@@ -290,6 +521,11 @@ class GroqClient:
 
         tpm_limit = getattr(settings, "groq_tpm_limit", None) or self.DEFAULT_TPM_LIMIT
         self._limiter = TokenRateLimiter(tpm_limit=tpm_limit)
+        # Вариант 1: адаптивная калибровка оценки токенов по роли (см.
+        # класс TokenEstimateCalibrator выше). Один инстанс на клиент —
+        # калибровка накапливается по всем вызовам этого клиента в течение
+        # его жизни (обычно — в течение одной задачи/сессии Orchestrator).
+        self._calibrator = TokenEstimateCalibrator()
         self._strict_schema_supported = settings.groq_model in _STRICT_SCHEMA_SUPPORTED_MODELS
 
         from openai import OpenAI  # локальный импорт — модуль не требует пакет,
@@ -324,7 +560,8 @@ class GroqClient:
         overhead = _estimate_tokens(system_instruction) + _estimate_tokens(schema_hint)
         total_available = self._limiter.available_tokens()
         # берём min с полным лимитом окна (available_tokens уже учитывает
-        # то, что "занято" другими вызовами в последнюю минуту)
+        # то, что "занято" другими вызовами в последнюю минуту, а также
+        # текущий adaptive margin после возможного недавнего 429)
         budget = total_available - overhead - self.RESERVED_OUTPUT_TOKENS
         return max(budget, 0)
 
@@ -374,16 +611,24 @@ class GroqClient:
             prompt = self._auto_truncate_prompt(prompt, max_prompt_tokens, role=role)
             prompt_tokens = _estimate_tokens(prompt)
 
-        estimated = system_tokens + prompt_tokens
+        # "Наивная" (по символам) оценка полного расхода на вызов, ДО
+        # калибровки по роли. Именно эта величина сравнивается с реальным
+        # эффективным расходом в _call_with_retry -> TokenEstimateCalibrator.observe()
+        # после ответа — калибровка автоматически впитывает как ошибку
+        # эвристики chars/token, так и эффект Groq prompt caching (вариант 1 + 7).
+        naive_estimate = system_tokens + prompt_tokens + self.RESERVED_OUTPUT_TOKENS
+        calibrated_estimate = self._calibrator.correct(role, naive_estimate)
 
         try:
             raw_json = self._call_with_retry(
                 prompt=prompt,
                 system_instruction=full_system,
-                estimated_tokens=estimated + self.RESERVED_OUTPUT_TOKENS,
+                estimated_tokens=calibrated_estimate,
                 response_format=response_format,
                 fallback_format=fallback_format,
                 fallback_system=fallback_system,
+                role=role,
+                naive_estimate=naive_estimate,
             )
             parsed = self._parse_with_repair(raw_json, response_model)
             self.budget.register_call(status, role=role, ok=True)
@@ -414,7 +659,15 @@ class GroqClient:
         ниже — используется для fallback-вызова после отказа API от
         строгой схемы) — json_object + текстовая схема как подсказка
         (best-effort), это ЕДИНСТВЕННЫЙ режим, где модель вообще видит
-        состав полей схемы текстом."""
+        состав полей схемы текстом.
+
+        ВАЖНО для prompt caching (см. п.7 в шапке модуля): full_system
+        здесь НЕ содержит ничего специфичного для конкретного вызова роли
+        (никаких evidence/заголовков заметки) — для одной и той же роли и
+        одного и того же response_model этот текст побайтово одинаков на
+        каждом вызове. Именно это делает его валидным статичным префиксом
+        для автоматического кэширования Groq — трогать эту инвариантность
+        (например, добавляя туда что-то динамическое) значит ломать кэш."""
         base_instruction = (system_instruction or "").strip()
 
         if self._strict_schema_supported and not force_json_object:
@@ -438,12 +691,6 @@ class GroqClient:
                   "того, чтобы пропустить поле целиком (пропуск обязательного "
                   "поля — ошибка формата, даже если по смыслу роли оно сейчас "
                   "не нужно)."
-                  "Особое внимание: поля, которые по смыслу относятся только к одному "
-                  "из вариантов action (например 'append_section' нужен только при "
-                  "action='update', 'existing_path' — тоже только при 'update'), ВСЁ "
-                  "РАВНО обязаны присутствовать в JSON как пустая строка \"\", если "
-                  "сейчас неприменимы. Пропуск такого поля — невалидный ответ, даже "
-                  "если оно 'не нужно' для текущего case."
             )
             return response_format, full_system
 
@@ -549,6 +796,8 @@ class GroqClient:
         response_format: dict,
         fallback_format: dict | None = None,
         fallback_system: str | None = None,
+        role: str = "",
+        naive_estimate: int = 0,
     ) -> str:
         self._limiter.wait_and_reserve(estimated_tokens)
 
@@ -568,8 +817,32 @@ class GroqClient:
 
             usage = getattr(response, "usage", None)
             actual_total = getattr(usage, "total_tokens", None) if usage else None
-            if actual_total:
-                self._limiter.adjust_last_reservation(int(actual_total))
+            if actual_total is not None:
+                # -- Prompt caching (вариант 7, см. шапку модуля) --
+                # usage.prompt_tokens_details.cached_tokens — сколько токенов
+                # промпта обслужено из кэша Groq (см.
+                # https://console.groq.com/docs/prompt-caching#response-usage-structure).
+                # Эти токены НЕ считаются в rate limit ("Cached tokens do not
+                # count towards your rate limits"), поэтому и для корректировки
+                # лимитера, и для калибровки (TokenEstimateCalibrator) нужно
+                # использовать ЭФФЕКТИВНЫЙ расход, а не total_tokens как раньше.
+                details = getattr(usage, "prompt_tokens_details", None)
+                cached = getattr(details, "cached_tokens", 0) if details else 0
+                cached = int(cached or 0)
+                effective_tokens = max(int(actual_total) - cached, 0)
+
+                self._limiter.adjust_last_reservation(effective_tokens)
+
+                if role and naive_estimate:
+                    self._calibrator.observe(role, naive_estimate, effective_tokens)
+
+                if cached:
+                    logger.info(
+                        "Groq prompt cache hit для роли '%s': %d/%d токенов "
+                        "промпта из кэша (%.0f%%).",
+                        role, cached, actual_total,
+                        100 * cached / actual_total if actual_total else 0,
+                    )
 
             return content
         except Exception as exc:
@@ -591,6 +864,8 @@ class GroqClient:
                     response_format=fallback_format,
                     # fallback_format/fallback_system не передаём — повторный
                     # откат не пытаемся делать, чтобы не уйти в рекурсию.
+                    role=role,
+                    naive_estimate=naive_estimate,
                 )
 
             logger.exception(
@@ -601,6 +876,12 @@ class GroqClient:
                 retry_after = _parse_retry_after(str(exc))
                 if retry_after is not None:
                     self._limiter.force_wait(retry_after)
+                # -- вариант 3: adaptive safety margin --
+                # Реальный 429 — сигнал, что текущий эффективный лимит
+                # (base_limit * margin) недостаточно консервативен здесь и
+                # сейчас; ужимаем его немедленно, чтобы не повторить всплеск
+                # на следующей волне вызовов той же роли/задачи.
+                self._limiter.register_rate_limit_hit()
                 raise GroqRateLimitError(str(exc), retry_after=retry_after) from exc
             if _is_request_too_large_error(exc):
                 raise GroqPromptTooLargeError(
