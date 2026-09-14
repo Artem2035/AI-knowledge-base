@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # Бампать при несовместимых изменениях структуры чекпоинта — старые
 # чекпоинты с другой версией просто не загрузятся (см. load_checkpoint),
 # вместо того чтобы упасть с невнятной ошибкой валидации Pydantic.
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 
 
 class TaskCheckpoint(BaseModel):
@@ -77,6 +77,13 @@ class TaskCheckpoint(BaseModel):
     total_gemini_calls_used: int = 0
 
     plan: Plan | None = None # теперь Plan с .notes
+    # НОВОЕ: явное подтверждение плана пользователем (inline-confirm в
+    # cli/main.py::ask). Отделено от самого факта "plan is not None",
+    # т.к. план может быть уже построен (1 дешёвый вызов), но ещё НЕ
+    # утверждён — например, если пользователь ответил "нет" и задача
+    # остановилась ДО траты бюджета на elaboration. При resume такой
+    # задачи подтверждение будет запрошено снова, а не пропущено.
+    plan_approved: bool = False
 
     raw_candidates_done: bool = False
     raw_candidates: list[SourceCandidate] = Field(default_factory=list)

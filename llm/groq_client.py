@@ -26,6 +26,7 @@ Gemini-стиль response_schema (строгую JSON Schema на сторон�
    ("confidence":0. Nine вместо 0.9). Добавлен regex-репейр наиболее частых
    паттернов перед Pydantic-валидацией + один retry с "усиленным" промптом
    при провале.
+
 ИЗМЕНЕНИЯ (v3) — снижение простоя из-за TPM rate limit:
 5. TokenRateLimiter теперь leaky-bucket ПОВЕРХ прежнего sliding-window
    (не вместо него): помимо суммы за скользящее окно 60с, дополнительно
@@ -70,7 +71,6 @@ Gemini-стиль response_schema (строгую JSON Schema на сторон�
    восстанавливается до базового через 5 минут без новых 429, чтобы
    единичный всплеск в начале задачи не занижал пропускную способность
    навсегда.
-
 """
 from __future__ import annotations
 
@@ -293,14 +293,17 @@ class TokenEstimateCalibrator:
     (например, включился/остыл кэш Groq в течение задачи).
     """
 
-    _EMA_ALPHA = 0.3  # вес нового наблюдения; выше — быстрее адаптация, но шумнее
-    # Не даём коэффициенту улетать в крайности от одного нетипичного вызова
-    # (например, первый вызов роли в задаче — заведомо без кэша, cache_ratio=0,
-    # но это не значит, что и ВСЕ следующие вызовы будут без кэша).
-    _MIN_RATIO = 0.05
-    _MAX_RATIO = 1.5
-
-    def __init__(self) -> None:
+    def __init__(self, ema_alpha: float = 0.3, min_ratio: float = 0.05, max_ratio: float = 1.5) -> None:
+        # ema_alpha — вес нового наблюдения; выше — быстрее адаптация, но
+        # шумнее. min_ratio/max_ratio — не даём коэффициенту улетать в
+        # крайности от одного нетипичного вызова (например, первый вызов
+        # роли в задаче — заведомо без кэша, cache_ratio=0, но это не
+        # значит, что и ВСЕ следующие вызовы будут без кэша).
+        # Значения читаются GroqClient из config/settings.py
+        # (groq_calibration_ema_alpha/min_ratio/max_ratio).
+        self._ema_alpha = ema_alpha
+        self._min_ratio = min_ratio
+        self._max_ratio = max_ratio
         self._ratio_by_role: dict[str, float] = {}
         self._lock = threading.Lock()
 
@@ -321,12 +324,12 @@ class TokenEstimateCalibrator:
         if naive_estimate <= 0:
             return
         sample_ratio = actual_effective_tokens / naive_estimate
-        sample_ratio = max(min(sample_ratio, self._MAX_RATIO), self._MIN_RATIO)
+        sample_ratio = max(min(sample_ratio, self._max_ratio), self._min_ratio)
         with self._lock:
             prev = self._ratio_by_role.get(role)
             new_ratio = (
                 sample_ratio if prev is None
-                else self._EMA_ALPHA * sample_ratio + (1 - self._EMA_ALPHA) * prev
+                else self._ema_alpha * sample_ratio + (1 - self._ema_alpha) * prev
             )
             self._ratio_by_role[role] = new_ratio
             logger.debug(
@@ -334,6 +337,7 @@ class TokenEstimateCalibrator:
                 "(naive=%d, effective=%d)",
                 role, sample_ratio, new_ratio, naive_estimate, actual_effective_tokens,
             )
+
 
 class TokenRateLimiter:
     """Клиентский лимитер по токенам в минуту (TPM).
@@ -358,10 +362,18 @@ class TokenRateLimiter:
     Также реализует adaptive safety margin (вариант 3):
     register_rate_limit_hit() ужимает эффективный лимит сразу после
     РЕАЛЬНОГО 429 от API, с плавным восстановлением через
-    _RECOVERY_AFTER_SECONDS секунд без новых 429.
+    margin_recovery_seconds секунд без новых 429.
     """
 
-    def __init__(self, tpm_limit: int, safety_margin: float = 0.85):
+    def __init__(
+        self,
+        tpm_limit: int,
+        safety_margin: float = 0.85,
+        bucket_slack_ratio: float = 0.15,
+        margin_penalty_factor: float = 0.8,
+        margin_min_penalty: float = 0.5,
+        margin_recovery_seconds: float = 300.0,
+    ):
         self._base_limit = max(int(tpm_limit * safety_margin), 1)
         self._limit = self._base_limit
         self._window: deque[tuple[float, int]] = deque()
@@ -370,14 +382,17 @@ class TokenRateLimiter:
         # -- leaky-bucket state --
         self._bucket_start = time.monotonic()
         self._bucket_spent = 0
-        self._BUCKET_SLACK_RATIO = 0.15  # допустимый "буфер темпа" сверх линии
+        self._bucket_slack_ratio = bucket_slack_ratio  # допустимый "буфер темпа" сверх линии
 
         # -- adaptive safety margin state (вариант 3) --
         self._margin_penalty = 1.0  # текущий множитель к self._base_limit
         self._last_penalty_at: float | None = None
-        self._RECOVERY_AFTER_SECONDS = 300.0
-        self._PENALTY_FACTOR = 0.8
-        self._MIN_PENALTY = 0.5
+        self._recovery_after_seconds = margin_recovery_seconds
+        self._penalty_factor = margin_penalty_factor
+        self._min_penalty = margin_min_penalty
+
+        # Значения bucket_slack_ratio/margin_* читаются GroqClient из
+        # config/settings.py (groq_bucket_slack_ratio, groq_margin_*).
 
     # -- вариант 3: adaptive safety margin --------------------------------
 
@@ -387,7 +402,7 @@ class TokenRateLimiter:
         TPM-лимит, чтобы не наступать на те же грабли повторно в рамках
         этой же сессии/задачи."""
         with self._lock:
-            self._margin_penalty = max(self._margin_penalty * self._PENALTY_FACTOR, self._MIN_PENALTY)
+            self._margin_penalty = max(self._margin_penalty * self._penalty_factor, self._min_penalty)
             self._last_penalty_at = time.monotonic()
             self._limit = max(int(self._base_limit * self._margin_penalty), 1)
             logger.warning(
@@ -395,19 +410,19 @@ class TokenRateLimiter:
                 "TPM-лимит ужат до %d (%.0f%% от базового %d) до восстановления "
                 "через %.0fс без новых 429.",
                 self._limit, 100 * self._margin_penalty, self._base_limit,
-                self._RECOVERY_AFTER_SECONDS,
+                self._recovery_after_seconds,
             )
 
     def _maybe_recover_margin(self, now: float) -> None:
         if self._margin_penalty >= 1.0 or self._last_penalty_at is None:
             return
-        if now - self._last_penalty_at >= self._RECOVERY_AFTER_SECONDS:
+        if now - self._last_penalty_at >= self._recovery_after_seconds:
             self._margin_penalty = 1.0
             self._limit = self._base_limit
             self._last_penalty_at = None
             logger.info(
                 "TokenRateLimiter: TPM-лимит восстановлен до базового значения %d "
-                "(нет 429 последние %.0fс).", self._limit, self._RECOVERY_AFTER_SECONDS,
+                "(нет 429 последние %.0fс).", self._limit, self._recovery_after_seconds,
             )
 
     # -- sliding window -----------------------------------------------------
@@ -442,7 +457,7 @@ class TokenRateLimiter:
 
         rate_per_second = self._limit / 60.0
         allowed_by_now = rate_per_second * elapsed
-        slack = self._limit * self._BUCKET_SLACK_RATIO
+        slack = self._limit * self._bucket_slack_ratio
         if self._bucket_spent + estimated_tokens <= allowed_by_now + slack:
             return True, 0.0
         deficit = self._bucket_spent + estimated_tokens - allowed_by_now - slack
@@ -520,12 +535,32 @@ class GroqClient:
         self.budget = budget
 
         tpm_limit = getattr(settings, "groq_tpm_limit", None) or self.DEFAULT_TPM_LIMIT
-        self._limiter = TokenRateLimiter(tpm_limit=tpm_limit)
+        # Все параметры leaky-bucket/adaptive-margin читаются из Settings
+        # (config/settings.py::groq_limiter_safety_margin, groq_bucket_slack_ratio,
+        # groq_margin_penalty_factor, groq_margin_min_penalty,
+        # groq_margin_recovery_seconds) вместо хардкода в TokenRateLimiter.
+        # getattr с дефолтом — на случай частично обновлённого Settings
+        # (не должно происходить в проекте, но не хотим падать по
+        # AttributeError при рассинхроне версий).
+        self._limiter = TokenRateLimiter(
+            tpm_limit=tpm_limit,
+            safety_margin=getattr(settings, "groq_limiter_safety_margin", 0.85),
+            bucket_slack_ratio=getattr(settings, "groq_bucket_slack_ratio", 0.15),
+            margin_penalty_factor=getattr(settings, "groq_margin_penalty_factor", 0.8),
+            margin_min_penalty=getattr(settings, "groq_margin_min_penalty", 0.5),
+            margin_recovery_seconds=getattr(settings, "groq_margin_recovery_seconds", 300.0),
+        )
         # Вариант 1: адаптивная калибровка оценки токенов по роли (см.
         # класс TokenEstimateCalibrator выше). Один инстанс на клиент —
         # калибровка накапливается по всем вызовам этого клиента в течение
         # его жизни (обычно — в течение одной задачи/сессии Orchestrator).
-        self._calibrator = TokenEstimateCalibrator()
+        # Параметры — из config/settings.py::groq_calibration_ema_alpha/
+        # min_ratio/max_ratio.
+        self._calibrator = TokenEstimateCalibrator(
+            ema_alpha=getattr(settings, "groq_calibration_ema_alpha", 0.3),
+            min_ratio=getattr(settings, "groq_calibration_min_ratio", 0.05),
+            max_ratio=getattr(settings, "groq_calibration_max_ratio", 1.5),
+        )
         self._strict_schema_supported = settings.groq_model in _STRICT_SCHEMA_SUPPORTED_MODELS
 
         from openai import OpenAI  # локальный импорт — модуль не требует пакет,

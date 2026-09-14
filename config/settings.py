@@ -71,6 +71,63 @@ class Settings(BaseSettings):
     groq_extraction_tpm_limit: int = Field(default=8000, ge=1)
     groq_extraction_rpd_soft_limit: int = Field(default=900, ge=1)  # запас от реального лимита 1000
 
+    # ---- Groq: adaptive rate limiting (llm/groq_client.py::TokenRateLimiter) ----
+    # Вынесено в конфиг по итогам обсуждения простоя из-за TPM rate limit
+    # (см. комментарии в заголовке llm/groq_client.py, варианты 1/3/4).
+    # Значения по умолчанию совпадают с тем, что раньше было захардкожено
+    # прямо в классах TokenRateLimiter/TokenEstimateCalibrator — изменение
+    # этого файла НЕ меняет поведение системы по умолчанию, только даёт
+    # возможность потюнить без правки кода.
+
+    # Множитель к реальному TPM-лимиту модели — держим запас, чтобы неточная
+    # оценка токенов сама по себе не провоцировала 429 (было захардкожено
+    # как safety_margin=0.85 в конструкторе TokenRateLimiter).
+    groq_limiter_safety_margin: float = Field(default=0.85, gt=0.0, le=1.0)
+
+    # Leaky-bucket (вариант 4): допустимый "буфер темпа" сверх идеально
+    # равномерной линии расхода — доля от лимита. Без буфера редкие короткие
+    # вызовы искусственно ждали бы даже при огромном запасе по sliding-window.
+    # Больше значение — ближе к прежнему поведению чистого sliding-window
+    # (разрешает больший всплеск); меньше — жёстче размазывает нагрузку.
+    groq_bucket_slack_ratio: float = Field(default=0.15, ge=0.0, le=1.0)
+
+    # Adaptive safety margin (вариант 3): что происходит с лимитом сразу
+    # после РЕАЛЬНОГО 429 от API.
+    # penalty_factor — на какую долю ужимается эффективный лимит за одно
+    # срабатывание (0.8 = минус 20%).
+    groq_margin_penalty_factor: float = Field(default=0.8, gt=0.0, lt=1.0)
+    # min_penalty — не даём итоговому множителю уйти ниже этой доли от
+    # базового лимита, даже при нескольких 429 подряд в рамках одной задачи
+    # (иначе можно почти полностью парализовать вызовы одним неудачным стартом).
+    groq_margin_min_penalty: float = Field(default=0.5, gt=0.0, le=1.0)
+    # recovery_seconds — через сколько секунд без новых 429 лимит плавно
+    # восстанавливается до базового значения.
+    groq_margin_recovery_seconds: float = Field(default=300.0, ge=0.0)
+
+    # Калибровка оценки токенов по роли (вариант 1 + учёт Groq prompt
+    # caching, см. TokenEstimateCalibrator).
+    # ema_alpha — вес нового наблюдения в экспоненциальном скользящем
+    # среднем; больше — быстрее адаптация, но чувствительнее к шуму
+    # отдельных вызовов.
+    groq_calibration_ema_alpha: float = Field(default=0.3, gt=0.0, le=1.0)
+    # min/max_ratio — ограничивают, во сколько раз калиброванная оценка
+    # может отличаться от "наивной" по одному наблюдению — защита от того,
+    # чтобы один нетипичный вызов (например, первый вызов роли без кэша)
+    # не увёл коэффициент в крайность на весь остаток задачи.
+    groq_calibration_min_ratio: float = Field(default=0.05, gt=0.0)
+    groq_calibration_max_ratio: float = Field(default=1.5, gt=0.0)
+
+    @field_validator("groq_calibration_max_ratio")
+    @classmethod
+    def _max_ratio_above_min(cls, v: float, info) -> float:
+        min_ratio = info.data.get("groq_calibration_min_ratio")
+        if min_ratio is not None and v <= min_ratio:
+            raise ValueError(
+                "groq_calibration_max_ratio должен быть больше "
+                "groq_calibration_min_ratio"
+            )
+        return v
+
     free_only: bool = Field(default=True, description="Жёсткий флаг: только бесплатные провайдеры")
 
     # Общий бюджет вызовов на задачу — не зависит от того, какой провайдер активен

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.tree import Tree
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from config.settings import get_settings
@@ -14,6 +17,7 @@ from staging.changeset import list_pending_tasks, load_changeset, staging_task_d
 from staging.checkpoint import list_resumable_tasks
 from staging.commit import commit_changeset
 from staging.diff import render_diff_summary
+from storage.models import Plan
 
 app = typer.Typer(add_completion=False, help="Персональная AI-система управления знаниями для Obsidian")
 console = Console()
@@ -29,12 +33,25 @@ def _run_and_report(orch: Orchestrator, *, raw_query: str | None, resume_task_id
     def progress_cb(stage: str):
         console.print(f"[dim]→[/dim] {stage}")
 
+    status_ctx = console.status("Выполняется…", spinner="dots")
+
+    def confirm_with_paused_spinner(plan) -> bool:
+        status_ctx.stop()
+        try:
+            return _confirm_plan(plan)
+        finally:
+            status_ctx.start()
+
     try:
-        with console.status("Выполняется…", spinner="dots"):
-            result = orch.run(
-                raw_query=raw_query, resume_task_id=resume_task_id, progress_cb=progress_cb
-            )
+        status_ctx.start()
+        result = orch.run(
+            raw_query=raw_query,
+            resume_task_id=resume_task_id,
+            progress_cb=progress_cb,
+            plan_confirm_cb=confirm_with_paused_spinner,
+        )
     finally:
+        status_ctx.stop()
         orch.close()
 
     if result.stopped:
@@ -96,11 +113,17 @@ def resumable():
     if not checkpoints:
         console.print("Нет задач, ожидающих продолжения.")
         return
+    moscow_tz = ZoneInfo("Europe/Moscow")
+    fromisoformat = datetime.fromisoformat
+
     for cp in checkpoints:
         preview = cp.raw_query if len(cp.raw_query) <= 60 else cp.raw_query[:57] + "…"
+        msk_time = fromisoformat(cp.updated_at).astimezone(moscow_tz)
+        task_date = msk_time.strftime("%d.%m.%Y %H:%M по мск")
         console.print(
             f"- [bold]{cp.task_id}[/bold]  шаг: {cp.last_completed_stage}  "
-            f"«{preview}»  (всего потрачено Gemini-вызовов: {cp.total_gemini_calls_used})"
+            f"«{preview}»  {task_date}"
+            f"(всего потрачено Gemini-вызовов: {cp.total_gemini_calls_used})"
         )
     console.print(
         "\nПродолжить: [bold]python -m cli.main resume <task_id>[/bold]"
@@ -184,6 +207,25 @@ def index():
     db.close()
     console.print(stats)
 
+def _build_plan_tree(plan: Plan) -> Tree:
+    # Корень дерева — summary темы (не topic_title отдельной строкой сверху,
+    # т.к. Panel с заголовком больше не используется — сам topic_title
+    # логично вынести отдельной строкой ПЕРЕД деревом, см. _confirm_plan).
+    root = Tree(plan.summary or plan.topic_title)
+    for i, note in enumerate(plan.notes, start=1):
+        note_branch = root.add(f"{i}. {note.title}")
+        for sp in note.subpoints:
+            note_branch.add(f"{sp.heading}: {sp.covers}")
+    return root
+
+
+def _confirm_plan(plan: Plan) -> bool:
+    console.print(plan.topic_title)
+    console.print(_build_plan_tree(plan))
+    total_subpoints = sum(len(n.subpoints) for n in plan.notes)
+    console.print(f"\nЗаметок: {len(plan.notes)}, подпунктов всего: {total_subpoints}\n")
+    # TODO (будущее): здесь же — выбор "утвердить / редактировать / отменить".
+    return typer.confirm("Утвердить текущий план?", default=True)
 
 if __name__ == "__main__":
     app()

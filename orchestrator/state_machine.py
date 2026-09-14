@@ -137,6 +137,7 @@ class Orchestrator:
         *,
         resume_task_id: str | None = None,
         progress_cb=None,
+        plan_confirm_cb=None,  # НОВОЕ: Callable[[Plan], bool] | None
     ) -> RunResult:
         """
         Выполняет workflow до этапа STAGING. Два режима:
@@ -145,6 +146,25 @@ class Orchestrator:
         - Продолжение остановленной задачи: run(resume_task_id="...").
           Уже завершённые шаги (согласно чекпоинту) пропускаются, бюджет
           Gemini-вызовов открывается заново на эту сессию.
+
+        plan_confirm_cb: если передан, вызывается РОВНО ОДИН РАЗ на задачу
+        (флаг checkpoint.plan_approved) сразу после построения/загрузки Plan —
+        ДО самого дорогого по бюджету этапа (elaborating). Если callback
+        вернул False — контролируемая остановка (аналогично исчерпанию
+        бюджета): прогресс (сам план) уже сохранён в чекпоинте, elaboration
+        ещё не начиналась, ни один "дорогой" вызов не потрачен.
+
+        Если callback не передан (например, в тестах, вызывающих Orchestrator
+        напрямую без CLI) — план утверждается автоматически, поведение
+        совпадает с прежним.
+
+        Точка расширения на будущее: сюда же позже добавится возможность
+        ПРАВИТЬ Plan между построением и подтверждением (удаление/изменение/
+        добавление notes и subpoints) — plan_confirm_cb можно будет заменить
+        на plan_review_cb: Callable[[Plan], Plan | None], где возвращённый
+        (изменённый) Plan подставляется в checkpoint.plan перед persist, а
+        None означает отказ. Сигнатура ЭТОГО метода менять не придётся —
+        только реализацию callback'а в cli/main.py.
         """
 
         def report(stage: str) -> None:
@@ -178,7 +198,7 @@ class Orchestrator:
 
             # -- Planning ------------------------------------------------
             if checkpoint.plan is None:
-                report("Планирование конспекта (Groq)…")
+                report(f"Планирование конспекта ({self.settings.llm_provider})…")
                 status.stage = "planning"
                 plan = outline_planner.build_plan(task, self.gemini, status)
                 checkpoint.plan = plan
@@ -186,6 +206,31 @@ class Orchestrator:
             else:
                 plan = checkpoint.plan
                 report("План уже построен (из чекпоинта) — пропускаем.")
+
+            # -- Plan approval (inline confirmation) ----------------------
+            if not checkpoint.plan_approved:
+                approved = plan_confirm_cb(plan) if plan_confirm_cb is not None else True
+                if not approved:
+                    status.stage = "stopped"
+                    status.stopped_reason = "План не подтверждён пользователем."
+                    persist("planned")  # last_completed_stage остаётся "planned"
+                    return RunResult(
+                        task_id=task.task_id,
+                        changeset=None,
+                        status=status,
+                        stopped=True,
+                        message=(
+                            "План конспекта не утверждён. Задача остановлена ДО "
+                            "траты бюджета Groq на elaboration/synthesis — сам "
+                            "план (1 дешёвый вызов) сохранён.\n"
+                            f"Продолжить (план будет показан снова): "
+                            f"python -m cli.main resume {task.task_id}"
+                        ),
+                    )
+                checkpoint.plan_approved = True
+                persist("plan_approved")
+            else:
+                report("План уже утверждён (из чекпоинта) — пропускаем подтверждение.")
 
             # -- Elaborating (только knowledge-режим) --
             if not checkpoint.extraction_done:
