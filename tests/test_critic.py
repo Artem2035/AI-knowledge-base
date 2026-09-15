@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from gemini.schemas import CriticVerdictOutput, DraftNoteOutput, NotePlanItem
+from gemini.schemas import CriticVerdictOutput, DraftNoteOutput
 from roles.critic import run_critic_cycle
-from storage.models import Evidence, TaskStatus
+from storage.models import Evidence, OutlineNote, OutlineSubpoint, TaskStatus
 
 
 class _FakeClient:
@@ -25,12 +25,23 @@ class _FakeClient:
         raise AssertionError(f"неожиданная роль в вызове: {role!r}")
 
 
-def _item() -> NotePlanItem:
-    return NotePlanItem(title="RAG", action="create", folder="Знания", evidence_indices=[0])
+def _note() -> OutlineNote:
+    return OutlineNote(
+        title="RAG",
+        folder="Знания",
+        subpoints=[OutlineSubpoint(heading="Определение", covers="Что такое RAG")],
+    )
 
 
-def _evidence() -> list[Evidence]:
-    return [Evidence(concept="RAG", statement="RAG объединяет retrieval и generation.", source_id="model_knowledge")]
+def _evidence(note: OutlineNote) -> list[Evidence]:
+    return [
+        Evidence(
+            note_id=note.note_id,
+            subpoint_id=note.subpoints[0].subpoint_id,
+            statement="RAG объединяет retrieval и generation.",
+            source_id="model_knowledge",
+        )
+    ]
 
 
 def _draft_output(body: str = "Текст версии, достаточно длинный для теста ревью критика.") -> DraftNoteOutput:
@@ -38,6 +49,7 @@ def _draft_output(body: str = "Текст версии, достаточно д�
 
 
 def test_critic_approves_on_first_try_no_rewrite():
+    note = _note()
     client = _FakeClient(
         write_outputs=[_draft_output()],
         critic_outputs=[CriticVerdictOutput(verdict="ok")],
@@ -45,17 +57,19 @@ def test_critic_approves_on_first_try_no_rewrite():
     status = TaskStatus(task_id="c1")
 
     draft = run_critic_cycle(
-        _item(), _evidence(), known_titles=[], title_map={}, sources=[],
-        client=client, status=status, default_folder="Знания", max_rounds=1,
+        note, _evidence(note), known_titles=[], title_map={},
+        client=client, status=status, max_rounds=1,
     )
 
     assert client.write_calls == 1
     assert client.critic_calls == 1
     assert draft.critic_rounds == 0
     assert draft.needs_review is False
+    assert draft.note_id == note.note_id
 
 
 def test_critic_rewrite_once_within_bound_then_stops():
+    note = _note()
     client = _FakeClient(
         write_outputs=[_draft_output("Первая версия."), _draft_output("Вторая версия, переписанная.")],
         critic_outputs=[CriticVerdictOutput(verdict="rewrite", feedback="Слишком коротко, добавь примеры.")],
@@ -63,8 +77,8 @@ def test_critic_rewrite_once_within_bound_then_stops():
     status = TaskStatus(task_id="c2")
 
     draft = run_critic_cycle(
-        _item(), _evidence(), known_titles=[], title_map={}, sources=[],
-        client=client, status=status, default_folder="Знания", max_rounds=1,
+        note, _evidence(note), known_titles=[], title_map={},
+        client=client, status=status, max_rounds=1,
     )
 
     assert client.write_calls == 2  # исходная версия + одно переписывание
@@ -78,6 +92,7 @@ def test_critic_rewrite_once_within_bound_then_stops():
 
 
 def test_critic_feedback_is_passed_to_rewrite_prompt():
+    note = _note()
     client = _FakeClient(
         write_outputs=[_draft_output("Первая версия."), _draft_output("Вторая версия.")],
         critic_outputs=[CriticVerdictOutput(verdict="rewrite", feedback="УНИКАЛЬНАЯ_МЕТКА_ЗАМЕЧАНИЯ")],
@@ -98,8 +113,8 @@ def test_critic_feedback_is_passed_to_rewrite_prompt():
     client.generate_structured = _spy  # type: ignore[method-assign]
 
     run_critic_cycle(
-        _item(), _evidence(), known_titles=[], title_map={}, sources=[],
-        client=client, status=status, default_folder="Знания", max_rounds=1,
+        note, _evidence(note), known_titles=[], title_map={},
+        client=client, status=status, max_rounds=1,
     )
 
     assert len(captured_prompts) == 2
@@ -108,12 +123,13 @@ def test_critic_feedback_is_passed_to_rewrite_prompt():
 
 
 def test_critic_disabled_when_max_rounds_zero():
+    note = _note()
     client = _FakeClient(write_outputs=[_draft_output()], critic_outputs=[])
     status = TaskStatus(task_id="c4")
 
     draft = run_critic_cycle(
-        _item(), _evidence(), known_titles=[], title_map={}, sources=[],
-        client=client, status=status, default_folder="Знания", max_rounds=0,
+        note, _evidence(note), known_titles=[], title_map={},
+        client=client, status=status, max_rounds=0,
     )
 
     assert client.write_calls == 1
@@ -124,9 +140,8 @@ def test_critic_disabled_when_max_rounds_zero():
 
 def test_critic_multi_round_bound_respected():
     """max_rounds=2: критик может попросить переписать дважды, но не
-    больше — третьего вызова критика быть не должно, даже если бы он был
-    доступен в списке ответов (здесь намеренно передан только 2, чтобы
-    IndexError/pop-from-empty сам стал проверкой границы)."""
+    больше — третьего вызова критика быть не должно."""
+    note = _note()
     client = _FakeClient(
         write_outputs=[_draft_output("v1"), _draft_output("v2"), _draft_output("v3")],
         critic_outputs=[
@@ -137,8 +152,8 @@ def test_critic_multi_round_bound_respected():
     status = TaskStatus(task_id="c5")
 
     draft = run_critic_cycle(
-        _item(), _evidence(), known_titles=[], title_map={}, sources=[],
-        client=client, status=status, default_folder="Знания", max_rounds=2,
+        note, _evidence(note), known_titles=[], title_map={},
+        client=client, status=status, max_rounds=2,
     )
 
     assert client.write_calls == 3
@@ -146,3 +161,42 @@ def test_critic_multi_round_bound_respected():
     assert draft.critic_rounds == 2
     assert draft.needs_review is True
     assert draft.body_md == "v3"
+
+
+def test_critic_only_evidence_assigned_to_note_is_used():
+    """Регрессия: evidence с другим note_id (от другой заметки плана) не
+    должен попадать в assigned_evidence, передаваемый критику на ревью —
+    иначе ревью будет сверяться с чужими фактами."""
+    note = _note()
+    other_evidence = Evidence(
+        note_id="другая-заметка",
+        subpoint_id="другой-раздел",
+        statement="Факт из другой заметки — не должен учитываться.",
+    )
+    all_evidence = _evidence(note) + [other_evidence]
+
+    client = _FakeClient(
+        write_outputs=[_draft_output()],
+        critic_outputs=[CriticVerdictOutput(verdict="ok")],
+    )
+    status = TaskStatus(task_id="c6")
+
+    captured_prompts: list[str] = []
+    original_generate = client.generate_structured
+
+    def _spy(*, role, prompt, response_model, status, system_instruction=None):
+        if role == "critic":
+            captured_prompts.append(prompt)
+        return original_generate(
+            role=role, prompt=prompt, response_model=response_model,
+            status=status, system_instruction=system_instruction,
+        )
+
+    client.generate_structured = _spy  # type: ignore[method-assign]
+
+    run_critic_cycle(
+        note, all_evidence, known_titles=[], title_map={},
+        client=client, status=status, max_rounds=1,
+    )
+
+    assert "Факт из другой заметки" not in captured_prompts[0]

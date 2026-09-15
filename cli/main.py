@@ -10,6 +10,7 @@ from rich.panel import Panel
 from rich.tree import Tree
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from cli.plan_editor import confirm_plan
 from config.settings import get_settings
 
 from orchestrator.state_machine import Orchestrator, OrchestratorStopped
@@ -18,6 +19,7 @@ from staging.checkpoint import list_resumable_tasks
 from staging.commit import commit_changeset
 from staging.diff import render_diff_summary
 from storage.models import Plan
+
 
 app = typer.Typer(add_completion=False, help="Персональная AI-система управления знаниями для Obsidian")
 console = Console()
@@ -38,7 +40,7 @@ def _run_and_report(orch: Orchestrator, *, raw_query: str | None, resume_task_id
     def confirm_with_paused_spinner(plan) -> bool:
         status_ctx.stop()
         try:
-            return _confirm_plan(plan)
+            return confirm_plan(plan)
         finally:
             status_ctx.start()
 
@@ -207,25 +209,6 @@ def index():
     db.close()
     console.print(stats)
 
-def _build_plan_tree(plan: Plan) -> Tree:
-    # Корень дерева — summary темы (не topic_title отдельной строкой сверху,
-    # т.к. Panel с заголовком больше не используется — сам topic_title
-    # логично вынести отдельной строкой ПЕРЕД деревом, см. _confirm_plan).
-    root = Tree(plan.summary or plan.topic_title)
-    for i, note in enumerate(plan.notes, start=1):
-        note_branch = root.add(f"{i}. {note.title}")
-        for sp in note.subpoints:
-            note_branch.add(f"{sp.heading}: {sp.covers}")
-    return root
-
-
-def _confirm_plan(plan: Plan) -> bool:
-    console.print(plan.topic_title)
-    console.print(_build_plan_tree(plan))
-    total_subpoints = sum(len(n.subpoints) for n in plan.notes)
-    console.print(f"\nЗаметок: {len(plan.notes)}, подпунктов всего: {total_subpoints}\n")
-    # TODO (будущее): здесь же — выбор "утвердить / редактировать / отменить".
-    return typer.confirm("Утвердить текущий план?", default=True)
 
 if __name__ == "__main__":
     app()

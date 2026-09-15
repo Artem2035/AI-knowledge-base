@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from storage.models import DraftNote, NoteAction, StagingChangeset
+from storage.models import DraftNote, NoteAction, OutlineNote, OutlineSubpoint, Plan, StagingChangeset
 from validation import run_validation
 from vault.db import VaultDB
 from vault.index import VaultIndexer
@@ -116,18 +116,72 @@ def test_duplicate_path_in_same_changeset_is_error(tmp_path):
     assert any(i.code == "duplicate_path_in_changeset" for i in report.errors)
     db.close()
 
-def test_draft_note_depth_hint_defaults_to_standard(tmp_path):
-    """Регрессия: старые вызовающие места (тесты, ручное конструирование
-    DraftNote без depth_hint) не должны ломаться после добавления поля."""
+
+def test_run_validation_without_plan_skips_headings_coverage(tmp_path):
+    """Регрессия: run_validation без plan (напр. старые вызовы без него)
+    не должен падать — validate_headings_coverage просто ничего не
+    добавляет, т.к. notes_by_id пуст."""
     db = _db(tmp_path)
     draft = DraftNote(
-        action=NoteAction.CREATE,
-        path="Знания/Без depth_hint.md",
-        title="Без depth_hint",
-        body_md="Первый абзац текста.\n\nВторой абзац текста.\n\nТретий абзац текста.",
+        action=NoteAction.CREATE, path="Знания/Без плана.md", title="Без плана",
+        body_md="Текст заметки без привязки к плану.",
     )
-    assert draft.depth_hint == "standard"
     changeset = StagingChangeset(task_id="t9", creates=[draft])
-    report = run_validation(changeset, db, allow_delete=False)
+    report = run_validation(changeset, db, allow_delete=False)  # plan не передан
     assert report.ok
+    assert not any(i.code == "missing_outline_heading" for i in report.issues)
+    db.close()
+
+
+def test_missing_outline_heading_is_warning(tmp_path):
+    db = _db(tmp_path)
+    note = OutlineNote(
+        title="Chunking",
+        subpoints=[
+            OutlineSubpoint(heading="Определение", covers="Что такое chunking"),
+            OutlineSubpoint(heading="Стратегии", covers="Какие бывают стратегии"),
+        ],
+    )
+    plan = Plan(task_id="p1", topic_title="RAG", notes=[note])
+
+    draft = DraftNote(
+        action=NoteAction.CREATE,
+        path="Знания/Chunking.md",
+        title="Chunking",
+        note_id=note.note_id,
+        body_md=(
+            "## Определение\n\nChunking — разбиение текста на фрагменты.\n\n"
+            "Раздел «Стратегии» отсутствует, хотя заявлен планом."
+        ),
+    )
+    changeset = StagingChangeset(task_id="t10", creates=[draft])
+    report = run_validation(changeset, db, allow_delete=False, plan=plan)
+
+    assert report.ok  # это warning, не error — не блокирует approve
+    assert any(
+        i.code == "missing_outline_heading" and "Стратегии" in i.message
+        for i in report.warnings
+    )
+    db.close()
+
+
+def test_all_outline_headings_present_no_warning(tmp_path):
+    db = _db(tmp_path)
+    note = OutlineNote(
+        title="Chunking",
+        subpoints=[OutlineSubpoint(heading="Определение", covers="Что такое chunking")],
+    )
+    plan = Plan(task_id="p2", topic_title="RAG", notes=[note])
+
+    draft = DraftNote(
+        action=NoteAction.CREATE,
+        path="Знания/Chunking.md",
+        title="Chunking",
+        note_id=note.note_id,
+        body_md="## Определение\n\nChunking — разбиение текста на фрагменты перед индексацией.",
+    )
+    changeset = StagingChangeset(task_id="t11", creates=[draft])
+    report = run_validation(changeset, db, allow_delete=False, plan=plan)
+
+    assert not any(i.code == "missing_outline_heading" for i in report.warnings)
     db.close()
