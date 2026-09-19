@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from gemini.schemas import DraftNoteOutput
+from llm.schemas import DraftNoteOutput
 from roles.synthesizer_writer import build_relationships, prepare_linking_context, write_note
 from storage.models import DraftNote, Evidence, NoteAction, OutlineNote, OutlineSubpoint, TaskStatus
 

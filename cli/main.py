@@ -59,8 +59,8 @@ def _run_and_report(orch: Orchestrator, *, raw_query: str | None, resume_task_id
     if result.stopped:
         console.print(Panel(result.message, title="⏸ Задача остановлена", style="dark_orange3"))
         console.print(
-            f"Потрачено вызовов Gemini за эту сессию: "
-            f"{result.status.gemini_calls_used}/{settings.max_gemini_calls_per_task}."
+            f"Потрачено вызовов LLM за эту сессию: "
+            f"{result.status.llm_calls_used}/{settings.max_llm_calls_per_task}."
         )
         raise typer.Exit(code=2)
 
@@ -93,7 +93,7 @@ def ask(query: str = typer.Argument(..., help="Запрос на естеств�
 
 @app.command()
 def resume(task_id: str = typer.Argument(..., help="task_id остановленной задачи (см. 'resumable')")):
-    """Продолжить ранее остановленную (по лимиту Gemini) задачу с последнего
+    """Продолжить ранее остановленную (по лимиту LLM) задачу с последнего
     сохранённого шага — без повторного прохождения уже сделанной работы."""
     settings = get_settings()
     orch = Orchestrator(settings)
@@ -109,7 +109,7 @@ def resume(task_id: str = typer.Argument(..., help="task_id остановлен
 
 @app.command()
 def resumable():
-    """Показать задачи, остановленные по лимиту Gemini и доступные для resume."""
+    """Показать задачи, остановленные по лимиту LLM и доступные для resume."""
     settings = get_settings()
     checkpoints = list_resumable_tasks(settings.checkpoint_dir)
     if not checkpoints:
@@ -125,7 +125,7 @@ def resumable():
         console.print(
             f"- [bold]{cp.task_id}[/bold]  шаг: {cp.last_completed_stage}  "
             f"«{preview}»  {task_date}"
-            f"(всего потрачено Gemini-вызовов: {cp.total_gemini_calls_used})"
+            f"(всего потрачено LLM-вызовов: {cp.total_llm_calls_used})"
         )
     console.print(
         "\nПродолжить: [bold]python -m cli.main resume <task_id>[/bold]"
@@ -194,7 +194,7 @@ def pending():
 
 @app.command()
 def index():
-    """Просто пересканировать Vault и обновить локальный индекс (без Gemini)."""
+    """Просто пересканировать Vault и обновить локальный индекс (без LLM)."""
     settings = get_settings()
     settings.ensure_dirs()
     from tools.dedup import try_create_embedder

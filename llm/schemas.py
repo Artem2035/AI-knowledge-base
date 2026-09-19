@@ -1,14 +1,14 @@
 """
-Контракты structured-output для каждого Gemini-вызова.
+Контракты structured-output для каждого LLM-вызова.
 
-Намеренно отделены от storage/models.py: Gemini не должен сам придумывать
+Намеренно отделены от storage/models.py: LLM не должна сама придумывать
 task_id/path/source_id (это foreign keys, которыми управляет код) — вместо
 этого модель ссылается на индексы элементов, переданных ей в промпте, а
 код-обвязка роли уже сама подставляет реальные id/пути. Это снижает риск
 галлюцинаций в структурных полях.
 
 Простые типы (str/float/bool/list) вместо произвольных dict — потому что
-JSON Schema, которую Gemini использует для structured output, работает
+JSON Schema, которую LLM использует для structured output, работает
 надёжнее с фиксированной формой полей.
 """
 from __future__ import annotations

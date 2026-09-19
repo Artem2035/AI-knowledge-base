@@ -1,16 +1,17 @@
 """
-GroqClient — реализует ТОТ ЖЕ публичный контракт, что gemini/client.py::GeminiClient
-(метод generate_structured с идентичной сигнатурой). Благодаря этому
-roles/*.py не знают и не должны знать, какой провайдер активен —
-переключение происходит только в llm/factory.py на основании
-settings.llm_provider.
+GroqClient — реализует ТОТ ЖЕ публичный контракт (llm/base.py::LLMClient
+Protocol), что и любой другой провайдер, добавленный в будущем (см.
+llm/factory.py). Благодаря этому roles/*.py не знают и не должны знать,
+какой провайдер активен — переключение происходит только в llm/factory.py
+на основании settings.llm_provider.
 
-Отличие от Gemini: Groq API (OpenAI-совместимый) не поддерживает
-Gemini-стиль response_schema (строгую JSON Schema на стороне сервера).
-Вместо этого используется JSON mode (response_format={"type":
-"json_object"}) + сама схема передаётся текстом в system-промпте как
-подсказка модели. Финальная гарантия корректности — как и для Gemini —
-через Pydantic-валидацию на стороне кода (response_model.model_validate_json).
+Groq API (OpenAI-совместимый) не поддерживает строгую server-side JSON
+Schema для всех моделей одинаково — используется JSON mode
+(response_format={"type": "json_object"}) + сама схема передаётся текстом
+в system-промпте как подсказка модели, либо (для поддерживаемых моделей)
+constrained decoding через response_format={"type": "json_schema", ...}.
+Финальная гарантия корректности — через Pydantic-валидацию на стороне кода
+(response_model.model_validate_json).
 
 ИЗМЕНЕНИЯ (v2):
 1. TokenRateLimiter — клиентский sliding-window limiter по TPM.
@@ -65,7 +66,7 @@ Gemini-стиль response_schema (строгую JSON Schema на сторон�
    воспользоваться эффектом в rate-limit бюджете.
 8. Adaptive safety margin (TokenRateLimiter.register_rate_limit_hit()):
    после РЕАЛЬНОГО 429 от API (не после локального throttle) эффективный
-   TPM-лимit сразу ужимается множителем (0.85 -> и ниже), а не остаётся
+   TPM-лимит сразу ужимается множителем (0.85 -> и ниже), а не остаётся
    прежним на всю сессию — это защита от повторного всплеска на пороге,
    который уже показал себя недостаточно консервативным. Лимит плавно
    восстанавливается до базового через 5 минут без новых 429, чтобы
@@ -91,7 +92,7 @@ from tenacity import (
 )
 
 from config.settings import Settings
-from orchestrator.budget import GeminiBudget, GeminiFreeLimitReached
+from orchestrator.budget import LLMBudget, LLMFreeLimitReached
 from storage.models import TaskStatus
 
 import httpx
@@ -524,7 +525,7 @@ class GroqClient:
     # чтобы не упереться в TPM уже во время генерации.
     RESERVED_OUTPUT_TOKENS = 1500
 
-    def __init__(self, settings: Settings, budget: GeminiBudget):
+    def __init__(self, settings: Settings, budget: LLMBudget):
         settings.validate_free_only()
         if not settings.groq_api_key:
             raise RuntimeError(
@@ -564,7 +565,7 @@ class GroqClient:
         self._strict_schema_supported = settings.groq_model in _STRICT_SCHEMA_SUPPORTED_MODELS
 
         from openai import OpenAI  # локальный импорт — модуль не требует пакет,
-        # если Groq вообще не используется (LLM_PROVIDER=gemini)
+        # если Groq вообще не используется (LLM_PROVIDER=другой провайдер, если появится)
 
         # keepalive_expiry ограничивает, сколько секунд httpx готов держать
         # простаивающее TLS-соединение в пуле перед новым запросом. Если он
@@ -670,7 +671,7 @@ class GroqClient:
             return parsed
         except GroqRateLimitError as exc:
             self.budget.register_call(status, role=role, ok=False, error=str(exc))
-            raise GeminiFreeLimitReached(
+            raise LLMFreeLimitReached(
                 "Свободный лимит Groq API исчерпан (устойчивая 429 после retry). "
                 "Задача остановлена. Прогресс сохранён — можно продолжить позже."
             ) from exc

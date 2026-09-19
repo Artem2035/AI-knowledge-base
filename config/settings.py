@@ -22,16 +22,23 @@ class Settings(BaseSettings):
     )
 
     # ---- Провайдер LLM ----
-    # "gemini" | "groq" — единственная точка переключения, всё остальное
-    # (roles/*, orchestrator) работает с любым провайдером одинаково,
-    # т.к. оба клиента реализуют один и тот же метод generate_structured().
+    # В MVP допустимо только значение "groq". Поле намеренно типизировано
+    # как обычная строка (не Literal), а не привязано жёстко к одному
+    # значению — это единственная точка переключения провайдера
+    # (см. llm/factory.py::create_llm_client). roles/*, orchestrator
+    # работают с любым провайдером одинаково, т.к. каждый клиент
+    # реализует один и тот же метод generate_structured() (см.
+    # llm/base.py::LLMClient Protocol). Чтобы добавить второго провайдера
+    # в будущем — реализовать llm/<provider>_client.py по образцу
+    # llm/groq_client.py и добавить одну ветку в llm/factory.py; менять
+    # тип этого поля не требуется.
     llm_provider: str = Field(default="groq")
 
     # ---- Режим исследования ----
     # "web" — прежний пайплайн: DuckDuckGo-поиск + fetch страниц +
     #   Extractor/Critic извлекает evidence из реального текста источников.
     #   Даёт проверяемые source_refs, но зависит от нестабильной сети и
-    #   тратит больше Gemini/Groq-вызовов.
+    #   тратит больше вызовов LLM.
     # "knowledge" (дефолт) — без веб-поиска: Elaborator (roles/elaborator.py)
     #   генерирует evidence по каждой подтеме плана из знаний модели.
     #   Быстрее и надёжнее (нет сетевого I/O к внешним сайтам), но заметки
@@ -40,13 +47,6 @@ class Settings(BaseSettings):
     #   должны рассматриваться как черновой конспект, требующий вашей
     #   проверки, а не как исследование с цитируемыми источниками.
     research_mode: Literal["web", "knowledge"] = Field(default="knowledge")
-
-    # ---- Gemini ----
-    gemini_api_key: str = Field(default="", description="Ключ Gemini API (бесплатный тир)")
-    gemini_model: str = Field(default="gemini-flash-latest")
-    gemini_timeout_seconds: int = Field(default=60, ge=1)
-    gemini_rpm_soft_limit: int = Field(default=8, ge=1)
-    gemini_rpd_soft_limit: int = Field(default=200, ge=1)
 
     # ---- Groq ----
     groq_api_key: str = Field(default="", description="Ключ Groq API (бесплатный тир)")
@@ -131,8 +131,8 @@ class Settings(BaseSettings):
     free_only: bool = Field(default=True, description="Жёсткий флаг: только бесплатные провайдеры")
 
     # Общий бюджет вызовов на задачу — не зависит от того, какой провайдер активен
-    max_gemini_calls_per_task: int = Field(default=40, ge=1)
-    max_gemini_retries: int = Field(default=3, ge=0)
+    max_llm_calls_per_task: int = Field(default=40, ge=1)
+    max_llm_retries: int = Field(default=3, ge=0)
 
     # ---- Vault ----
     vault_path: Path = Field(default=Path("./vault_placeholder"))
@@ -205,7 +205,7 @@ class Settings(BaseSettings):
             raise RuntimeError(
                 "FREE_ONLY=false запрещено в текущей версии MVP. "
                 "Система спроектирована работать исключительно на бесплатном "
-                "Gemini API. Платные провайдеры сознательно не реализованы."
+                "Groq API. Платные провайдеры сознательно не реализованы."
             )
 
 

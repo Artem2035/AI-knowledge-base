@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from gemini.schemas import EvidenceBatchOutput
+from llm.schemas import EvidenceBatchOutput
 from llm.base import LLMClient
 from llm.chunking import split_items_into_batches
 from llm.groq_client import GroqPromptTooLargeError, GroqSchemaError

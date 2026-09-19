@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from gemini.schemas import ElaborationItem, ElaborationOutput
+from llm.schemas import ElaborationItem, ElaborationOutput
 from roles.elaborator import (
     MODEL_KNOWLEDGE_SOURCE_ID,
     build_elaboration_units,

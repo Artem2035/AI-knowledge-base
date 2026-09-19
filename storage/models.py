@@ -4,8 +4,8 @@
 Правило проекта: между ролями никогда не передаётся длинный "сырой" текст —
 только эти типизированные модели. Это даёт: (1) валидацию на границах между
 ролями, (2) возможность сериализовать в JSON и персистить прогресс на диск
-(resume после исчерпания лимита Gemini), (3) предсказуемый contract для
-structured-output вызовов Gemini.
+(resume после исчерпания лимита LLM-провайдера), (3) предсказуемый contract
+для structured-output вызовов LLM.
 """
 from __future__ import annotations
 
@@ -204,7 +204,7 @@ class StagingChangeset(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class GeminiCallLog(BaseModel):
+class LLMCallLog(BaseModel):
     role: str
     timestamp: str = Field(default_factory=_now)
     prompt_tokens_est: int = 0
@@ -215,7 +215,7 @@ class GeminiCallLog(BaseModel):
 class TaskStatus(BaseModel):
     task_id: str
     stage: str = "created"
-    gemini_calls_used: int = 0
-    gemini_calls_log: list[GeminiCallLog] = Field(default_factory=list)
-    stopped_reason: str | None = None  # напр. "gemini_free_limit_reached"
+    llm_calls_used: int = 0
+    llm_calls_log: list[LLMCallLog] = Field(default_factory=list)
+    stopped_reason: str | None = None  # напр. "llm_free_limit_reached"
     finished: bool = False

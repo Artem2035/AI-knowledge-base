@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from gemini.schemas import CriticVerdictOutput, DraftNoteOutput
+from llm.schemas import CriticVerdictOutput, DraftNoteOutput
 from roles.critic import run_critic_cycle
 from storage.models import Evidence, OutlineNote, OutlineSubpoint, TaskStatus
 

@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 
 from llm.base import LLMClient
-from gemini.prompts.critic import SYSTEM_INSTRUCTION
-from gemini.schemas import CriticVerdictOutput
+from llm.prompts.critic import SYSTEM_INSTRUCTION
+from llm.schemas import CriticVerdictOutput
 from roles import synthesizer_writer
-from storage.models import DraftNote, Evidence, SourceCandidate, TaskStatus, OutlineNote
+from storage.models import DraftNote, Evidence, TaskStatus, OutlineNote
 
 logger = logging.getLogger(__name__)
 

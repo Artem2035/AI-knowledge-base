@@ -7,7 +7,7 @@ import pytest
 from pydantic import BaseModel
 
 from config.settings import Settings
-from orchestrator.budget import GeminiBudget, GeminiFreeLimitReached, GeminiTaskBudgetExceeded
+from orchestrator.budget import LLMBudget, LLMFreeLimitReached, LLMTaskBudgetExceeded
 from storage.models import TaskStatus
 
 
@@ -60,7 +60,7 @@ def test_groq_missing_api_key_raises(monkeypatch):
     from llm.groq_client import GroqClient
 
     settings = _settings(groq_api_key="")
-    budget = GeminiBudget(3, 100, 100)
+    budget = LLMBudget(3, 100, 100)
     with pytest.raises(RuntimeError):
         GroqClient(settings=settings, budget=budget)
 
@@ -80,7 +80,7 @@ def test_groq_successful_structured_call(monkeypatch):
     from llm.groq_client import GroqClient
 
     settings = _settings()
-    budget = GeminiBudget(3, 100, 100)
+    budget = LLMBudget(3, 100, 100)
     client = GroqClient(settings=settings, budget=budget)
     status = TaskStatus(task_id="g1")
 
@@ -88,7 +88,7 @@ def test_groq_successful_structured_call(monkeypatch):
         role="test_role", prompt="hi", response_model=_DummyOutput, status=status
     )
     assert result.value == "ok"
-    assert status.gemini_calls_used == 1
+    assert status.llm_calls_used == 1
 
 
 def test_groq_uses_strict_json_schema_for_supported_model(monkeypatch):
@@ -102,7 +102,7 @@ def test_groq_uses_strict_json_schema_for_supported_model(monkeypatch):
     from llm.groq_client import GroqClient
 
     settings = _settings(groq_model="openai/gpt-oss-120b")
-    budget = GeminiBudget(3, 100, 100)
+    budget = LLMBudget(3, 100, 100)
     client = GroqClient(settings=settings, budget=budget)
     status = TaskStatus(task_id="g1s")
 
@@ -122,7 +122,7 @@ def test_groq_uses_json_object_for_unsupported_model(monkeypatch):
     from llm.groq_client import GroqClient
 
     settings = _settings(groq_model="qwen/qwen3.8-27b")
-    budget = GeminiBudget(3, 100, 100)
+    budget = LLMBudget(3, 100, 100)
     client = GroqClient(settings=settings, budget=budget)
     status = TaskStatus(task_id="g1o")
 
@@ -141,11 +141,11 @@ def test_groq_persistent_429_stops_without_paid_fallback(monkeypatch):
     from llm.groq_client import GroqClient
 
     settings = _settings()
-    budget = GeminiBudget(5, 100, 100)
+    budget = LLMBudget(5, 100, 100)
     client = GroqClient(settings=settings, budget=budget)
     status = TaskStatus(task_id="g2")
 
-    with pytest.raises(GeminiFreeLimitReached):
+    with pytest.raises(LLMFreeLimitReached):
         client.generate_structured(role="r", prompt="p", response_model=_DummyOutput, status=status)
 
 
@@ -162,7 +162,7 @@ def test_factory_selects_groq(monkeypatch):
     assert rpm == settings.groq_rpm_soft_limit
     assert rpd == settings.groq_rpd_soft_limit
 
-    budget = GeminiBudget(3, rpm, rpd)
+    budget = LLMBudget(3, rpm, rpd)
     client = create_llm_client(settings, budget)
     from llm.groq_client import GroqClient
 
@@ -173,6 +173,6 @@ def test_factory_unknown_provider_raises():
     from llm.factory import create_llm_client
 
     settings = _settings(llm_provider="does_not_exist")
-    budget = GeminiBudget(3, 100, 100)
+    budget = LLMBudget(3, 100, 100)
     with pytest.raises(ValueError):
         create_llm_client(settings, budget)

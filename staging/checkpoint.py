@@ -1,12 +1,12 @@
 """
-Чекпоинты задач для resume после остановки по бюджету Gemini.
+Чекпоинты задач для resume после остановки по бюджету LLM-вызовов.
 
 Формат: один JSON-файл на задачу, <checkpoint_dir>/<task_id>.json,
 перезаписывается ПОСЛЕ КАЖДОГО завершённого шага (а не только в конце
 пайплайна). Это принципиально отличается от StagingChangeset — тот
 создаётся только на последнем шаге ("staged"), поэтому бесполезен, если
 задача остановилась раньше (а именно так и происходит при исчерпании
-MAX_GEMINI_CALLS_PER_TASK на этапе extracting — самом "дорогом" по числу
+MAX_LLM_CALLS_PER_TASK на этапе extracting — самом "дорогом" по числу
 вызовов).
 
 Инвариант: чекпоинт хранит уже провалидированные структурированные данные
@@ -50,7 +50,12 @@ logger = logging.getLogger(__name__)
 # Бампать при несовместимых изменениях структуры чекпоинта — старые
 # чекпоинты с другой версией просто не загрузятся (см. load_checkpoint),
 # вместо того чтобы упасть с невнятной ошибкой валидации Pydantic.
-CHECKPOINT_VERSION = 3
+# v4: TaskStatus.gemini_calls_used/gemini_calls_log переименованы в
+# llm_calls_used/llm_calls_log (Gemini исключён как провайдер, остался
+# только Groq) — старые чекпоинты (v3) с этими полями больше не
+# провалидируются как TaskStatus, поэтому версия бампнута; они просто
+# не подхватятся при resume (см. README про то, что делать в этом случае).
+CHECKPOINT_VERSION = 4
 
 
 class TaskCheckpoint(BaseModel):
@@ -68,15 +73,15 @@ class TaskCheckpoint(BaseModel):
 
     status: TaskStatus
 
-    # Накопительный расход Gemini-вызовов по ВСЕМ попыткам (для отчёта
-    # пользователю). Отдельно от status.gemini_calls_used, который считает
+    # Накопительный расход LLM-вызовов по ВСЕМ попыткам (для отчёта
+    # пользователю). Отдельно от status.llm_calls_used, который считает
     # вызовы только в рамках ТЕКУЩЕЙ сессии/попытки — см.
-    # MAX_GEMINI_CALLS_PER_TASK в orchestrator/budget.py: лимит применяется
+    # MAX_LLM_CALLS_PER_TASK в orchestrator/budget.py: лимит применяется
     # к сессии, иначе задачу нельзя было бы никогда докрутить после
     # однократного исчерпания.
-    total_gemini_calls_used: int = 0
+    total_llm_calls_used: int = 0
 
-    plan: Plan | None = None # теперь Plan с .notes
+    plan: Plan | None = None  # теперь Plan с .notes
     # НОВОЕ: явное подтверждение плана пользователем (inline-confirm в
     # cli/main.py::ask). Отделено от самого факта "plan is not None",
     # т.к. план может быть уже построен (1 дешёвый вызов), но ещё НЕ
@@ -99,14 +104,14 @@ class TaskCheckpoint(BaseModel):
     extracted_unit_ids: list[str] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
 
-    vault_analysis_done: bool = False # мутирует plan.notes напрямую, отдельного списка не нужно
+    vault_analysis_done: bool = False  # мутирует plan.notes напрямую, отдельного списка не нужно
     existing_notes: list[ExistingNote] = Field(default_factory=list)
 
     synthesis_done: bool = False
     # Map-reduce: шаг 1 (план заметок) и шаг 2 (запись по одной заметке)
     # персистятся отдельно — резюм не должен пересчитывать ни план, ни уже
     # написанные заметки (аналогично extracted_source_ids для extraction).
-    written_note_indices: list[int] = Field(default_factory=list) # индекс в plan.notes
+    written_note_indices: list[int] = Field(default_factory=list)  # индекс в plan.notes
     drafts: list[DraftNote] = Field(default_factory=list)  # накапливается по одной заметке
     relationships: list[Relationship] = Field(default_factory=list)
 

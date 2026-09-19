@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from llm.base import LLMClient
-from gemini.prompts.vault_analyst import SYSTEM_INSTRUCTION, FOLDER_SYSTEM_INSTRUCTION
-from gemini.schemas import DedupDecisionOutput, FolderAssignmentOutput
+from llm.prompts.vault_analyst import SYSTEM_INSTRUCTION, FOLDER_SYSTEM_INSTRUCTION
+from llm.schemas import DedupDecisionOutput, FolderAssignmentOutput
 from llm.chunking import split_items_into_batches
 from retrieval.search import RetrievalHit, VaultSearcher
 from storage.models import Plan, TaskStatus

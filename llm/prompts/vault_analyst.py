@@ -1,7 +1,7 @@
 """
 Системная инструкция роли Vault Analyst (используется только для
 "серой зоны" схожести — см. tools/dedup.py::classify_similarity).
-Вынесена из roles/vault_analyst.py, см. gemini/prompts/planner.py про
+Вынесена из roles/vault_analyst.py, см. llm/prompts/outline_planner.py про
 принцип разделения статики и динамики prompt.
 """
 from __future__ import annotations

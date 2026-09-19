@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 from llm.base import LLMClient
 from llm.chunking import batch_for_quality_and_budget
-from gemini.prompts.elaborator import SYSTEM_INSTRUCTION
-from gemini.schemas import ElaborationOutput
+from llm.prompts.elaborator import SYSTEM_INSTRUCTION
+from llm.schemas import ElaborationOutput
 from storage.models import Evidence, OutlineNote, OutlineSubpoint, Plan, TaskStatus
 
 logger = logging.getLogger(__name__)

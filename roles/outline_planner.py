@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from llm.base import LLMClient
-from gemini.prompts.outline_planner import OUTLINE_PLANNER_SYSTEM_INSTRUCTION
-from gemini.schemas import OutlinePlanOutput
+from llm.prompts.outline_planner import OUTLINE_PLANNER_SYSTEM_INSTRUCTION
+from llm.schemas import OutlinePlanOutput
 from storage.models import OutlineNote, OutlineSubpoint, Plan, Task, TaskStatus
 
 

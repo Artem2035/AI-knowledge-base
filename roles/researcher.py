@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from llm.base import LLMClient
-from gemini.schemas import SourceSelectionOutput
+from llm.schemas import SourceSelectionOutput
 from storage.models import Plan, SourceCandidate, TaskStatus
 from tools.web_fetch import fetch_clean_text
 from tools.web_search import deduplicate_by_url, search_web

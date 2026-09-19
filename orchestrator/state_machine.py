@@ -3,7 +3,7 @@ Orchestrator — не LLM. Чистый Python state machine, который:
 - понимает пользовательский запрос (нормализует Task);
 - вызывает роли в фиксированной последовательности;
 - прокидывает структурированные данные между этапами;
-- контролирует бюджет Gemini-вызовов и останавливается при исчерпании
+- контролирует бюджет LLM-вызовов и останавливается при исчерпании
   лимита (без fallback на платный tier);
 - ПЕРСИСТИТ ПРОГРЕСС ПОСЛЕ КАЖДОГО ШАГА (см. orchestrator/checkpoint.py),
   чтобы задачу можно было продолжить позже командой `resume <task_id>`,
@@ -21,12 +21,12 @@ RESEARCH_MODE (см. config/settings.py):
   roles/synthesizer_writer.py::_to_draft_note) — это ЧЕРНОВОЙ конспект без
   проверяемых источников, а не исследование.
 
-ВАЖНО про бюджет при resume: MAX_GEMINI_CALLS_PER_TASK — это лимит на
-ОДНУ СЕССИЮ/ПОПЫТКУ (status.gemini_calls_used обнуляется в начале каждого
+ВАЖНО про бюджет при resume: MAX_LLM_CALLS_PER_TASK — это лимит на
+ОДНУ СЕССИЮ/ПОПЫТКУ (status.llm_calls_used обнуляется в начале каждого
 вызова run(), в т.ч. при resume), а не на задачу за всё её время жизни.
 Иначе после однократного исчерпания лимита задачу нельзя было бы
 продолжить никогда. Накопительный расход по всем попыткам хранится
-отдельно в TaskCheckpoint.total_gemini_calls_used — только для отчёта
+отдельно в TaskCheckpoint.total_llm_calls_used — только для отчёта
 пользователю.
 """
 from __future__ import annotations
@@ -38,7 +38,7 @@ from pathlib import Path
 from config.settings import Settings
 from llm.factory import budget_limits_for_provider, create_llm_client, extraction_budget_limits, \
     create_extraction_llm_client
-from orchestrator.budget import GeminiBudget, GeminiFreeLimitReached, GeminiTaskBudgetExceeded
+from orchestrator.budget import LLMBudget, LLMFreeLimitReached, LLMTaskBudgetExceeded
 
 from retrieval.search import VaultSearcher
 from roles import critic, elaborator, outline_planner, synthesizer_writer, vault_analyst
@@ -63,7 +63,7 @@ KNOWLEDGE_MODE_FRONTMATTER_SOURCE = "model-knowledge"
 
 
 class OrchestratorStopped(Exception):
-    """Управляемая остановка задачи (лимит бюджета/Gemini, либо ошибка
+    """Управляемая остановка задачи (лимит бюджета/LLM, либо ошибка
     resume — например, чекпоинт не найден). Прогресс сохранён (кроме
     случая, когда чекпоинт сам оказался нечитаем)."""
 
@@ -91,29 +91,27 @@ class Orchestrator:
         self.embedder = try_create_embedder(settings.embedding_model, settings.use_local_embeddings)
 
         rpm_limit, rpd_limit = budget_limits_for_provider(settings)
-        self.budget = GeminiBudget(
-            max_calls_per_task=settings.max_gemini_calls_per_task,
+        self.budget = LLMBudget(
+            max_calls_per_task=settings.max_llm_calls_per_task,
             rpm_soft_limit=rpm_limit,
             rpd_soft_limit=rpd_limit,
         )
-        # Имя атрибута исторически "gemini", но фактический тип определяется
-        # settings.llm_provider — roles/* работают с ним только через
-        # generate_structured(...), тип провайдера им не важен.
-        self.gemini = create_llm_client(settings, self.budget)
+        # roles/* работают с этим клиентом только через generate_structured(...),
+        # конкретный тип провайдера им не важен (см. llm/base.py::LLMClient).
+        self.llm = create_llm_client(settings, self.budget)
         # Отдельный клиент+бюджет для extraction/elaboration (см.
         # llm/factory.py) — на Groq использует другую модель
-        # (compound-mini/gpt-oss-120b) с другим TPM/RPD, поэтому не может
-        # делить лимитер с self.gemini. Используется как в web-режиме
-        # (extractor_critic), так и в knowledge-режиме (elaborator) — в
-        # обоих случаях это самый частый по числу вызовов шаг. Оба бюджета
-        # читают и пишут в один и тот же status.gemini_calls_used
-        # (передаётся при каждом вызове run()), так что
-        # MAX_GEMINI_CALLS_PER_TASK продолжает работать как ОБЩИЙ потолок
+        # (openai/gpt-oss-120b с другим TPM-профилем) — используется как в
+        # web-режиме (extractor_critic), так и в knowledge-режиме
+        # (elaborator) — в обоих случаях это самый частый по числу вызовов
+        # шаг. Оба бюджета читают и пишут в один и тот же
+        # status.llm_calls_used (передаётся при каждом вызове run()), так
+        # что MAX_LLM_CALLS_PER_TASK продолжает работать как ОБЩИЙ потолок
         # на задачу независимо от того, какой из двух клиентов расходует
         # вызовы.
         ext_rpm, ext_rpd = extraction_budget_limits(settings)
-        self.extraction_budget = GeminiBudget(
-            max_calls_per_task=settings.max_gemini_calls_per_task,
+        self.extraction_budget = LLMBudget(
+            max_calls_per_task=settings.max_llm_calls_per_task,
             rpm_soft_limit=ext_rpm,
             rpd_soft_limit=ext_rpd,
         )
@@ -145,7 +143,7 @@ class Orchestrator:
         - Новая задача: run(raw_query="...").
         - Продолжение остановленной задачи: run(resume_task_id="...").
           Уже завершённые шаги (согласно чекпоинту) пропускаются, бюджет
-          Gemini-вызовов открывается заново на эту сессию.
+          LLM-вызовов открывается заново на эту сессию.
 
         plan_confirm_cb: если передан, вызывается РОВНО ОДИН РАЗ на задачу
         (флаг checkpoint.plan_approved) сразу после построения/загрузки Plan —
@@ -189,18 +187,18 @@ class Orchestrator:
             КАЖДОГО источника/подтемы) — это и есть механизм resume."""
             checkpoint.last_completed_stage = stage_label
             checkpoint.status = status
-            checkpoint.total_gemini_calls_used = base_total_calls + status.gemini_calls_used
+            checkpoint.total_llm_calls_used = base_total_calls + status.llm_calls_used
             save_checkpoint(self.settings.checkpoint_dir, checkpoint)
 
         try:
             report("Анализ Vault (индексация)…")
-            self.sync_vault_index()  # чистый код, без Gemini — безопасно повторять всегда
+            self.sync_vault_index()  # чистый код, без LLM — безопасно повторять всегда
 
             # -- Planning ------------------------------------------------
             if checkpoint.plan is None:
                 report(f"Планирование конспекта ({self.settings.llm_provider})…")
                 status.stage = "planning"
-                plan = outline_planner.build_plan(task, self.gemini, status)
+                plan = outline_planner.build_plan(task, self.llm, status)
                 checkpoint.plan = plan
                 persist("planned")
             else:
@@ -266,7 +264,7 @@ class Orchestrator:
                 topic_folder = f"{self.settings.default_notes_folder}/{slugify_filename(plan.topic_title)}".strip("/")
                 searcher = VaultSearcher(self.db, embedder=self.embedder)
                 vault_analyst.resolve_notes_against_vault(
-                    plan, searcher, self.gemini, status,
+                    plan, searcher, self.llm, status,
                     existing_folders=existing_folders, default_folder=topic_folder,
                     high_threshold=self.settings.dedup_high_threshold,
                     low_threshold=self.settings.dedup_low_threshold,
@@ -312,7 +310,7 @@ class Orchestrator:
                     report(f"Написание заметки «{note.title}» ({self.settings.llm_provider})…")
                     draft = critic.run_critic_cycle(
                         note, evidence, known_titles, title_map,
-                        self.gemini, status,
+                        self.llm, status,
                         max_rounds=self.settings.max_critic_rounds,
                         mark_source=mark_source,
                     )
@@ -338,7 +336,7 @@ class Orchestrator:
                 relationships = checkpoint.relationships
                 report("Синтез уже выполнен (из чекпоинта) — пропускаем.")
 
-            # -- Validation + Staging (без Gemini, всегда выполняются заново,
+            # -- Validation + Staging (без LLM, всегда выполняются заново,
             # т.к. дёшевы и должны учитывать текущее состояние db/Vault) ----
             report("Валидация предложенных изменений…")
             status.stage = "validating"
@@ -369,7 +367,7 @@ class Orchestrator:
                 message="Изменения подготовлены и ждут вашего approve.",
             )
 
-        except (GeminiFreeLimitReached, GeminiTaskBudgetExceeded) as exc:
+        except (LLMFreeLimitReached, LLMTaskBudgetExceeded) as exc:
             status.stage = "stopped"
             status.stopped_reason = str(exc)
             # Обновляем сохранённый статус/накопленный счётчик даже если
@@ -420,11 +418,11 @@ class Orchestrator:
                 language=checkpoint.language,
             )
             status = TaskStatus(task_id=task.task_id, stage=checkpoint.last_completed_stage)
-            base_total_calls = checkpoint.total_gemini_calls_used
+            base_total_calls = checkpoint.total_llm_calls_used
             report(
                 f"Продолжаем задачу {task.task_id} "
                 f"(последний завершённый шаг: «{checkpoint.last_completed_stage}», "
-                f"уже потрачено Gemini-вызовов всего: {base_total_calls})…"
+                f"уже потрачено LLM-вызовов всего: {base_total_calls})…"
             )
             return checkpoint, task, status, base_total_calls
 
