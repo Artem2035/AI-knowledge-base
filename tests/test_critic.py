@@ -200,3 +200,31 @@ def test_critic_only_evidence_assigned_to_note_is_used():
     )
 
     assert "Факт из другой заметки" not in captured_prompts[0]
+
+
+def test_run_critic_cycle_propagates_system_instruction_to_write_note():
+    note = _note()
+    client = _FakeClient(
+        write_outputs=[_draft_output()],
+        critic_outputs=[CriticVerdictOutput(verdict="ok")],
+    )
+    status = TaskStatus(task_id="c7")
+
+    captured = []
+    original_generate = client.generate_structured
+
+    def _spy(*, role, prompt, response_model, status, system_instruction=None):
+        if role == "synthesizer_write":
+            captured.append(system_instruction)
+        return original_generate(role=role, prompt=prompt, response_model=response_model,
+                                  status=status, system_instruction=system_instruction)
+
+    client.generate_structured = _spy  # type: ignore[method-assign]
+
+    run_critic_cycle(
+        note, _evidence(note), known_titles=[], title_map={},
+        client=client, status=status, max_rounds=1,
+        system_instruction="ОБЩИЙ ПРОМПТ ЗАДАЧИ",
+    )
+
+    assert captured == ["ОБЩИЙ ПРОМПТ ЗАДАЧИ"]

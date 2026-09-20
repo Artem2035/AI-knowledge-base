@@ -44,6 +44,14 @@ def _run_and_report(orch: Orchestrator, *, raw_query: str | None, resume_task_id
         finally:
             status_ctx.start()
 
+    def merge_confirm_with_paused_spinner(drafts):
+        status_ctx.stop()
+        try:
+            from cli.draft_merge_editor import confirm_merges
+            return confirm_merges(drafts, mode=settings.draft_merge_mode)
+        finally:
+            status_ctx.start()
+
     try:
         status_ctx.start()
         result = orch.run(
@@ -51,6 +59,7 @@ def _run_and_report(orch: Orchestrator, *, raw_query: str | None, resume_task_id
             resume_task_id=resume_task_id,
             progress_cb=progress_cb,
             plan_confirm_cb=confirm_with_paused_spinner,
+            merge_confirm_cb=merge_confirm_with_paused_spinner,
         )
     finally:
         status_ctx.stop()

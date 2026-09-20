@@ -32,6 +32,13 @@ def write_note(
     status: TaskStatus,
     extra_instructions: str = "",
     mark_source: str | None = None,
+    system_instruction: str | None = None,
+    # NEW: позволяет вызывающему коду (Orchestrator) подставить статичный
+    # системный промпт, отличный от дефолтного WRITE_SYSTEM_INSTRUCTION —
+    # используется для добавления MERGE_AWARENESS_GUIDANCE, когда
+    # settings.enable_draft_merging=True. ОДНА И ТА ЖЕ строка на все
+    # вызовы в рамках задачи — не ломает Groq prompt caching (см.
+    # llm/groq_client.py, п.7 докстринга).
 ) -> DraftNote:
     assigned = [e for e in evidence if e.note_id == note.note_id]
     by_subpoint = {sp.subpoint_id: sp for sp in note.subpoints}
@@ -63,7 +70,7 @@ def write_note(
 
     output: DraftNoteOutput = client.generate_structured(
         role="synthesizer_write", prompt=prompt, response_model=DraftNoteOutput,
-        status=status, system_instruction=WRITE_SYSTEM_INSTRUCTION,
+        status=status, system_instruction=system_instruction or WRITE_SYSTEM_INSTRUCTION,
     )
     return _to_draft_note(note, output, title_map, mark_source=mark_source)
 

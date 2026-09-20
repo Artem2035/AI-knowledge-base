@@ -216,3 +216,47 @@ def test_build_relationships_unresolved_title_falls_back_to_title_itself():
     rels = build_relationships([d1])
 
     assert rels[0].to_note == "Неизвестная тема"
+
+
+def test_write_note_uses_custom_system_instruction_when_provided():
+    note = _note()
+    output = DraftNoteOutput(action="create", title="Reranking", body_md="Текст.", tags=[], links_out=[])
+    client = _FakeClient([output])
+    status = TaskStatus(task_id="s10")
+
+    captured = {}
+    original_generate = client.generate_structured
+
+    def _spy(*, role, prompt, response_model, status, system_instruction=None):
+        captured["system_instruction"] = system_instruction
+        return original_generate(role=role, prompt=prompt, response_model=response_model,
+                                  status=status, system_instruction=system_instruction)
+
+    client.generate_structured = _spy  # type: ignore[method-assign]
+
+    write_note(note, [], known_titles=[], title_map={}, client=client, status=status,
+               system_instruction="КАСТОМНЫЙ ПРОМПТ")
+
+    assert captured["system_instruction"] == "КАСТОМНЫЙ ПРОМПТ"
+
+
+def test_write_note_falls_back_to_default_system_instruction_when_none():
+    from llm.prompts.synthesizer_writer import WRITE_SYSTEM_INSTRUCTION
+    note = _note()
+    output = DraftNoteOutput(action="create", title="Reranking", body_md="Текст.", tags=[], links_out=[])
+    client = _FakeClient([output])
+    status = TaskStatus(task_id="s11")
+
+    captured = {}
+    original_generate = client.generate_structured
+
+    def _spy(*, role, prompt, response_model, status, system_instruction=None):
+        captured["system_instruction"] = system_instruction
+        return original_generate(role=role, prompt=prompt, response_model=response_model,
+                                  status=status, system_instruction=system_instruction)
+
+    client.generate_structured = _spy  # type: ignore[method-assign]
+
+    write_note(note, [], known_titles=[], title_map={}, client=client, status=status)
+
+    assert captured["system_instruction"] == WRITE_SYSTEM_INSTRUCTION

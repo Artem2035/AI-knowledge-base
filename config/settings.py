@@ -117,6 +117,21 @@ class Settings(BaseSettings):
     groq_calibration_min_ratio: float = Field(default=0.05, gt=0.0)
     groq_calibration_max_ratio: float = Field(default=1.5, gt=0.0)
 
+    # ---- Объединение заметок в конце workflow ----
+    # См. staging/draft_merge.py — ноль LLM-вызовов, чистая пересборка уже
+    # написанного текста ПОСЛЕ Writer+Critic, ПЕРЕД validation/staging.
+    enable_draft_merging: bool = Field(default=False)
+
+    # Как именно объединять, когда enable_draft_merging=True:
+    # "all" (дефолт) — ВСЕ написанные заметки (action=create) сливаются в
+    #   одну итоговую заметку автоматически, без интерактивного выбора —
+    #   поведение однозначно и предсказуемо: включил флаг -> получил одну
+    #   большую заметку по теме задачи.
+    # "select" — пользователь сам выбирает, какие заметки объединить (можно
+    #   несколькими независимыми группами, см. staging/draft_merge.py::
+    #   apply_merges), остальные остаются отдельными файлами как обычно.
+    draft_merge_mode: Literal["all", "select"] = Field(default="all")
+
     @field_validator("groq_calibration_max_ratio")
     @classmethod
     def _max_ratio_above_min(cls, v: float, info) -> float:

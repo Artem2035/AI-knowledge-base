@@ -38,6 +38,7 @@ from pathlib import Path
 from config.settings import Settings
 from llm.factory import budget_limits_for_provider, create_llm_client, extraction_budget_limits, \
     create_extraction_llm_client
+from llm.prompts.synthesizer_writer import WRITE_SYSTEM_INSTRUCTION, MERGE_AWARENESS_GUIDANCE
 from orchestrator.budget import LLMBudget, LLMFreeLimitReached, LLMTaskBudgetExceeded
 
 from retrieval.search import VaultSearcher
@@ -135,7 +136,8 @@ class Orchestrator:
         *,
         resume_task_id: str | None = None,
         progress_cb=None,
-        plan_confirm_cb=None,  # НОВОЕ: Callable[[Plan], bool] | None
+        plan_confirm_cb=None,  # Callable[[Plan], bool] | None
+        merge_confirm_cb=None,  # Callable[[list[DraftNote]], list[DraftNote]] | None
     ) -> RunResult:
         """
         Выполняет workflow до этапа STAGING. Два режима:
@@ -295,14 +297,16 @@ class Orchestrator:
                     if self.settings.research_mode == "knowledge"
                     else None
                 )
-                report(f"-- План конспекта --")
-                for i, note in enumerate(plan.notes):
-                    report(f"({i+1}) «{note.title}» {'написана' if i in already_written else ''}")
-                    count = 1
-                    for title in known_titles:
-                        report(f"{count} {title}")
-                        count += 1
-                report(f"-- конец План конспекта --")
+                # Один статичный вариант системного промпта на всю задачу —
+                # см. llm/prompts/synthesizer_writer.py::MERGE_AWARENESS_GUIDANCE.
+                # Не привязано к тому, реально ли пользователь потом что-то
+                # объединит — только к тому, что такая возможность включена
+                # (у пользователя есть шанс воспользоваться merge_confirm_cb).
+                write_system_instruction = (
+                    WRITE_SYSTEM_INSTRUCTION + "\n\n" + MERGE_AWARENESS_GUIDANCE
+                    if self.settings.enable_draft_merging
+                    else WRITE_SYSTEM_INSTRUCTION
+                )
 
                 for i, note in enumerate(plan.notes):
                     if i in already_written:
@@ -313,6 +317,7 @@ class Orchestrator:
                         self.llm, status,
                         max_rounds=self.settings.max_critic_rounds,
                         mark_source=mark_source,
+                        system_instruction=write_system_instruction,
                     )
                     if draft.needs_review:
                         report(
@@ -335,6 +340,14 @@ class Orchestrator:
                 drafts = checkpoint.drafts
                 relationships = checkpoint.relationships
                 report("Синтез уже выполнен (из чекпоинта) — пропускаем.")
+
+            # -- Объединение готовых заметок (опционально, БЕЗ LLM) --------
+            # Только здесь, ПОСЛЕ synthesis_done (все drafts уже написаны и
+            # прошли Critic) и ДО validation/staging — см.
+            # config/settings.py::enable_draft_merging.
+            if self.settings.enable_draft_merging and merge_confirm_cb is not None:
+                report("Объединение заметок (если выбрано пользователем)…")
+                drafts = merge_confirm_cb(drafts)
 
             # -- Validation + Staging (без LLM, всегда выполняются заново,
             # т.к. дёшевы и должны учитывать текущее состояние db/Vault) ----

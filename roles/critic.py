@@ -51,6 +51,7 @@ def run_critic_cycle(
     status: TaskStatus,
     max_rounds: int,
     mark_source: str | None = None,
+    system_instruction: str | None = None,  # NEW, см. synthesizer_writer.write_note
 ) -> DraftNote:
     """
     Пишет заметку (synthesizer_writer.write_note), затем прогоняет её через
@@ -70,7 +71,8 @@ def run_critic_cycle(
     diff (staging/diff.py) перед approve.
     """
     draft = synthesizer_writer.write_note(
-        note, evidence, known_titles, title_map, client, status, mark_source=mark_source,
+        note, evidence, known_titles, title_map, client, status,
+        mark_source=mark_source, system_instruction=system_instruction,
     )
     if max_rounds <= 0:
         return draft
@@ -85,6 +87,7 @@ def run_critic_cycle(
         draft = synthesizer_writer.write_note(
             note, evidence, known_titles, title_map, client, status,
             extra_instructions=verdict.feedback, mark_source=mark_source,
+            system_instruction=system_instruction,
         )
 
     draft.critic_rounds = rounds
