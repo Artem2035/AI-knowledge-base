@@ -48,6 +48,23 @@ class Settings(BaseSettings):
     #   проверки, а не как исследование с цитируемыми источниками.
     research_mode: Literal["web", "knowledge"] = Field(default="knowledge")
 
+    # ---- OpenRouter (второй провайдер, роль-based роутинг) ----
+    openrouter_api_key: str = Field(default="")
+    openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1")
+    openrouter_timeout_seconds: int = Field(default=60, ge=1)
+
+    # Nemotron 3 Super — Planner/Elaborator/Critic/vault_dedup/folder_assignment/
+    # researcher_selection (все reasoning-роли). Проверь точный slug модели в
+    # OpenRouter перед запуском — их id могут отличаться от псевдонима в UI.
+    openrouter_planning_model: str = Field(default="nvidia/nemotron-3-ultra-550b-a55b:free")
+    openrouter_planning_rpm_soft_limit: int = Field(default=15, ge=1)
+    openrouter_planning_rpd_soft_limit: int = Field(default=150, ge=1)
+
+    # Gemma 4 26B A4B — ТОЛЬКО synthesizer_write (Writer).
+    openrouter_writing_model: str = Field(default="google/gemma-4-26b-a4b-it:free")
+    openrouter_writing_rpm_soft_limit: int = Field(default=15, ge=1)
+    openrouter_writing_rpd_soft_limit: int = Field(default=150, ge=1)
+
     # ---- Groq ----
     groq_api_key: str = Field(default="", description="Ключ Groq API (бесплатный тир)")
     groq_model: str = Field(default="openai/gpt-oss-120b")
