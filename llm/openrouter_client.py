@@ -16,12 +16,32 @@ LLMBudget (soft RPM/RPD), что уже используется во всей �
 независимый LLMBudget (у разных моделей OpenRouter разные free-tier
 лимиты, и мы не хотим, чтобы редкие вызовы Writer (Gemma) ждали из-за
 частых вызовов Planner (Nemotron) в общем окне throttle).
+
+ИЗМЕНЕНИЯ (v2) — унификация с GroqClient через llm/common.py:
+1. JSON-repair (_repair_json/_WORD_DIGITS) и распознавание типа ошибки по
+   тексту (429/413) больше не дублируются здесь текстом — импортируются
+   из llm/common.py как общие, провайдер-нейтральные утилиты.
+2. Классы исключений (OpenRouterRateLimitError/OpenRouterSchemaError)
+   теперь наследуются от общих LLMRateLimitError/LLMSchemaError
+   (llm/common.py) — это КРИТИЧНО для ролей вроде
+   roles/extractor_critic.py, которые ловят ошибки по типу: раньше они
+   ловили только Groq*-специфичные классы и пропускали OpenRouter*-ошибки
+   необработанными при переключении провайдера.
+3. Добавлен OpenRouterPromptTooLargeError (413 / промпт больше бюджета
+   контекста) — раньше такого случая не существовало вовсе, ошибка ушла
+   бы наружу как сырой Exception от OpenAI SDK.
+4. Добавлен available_prompt_budget_tokens() — раньше отсутствовал,
+   из-за чего llm/chunking.py::split_items_into_batches для OpenRouter
+   не резал элементы по токен-бюджету вообще (возвращал один батч со
+   всеми элементами при любом объёме).
+5. Ретрай (tenacity) расширен на APIConnectionError/APITimeoutError —
+   раньше ретраился только rate limit, любой сетевой сбой падал наружу
+   необработанным (тот же паттерн, что уже был у GroqClient).
 """
 from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -32,55 +52,61 @@ from tenacity import (
     wait_random_exponential,
 )
 
+from openai import APIConnectionError, APITimeoutError
+
 from config.settings import Settings
+from llm.common import (LLMRateLimitError, LLMSchemaError, LLMPromptTooLargeError,
+                        LLMSchemaError,
+                        is_rate_limit_error,
+                        is_request_too_large_error,
+                        parse_retry_after,
+                        repair_json, estimate_tokens)
+
 from orchestrator.budget import LLMBudget, LLMFreeLimitReached
 from storage.models import TaskStatus
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
-# Те же repair-эвристики, что в llm/groq_client.py::_repair_json —
-# продублированы намеренно (а не импортированы оттуда), чтобы
-# openrouter_client.py не тянул зависимость на groq_client.py: это два
-# независимых, взаимозаменяемых провайдера (см. llm/base.py::LLMClient),
-# а не один зависит от другого.
-_WORD_DIGITS = {
-    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
-    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
-}
 
-
-class OpenRouterRateLimitError(Exception):
+class OpenRouterRateLimitError(LLMRateLimitError):
     """Оборачивает 429 от OpenRouter API для retry-логики tenacity."""
 
 
-class OpenRouterSchemaError(Exception):
-    """JSON от модели невалиден даже после repair-попыток. Тот же контракт,
-    что GroqSchemaError — вызывающий код (extractor_critic и т.п.) может
-    уменьшить батч, а не просто ретраить тот же запрос."""
+class OpenRouterSchemaError(LLMSchemaError):
+    """JSON от модели невалиден даже после repair-попыток. Тот же
+    контракт, что и у любого другого LLMSchemaError — вызывающий код
+    (extractor_critic и т.п.) может уменьшить батч, а не просто ретраить
+    тот же запрос."""
 
 
-def _repair_json(raw: str) -> str:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-
-    def _replace_word_decimal(match: re.Match) -> str:
-        whole, word = match.group(1), match.group(2).lower()
-        digit = _WORD_DIGITS.get(word)
-        return f"{whole}.{digit}" if digit is not None else match.group(0)
-
-    return re.sub(r"(\d)\.\s*([A-Za-z]+)\b", _replace_word_decimal, text)
-
-
-def _is_rate_limit_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return "429" in text or "rate limit" in text or "rate_limit" in text
+class OpenRouterPromptTooLargeError(LLMPromptTooLargeError):
+    """413 от API, либо промпт заведомо больше context_budget_tokens
+    (см. OpenRouterClient.available_prompt_budget_tokens)."""
 
 
 class OpenRouterClient:
-    def __init__(self, settings: Settings, budget: LLMBudget, model: str):
+    # Свободные модели OpenRouter в проекте заявляют контекст 256K-1M
+    # токенов (см. config/settings.py::openrouter_planning_model /
+    # openrouter_writing_model). Дефолт здесь НАМНОГО консервативнее
+    # реального лимита контекста — не из-за технического ограничения, а
+    # потому что бесплатные модели на очень больших батчах в одном вызове
+    # чаще теряют структуру ответа (тот же практический риск, из-за
+    # которого в elaborator/roles введён max_subpoints_per_generation_batch
+    # как отдельный, качественный, а не только токенный потолок — см.
+    # llm/chunking.py::batch_for_quality_and_budget). Можно переопределить
+    # через context_budget_tokens при создании клиента (см.
+    # llm/factory.py) под конкретную модель.
+    DEFAULT_CONTEXT_BUDGET_TOKENS = 60_000
+    RESERVED_OUTPUT_TOKENS = 2000
+
+    def __init__(
+        self,
+        settings: Settings,
+        budget: LLMBudget,
+        model: str,
+        context_budget_tokens: int | None = None,
+    ):
         settings.validate_free_only()
         if not settings.openrouter_api_key:
             raise RuntimeError(
@@ -90,6 +116,7 @@ class OpenRouterClient:
         self.settings = settings
         self.budget = budget
         self.model = model
+        self.context_budget_tokens = context_budget_tokens or self.DEFAULT_CONTEXT_BUDGET_TOKENS
 
         from openai import OpenAI  # локальный импорт, как в GroqClient —
         # модуль не должен требовать пакет, если провайдер не используется.
@@ -98,6 +125,22 @@ class OpenRouterClient:
             api_key=settings.openrouter_api_key,
             base_url=settings.openrouter_base_url,
         )
+
+    def available_prompt_budget_tokens(
+        self,
+        system_instruction: str,
+        response_model: type[BaseModel],
+    ) -> int:
+        """Сколько токенов остаётся под сам prompt (без system/schema/output).
+        Используется llm/chunking.py::split_items_into_batches, чтобы резать
+        длинные списки элементов на батчи под доступный бюджет контекста —
+        тот же контракт, что у GroqClient.available_prompt_budget_tokens,
+        только без реального TPM-лимитера под капотом (см. докстринг
+        модуля, п.4 «Изменения»)."""
+        schema_hint = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+        overhead = estimate_tokens(system_instruction) + estimate_tokens(schema_hint)
+        budget = self.context_budget_tokens - overhead - self.RESERVED_OUTPUT_TOKENS
+        return max(budget, 0)
 
     def generate_structured(
         self,
@@ -122,6 +165,27 @@ class OpenRouterClient:
               "словами.\n\nJSON Schema:\n" + schema_hint
         )
 
+        # Проактивная проверка бюджета ДО сетевого вызова — тот же принцип,
+        # что и в GroqClient.generate_structured (см. groq_client.py):
+        # лучше явная GroqPromptTooLargeError-совместимая ошибка, которую
+        # вызывающий код (extractor_critic и т.п.) умеет ловить и резать
+        # батч, чем 413 от API постфактум.
+        prompt_tokens = estimate_tokens(prompt)
+        available = self.available_prompt_budget_tokens(system_instruction or "", response_model)
+        if prompt_tokens > available > 0:
+            # Не падаем сразу — OpenRouter-модели с их 256K-1M контекстом
+            # почти всегда физически вмещают промпт даже при превышении
+            # нашего консервативного DEFAULT_CONTEXT_BUDGET_TOKENS, поэтому
+            # только предупреждаем и пробуем отправить как есть; реальный
+            # 413 (если он всё-таки случится) будет корректно превращён в
+            # OpenRouterPromptTooLargeError ниже, в _call_with_retry.
+            logger.info(
+                "OpenRouter (%s): промпт роли '%s' (~%d токенов) превышает "
+                "консервативный бюджет ~%d токенов — отправляем как есть, "
+                "полагаясь на реальный контекст модели.",
+                self.model, role, prompt_tokens, available,
+            )
+
         try:
             raw_json = self._call_with_retry(prompt=prompt, system_instruction=full_system)
             parsed = self._parse_with_repair(raw_json, response_model)
@@ -134,15 +198,21 @@ class OpenRouterClient:
                 "429 после retry). Задача остановлена. Прогресс сохранён — можно "
                 "продолжить позже."
             ) from exc
-        except OpenRouterSchemaError as exc:
+        except (OpenRouterSchemaError, OpenRouterPromptTooLargeError) as exc:
             self.budget.register_call(status, role=role, ok=False, error=str(exc))
             raise
         except Exception as exc:
             self.budget.register_call(status, role=role, ok=False, error=str(exc))
             raise
 
+    # Тот же принцип, что и у GroqClient._RETRYABLE_EXCEPTIONS: ретраим не
+    # только rate limit, но и обрывы соединения/таймауты — раньше здесь
+    # ретраился только OpenRouterRateLimitError, и любой сетевой сбой
+    # (обрыв TLS, таймаут) падал наружу необработанным с первой попытки.
+    _RETRYABLE_EXCEPTIONS = (OpenRouterRateLimitError, APIConnectionError, APITimeoutError)
+
     @retry(
-        retry=retry_if_exception_type(OpenRouterRateLimitError),
+        retry=retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
         wait=wait_random_exponential(multiplier=1, max=15),
         stop=stop_after_attempt(4),
         reraise=True,
@@ -160,8 +230,13 @@ class OpenRouterClient:
             )
         except Exception as exc:
             logger.exception("OpenRouter request failed (%s): %s", self.model, exc)
-            if _is_rate_limit_error(exc):
-                raise OpenRouterRateLimitError(str(exc)) from exc
+            if is_rate_limit_error(exc):
+                retry_after = parse_retry_after(str(exc))
+                raise OpenRouterRateLimitError(str(exc), retry_after=retry_after) from exc
+            if is_request_too_large_error(exc):
+                raise OpenRouterPromptTooLargeError(
+                    f"OpenRouter ({self.model}) вернул 413 Request Entity Too Large: {exc}"
+                ) from exc
             raise
 
         content = response.choices[0].message.content
@@ -173,7 +248,7 @@ class OpenRouterClient:
         try:
             return response_model.model_validate_json(raw_json)
         except (ValidationError, ValueError) as first_exc:
-            repaired = _repair_json(raw_json)
+            repaired = repair_json(raw_json)
             if repaired == raw_json:
                 raise OpenRouterSchemaError(
                     f"OpenRouter ({self.model}) вернул невалидный JSON, repair не применим: {first_exc}"

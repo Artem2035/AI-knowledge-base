@@ -92,6 +92,13 @@ from tenacity import (
 )
 
 from config.settings import Settings
+from llm.common import (LLMRateLimitError, LLMSchemaError, LLMPromptTooLargeError,
+                        LLMSchemaError,
+                        is_rate_limit_error,
+                        is_request_too_large_error,
+                        parse_retry_after,
+                        repair_json)
+
 from orchestrator.budget import LLMBudget, LLMFreeLimitReached
 from storage.models import TaskStatus
 
@@ -102,33 +109,18 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
-# Числа словами, которые модель иногда подставляет вместо цифр в JSON
-# (наблюдалось в реальных логах: "0. Nine" вместо "0.9").
-_WORD_DIGITS = {
-    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
-    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
-}
-
-# "Please try again in 10.02s" -> 10.02
-_RETRY_AFTER_RE = re.compile(r"try again in\s+([\d.]+)\s*s", re.IGNORECASE)
-
-
-class GroqRateLimitError(Exception):
+class GroqRateLimitError(LLMRateLimitError):
     """Оборачивает 429 от Groq API для retry-логики tenacity."""
 
-    def __init__(self, message: str, retry_after: float | None = None):
-        super().__init__(message)
-        self.retry_after = retry_after
 
-
-class GroqSchemaError(Exception):
+class GroqSchemaError(LLMSchemaError):
     """JSON от модели невалиден даже после repair-попыток.
     Отличается от обычных ошибок тем, что вызывающий код (например,
     extractor_critic) может отреагировать уменьшением батча/чанка,
     а не просто ретраем того же запроса."""
 
 
-class GroqPromptTooLargeError(Exception):
+class GroqPromptTooLargeError(LLMPromptTooLargeError):
     """Промпт+система+ожидаемый output превышают доступный TPM-бюджет.
     Поднимается ДО сетевого вызова — вызывающий код должен порезать текст."""
 
@@ -158,48 +150,6 @@ def _estimate_tokens(text: str) -> int:
     if not text:
         return 0
     return int(len(text) / _chars_per_token(text)) + 1
-
-
-def _parse_retry_after(message: str) -> float | None:
-    m = _RETRY_AFTER_RE.search(message)
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            return None
-    return None
-
-
-def _repair_json(raw: str) -> str:
-    """Чинит наиболее частые способы, которыми gpt-oss-120b ломает JSON:
-    - markdown-обёртка ```json ... ```
-    - число словами после точки: "0. Nine" / "0.Nine" -> "0.9"
-    Возвращает исправленную строку (без гарантии, что она валидна —
-    вызывающий код обязан обернуть повторный json.loads/model_validate_json
-    в try/except)."""
-    text = raw.strip()
-
-    # Снять markdown-ограждение, если модель всё же его добавила
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-
-    # "0. Nine" / "0 . nine" / "0.Nine" -> "0.9"
-    def _replace_word_decimal(match: re.Match) -> str:
-        whole = match.group(1)
-        word = match.group(2).lower()
-        digit = _WORD_DIGITS.get(word)
-        if digit is None:
-            return match.group(0)
-        return f"{whole}.{digit}"
-
-    text = re.sub(
-        r"(\d)\.\s*([A-Za-z]+)\b",
-        _replace_word_decimal,
-        text,
-    )
-
-    return text
 
 # Модели, для которых Groq поддерживает constrained decoding
 # (response_format={"type": "json_schema", "json_schema": {"strict": True, ...}}) —
@@ -793,7 +743,7 @@ class GroqClient:
         try:
             return response_model.model_validate_json(raw_json)
         except (ValidationError, ValueError) as first_exc:
-            repaired = _repair_json(raw_json)
+            repaired = repair_json(raw_json)
             if repaired == raw_json:
                 raise GroqSchemaError(
                     f"Groq вернул невалидный JSON, repair не применим: {first_exc}"
@@ -908,8 +858,8 @@ class GroqClient:
                 "Groq request failed: type=%s, message=%s", type(exc).__name__, str(exc)
             )
 
-            if _is_rate_limit_error(exc):
-                retry_after = _parse_retry_after(str(exc))
+            if is_rate_limit_error(exc):
+                retry_after = parse_retry_after(str(exc))
                 if retry_after is not None:
                     self._limiter.force_wait(retry_after)
                 # -- вариант 3: adaptive safety margin --
@@ -919,17 +869,8 @@ class GroqClient:
                 # на следующей волне вызовов той же роли/задачи.
                 self._limiter.register_rate_limit_hit()
                 raise GroqRateLimitError(str(exc), retry_after=retry_after) from exc
-            if _is_request_too_large_error(exc):
+            if is_request_too_large_error(exc):
                 raise GroqPromptTooLargeError(
                     f"Groq вернул 413 Request Entity Too Large: {exc}"
                 ) from exc
             raise
-
-
-def _is_rate_limit_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return "429" in text or "rate limit" in text or "rate_limit" in text
-
-def _is_request_too_large_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return "413" in text or "request_too_large" in text or "request entity too large" in text

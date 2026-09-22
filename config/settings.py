@@ -56,7 +56,8 @@ class Settings(BaseSettings):
     # Nemotron 3 Super — Planner/Elaborator/Critic/vault_dedup/folder_assignment/
     # researcher_selection (все reasoning-роли). Проверь точный slug модели в
     # OpenRouter перед запуском — их id могут отличаться от псевдонима в UI.
-    openrouter_planning_model: str = Field(default="nvidia/nemotron-3-ultra-550b-a55b:free")
+    #nvidia/nemotron-3-ultra-550b-a55b:free
+    openrouter_planning_model: str = Field(default="z-ai/glm-5.2:free")
     openrouter_planning_rpm_soft_limit: int = Field(default=15, ge=1)
     openrouter_planning_rpd_soft_limit: int = Field(default=150, ge=1)
 
