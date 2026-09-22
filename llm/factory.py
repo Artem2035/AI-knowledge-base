@@ -55,39 +55,49 @@ def create_llm_client(settings: Settings, budget: LLMBudget):
 
 def _create_openrouter_router(settings: Settings):
     """
-    У каждой модели — СВОЙ LLMBudget (разные free-tier RPM/RPD лимиты на
-    OpenRouter), но оба инкрементируют llm_calls_used на ОБЩЕМ TaskStatus,
-    который передаёт вызывающий код (roles/*.py через generate_structured
-    -> LLMBudget.register_call(status, ...)) — поэтому
-    MAX_LLM_CALLS_PER_TASK по-прежнему работает как единый потолок на
-    задачу независимо от того, какая из двух моделей тратит вызовы. Это
-    тот же принцип, на котором уже построены self.budget/
-    self.extraction_budget в orchestrator/state_machine.py для Groq.
+    RoleRoutingLLMClient поверх MultiModelOpenRouterClient на группу ролей
+    (planning/writing) — см. llm/multi_model_client.py про auto/manual
+    (settings.openrouter_selection_mode).
+
+    У каждой модели-кандидата свой LLMBudget. В MVP один и тот же soft-лимит
+    (settings.openrouter_planning_rpm_soft_limit/rpd_soft_limit) применяется
+    ко всем кандидатам группы — упрощение: раздельная настройка per-модель
+    добавила бы конфигурационный шум, непропорциональный MVP. Все бюджеты
+    пишут в общий TaskStatus.llm_calls_used, так что MAX_LLM_CALLS_PER_TASK
+    остаётся единым потолком на задачу.
     """
     from llm.openrouter_client import OpenRouterClient
+    from llm.multi_model_client import MultiModelOpenRouterClient
     from llm.router import RoleRoutingLLMClient
 
-    planning_budget = LLMBudget(
-        max_calls_per_task=settings.max_llm_calls_per_task,
-        rpm_soft_limit=settings.openrouter_planning_rpm_soft_limit,
-        rpd_soft_limit=settings.openrouter_planning_rpd_soft_limit,
-    )
-    planning_client = OpenRouterClient(
-        settings=settings, budget=planning_budget, model=settings.openrouter_planning_model,
-    )
+    def _build_group(models: list[str], rpm: int, rpd: int) -> MultiModelOpenRouterClient:
+        candidates = [
+            OpenRouterClient(
+                settings=settings,
+                budget=LLMBudget(
+                    max_calls_per_task=settings.max_llm_calls_per_task,
+                    rpm_soft_limit=rpm, rpd_soft_limit=rpd,
+                ),
+                model=model,
+            )
+            for model in models
+        ]
+        return MultiModelOpenRouterClient(candidates, selection_mode=settings.openrouter_selection_mode)
 
-    writing_budget = LLMBudget(
-        max_calls_per_task=settings.max_llm_calls_per_task,
-        rpm_soft_limit=settings.openrouter_writing_rpm_soft_limit,
-        rpd_soft_limit=settings.openrouter_writing_rpd_soft_limit,
+    planning_group = _build_group(
+        settings.openrouter_planning_models,
+        settings.openrouter_planning_rpm_soft_limit,
+        settings.openrouter_planning_rpd_soft_limit,
     )
-    writing_client = OpenRouterClient(
-        settings=settings, budget=writing_budget, model=settings.openrouter_writing_model,
+    writing_group = _build_group(
+        settings.openrouter_writing_models,
+        settings.openrouter_writing_rpm_soft_limit,
+        settings.openrouter_writing_rpd_soft_limit,
     )
 
     return RoleRoutingLLMClient(
-        default_client=planning_client,
-        role_map={"synthesizer_write": writing_client},
+        default_client=planning_group,
+        role_map={"synthesizer_write": writing_group},
     )
 
 

@@ -48,23 +48,63 @@ class Settings(BaseSettings):
     #   проверки, а не как исследование с цитируемыми источниками.
     research_mode: Literal["web", "knowledge"] = Field(default="knowledge")
 
-    # ---- OpenRouter (второй провайдер, роль-based роутинг) ----
+    # ---- OpenRouter (второй провайдер, роль-based роутинг с failover) ----
     openrouter_api_key: str = Field(default="")
     openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1")
     openrouter_timeout_seconds: int = Field(default=60, ge=1)
 
-    # Nemotron 3 Super — Planner/Elaborator/Critic/vault_dedup/folder_assignment/
-    # researcher_selection (все reasoning-роли). Проверь точный slug модели в
-    # OpenRouter перед запуском — их id могут отличаться от псевдонима в UI.
-    #nvidia/nemotron-3-ultra-550b-a55b:free
-    openrouter_planning_model: str = Field(default="z-ai/glm-5.2:free")
+    # "auto" (дефолт) — при сбое текущей модели (перегрузка апстрима,
+    #   rate limit, исчерпанный дневной бесплатный лимит именно у неё,
+    #   невалидный JSON после repair) клиент сам пробует следующую модель
+    #   из списка *_models ниже, по порядку приоритета.
+    # "manual" — используется только ПЕРВАЯ модель списка; при её сбое —
+    #   контролируемая остановка с подсказкой, какие резервные модели
+    #   есть в конфиге (переключение — ваше явное решение).
+    openrouter_selection_mode: Literal["auto", "manual"] = Field(default="auto")
+
+    # Списки моделей-кандидатов НА РОЛЬ, в порядке приоритета. В .env можно
+    # задать comma-separated строкой:
+    # OPENROUTER_PLANNING_MODELS=nvidia/nemotron-3-ultra-550b-a55b:free,z-ai/glm-5.2:free
+    openrouter_planning_models: list[str] = Field(
+        default_factory=lambda: [
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "z-ai/glm-5.2:free",
+            "thinkingmachines/inkling-small:free",
+        ]
+    )
     openrouter_planning_rpm_soft_limit: int = Field(default=15, ge=1)
     openrouter_planning_rpd_soft_limit: int = Field(default=150, ge=1)
 
-    # Gemma 4 26B A4B — ТОЛЬКО synthesizer_write (Writer).
-    openrouter_writing_model: str = Field(default="google/gemma-4-26b-a4b-it:free")
+    openrouter_writing_models: list[str] = Field(
+        default_factory=lambda: [
+            "google/gemma-4-26b-a4b-it:free",
+            "google/gemma-4-31b:free",
+        ]
+    )
     openrouter_writing_rpm_soft_limit: int = Field(default=15, ge=1)
     openrouter_writing_rpd_soft_limit: int = Field(default=150, ge=1)
+
+    @field_validator("openrouter_planning_models", "openrouter_writing_models", mode="before")
+    @classmethod
+    def _split_csv_models(cls, v):
+        if isinstance(v, str):
+            return [m.strip() for m in v.split(",") if m.strip()]
+        return v
+
+    # ---- OpenRouter: проактивная проверка остатка free-tier лимита ----
+    # См. GET /api/v1/key (docs: Open router ai limits) — поле
+    # free_model_daily_requests.{used,limit,remaining} показывает дневной
+    # счётчик запросов к :free-моделям ДЛЯ ВСЕГО КЛЮЧА (не по модели).
+    # Если True — перед КАЖДОЙ группой вызовов (planning/writing)
+    # MultiModelOpenRouterClient опционально запрашивает этот эндпоинт
+    # (см. llm/openrouter_client.py::fetch_key_info) и кэширует результат
+    # на openrouter_key_check_cache_seconds — это позволяет узнать, что
+    # дневной бесплатный лимit близок к исчерпанию, ДО того как реальный
+    # запрос упадёт с 429, и залогировать явное предупреждение. Само по
+    # себе НЕ блокирует вызов (сервер — источник истины), просто даёт
+    # более информативное сообщение при остановке.
+    openrouter_check_key_before_call: bool = Field(default=True)
+    openrouter_key_check_cache_seconds: float = Field(default=60.0, ge=0.0)
 
     # ---- Groq ----
     groq_api_key: str = Field(default="", description="Ключ Groq API (бесплатный тир)")

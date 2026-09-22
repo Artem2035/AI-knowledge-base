@@ -84,6 +84,14 @@ class OpenRouterPromptTooLargeError(LLMPromptTooLargeError):
     """413 от API, либо промпт заведомо больше context_budget_tokens
     (см. OpenRouterClient.available_prompt_budget_tokens)."""
 
+class OpenRouterProviderOverloadedError(Exception):
+    """Апстрим-провайдер модели (за OpenRouter) временно перегружен —
+    ответ вида {"choices": None, "error": {"code": 503, "metadata":
+    {"error_type": "provider_overloaded"}}}. Retryable и failover-triggering
+    (см. llm/multi_model_client.py) — в отличие от OpenRouterSchemaError,
+    это не проблема качества ответа модели, а временная недоступность
+    инфраструктуры за конкретной моделью."""
+
 
 class OpenRouterClient:
     # Свободные модели OpenRouter в проекте заявляют контекст 256K-1M
@@ -191,14 +199,9 @@ class OpenRouterClient:
             parsed = self._parse_with_repair(raw_json, response_model)
             self.budget.register_call(status, role=role, ok=True)
             return parsed
-        except OpenRouterRateLimitError as exc:
-            self.budget.register_call(status, role=role, ok=False, error=str(exc))
-            raise LLMFreeLimitReached(
-                f"Свободный лимит OpenRouter ({self.model}) исчерпан (устойчивая "
-                "429 после retry). Задача остановлена. Прогресс сохранён — можно "
-                "продолжить позже."
-            ) from exc
-        except (OpenRouterSchemaError, OpenRouterPromptTooLargeError) as exc:
+        except (OpenRouterRateLimitError, OpenRouterProviderOverloadedError, OpenRouterSchemaError) as exc:
+            # Решение "сдаться окончательно или попробовать следующую
+            # модель-кандидата" принимает MultiModelOpenRouterClient.
             self.budget.register_call(status, role=role, ok=False, error=str(exc))
             raise
         except Exception as exc:
@@ -212,7 +215,7 @@ class OpenRouterClient:
     _RETRYABLE_EXCEPTIONS = (OpenRouterRateLimitError, APIConnectionError, APITimeoutError)
 
     @retry(
-        retry=retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
+        retry=retry_if_exception_type((OpenRouterRateLimitError, OpenRouterProviderOverloadedError)),
         wait=wait_random_exponential(multiplier=1, max=15),
         stop=stop_after_attempt(4),
         reraise=True,
@@ -231,15 +234,28 @@ class OpenRouterClient:
         except Exception as exc:
             logger.exception("OpenRouter request failed (%s): %s", self.model, exc)
             if is_rate_limit_error(exc):
-                retry_after = parse_retry_after(str(exc))
-                raise OpenRouterRateLimitError(str(exc), retry_after=retry_after) from exc
-            if is_request_too_large_error(exc):
-                raise OpenRouterPromptTooLargeError(
-                    f"OpenRouter ({self.model}) вернул 413 Request Entity Too Large: {exc}"
-                ) from exc
+                raise OpenRouterRateLimitError(str(exc)) from exc
             raise
 
-        content = response.choices[0].message.content
+        code, message, error_type = _extract_error_info(response)
+        if code is not None:
+            if code == 503 or error_type == "provider_overloaded":
+                raise OpenRouterProviderOverloadedError(
+                    f"OpenRouter ({self.model}): апстрим-провайдер временно "
+                    f"перегружен — {message} (code={code})"
+                )
+            if is_rate_limit_error(message or ""):
+                raise OpenRouterRateLimitError(message or f"rate limited (code={code})")
+            raise RuntimeError(f"OpenRouter ({self.model}) вернул ошибку: {message} (code={code})")
+
+        choices = getattr(response, "choices", None)
+        if not choices:
+            raise RuntimeError(
+                f"OpenRouter ({self.model}) вернул пустой choices без явного "
+                f"поля error в ответе: {response}"
+            )
+
+        content = choices[0].message.content
         if content is None:
             raise RuntimeError(f"OpenRouter ({self.model}) вернул пустой ответ (content=None)")
         return content
@@ -262,3 +278,21 @@ class OpenRouterClient:
                     f"OpenRouter ({self.model}) вернул невалидный JSON даже после repair. "
                     f"Исходная ошибка: {first_exc}; после repair: {second_exc}"
                 ) from second_exc
+
+def _extract_error_info(response) -> tuple[int | None, str | None, str | None]:
+    err = getattr(response, "error", None)
+    if not err:
+        return None, None, None
+    if isinstance(err, dict):
+        code = err.get("code")
+        message = err.get("message")
+        metadata = err.get("metadata") or {}
+    else:
+        code = getattr(err, "code", None)
+        message = getattr(err, "message", None)
+        metadata = getattr(err, "metadata", None) or {}
+    error_type = (
+        metadata.get("error_type") if isinstance(metadata, dict)
+        else getattr(metadata, "error_type", None)
+    )
+    return code, message, error_type

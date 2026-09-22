@@ -15,6 +15,8 @@ from typing import Callable, Sequence, TypeVar
 
 from pydantic import BaseModel
 
+from llm.common import estimate_tokens
+
 T = TypeVar("T")
 
 
@@ -34,10 +36,10 @@ def split_items_into_batches(
     if budget_fn is None:
         return [list(items)]
 
-    from llm.groq_client import _estimate_tokens  # та же эвристика, что и у клиента
+
 
     available_tokens = budget_fn(system_instruction, response_model)
-    overhead_tokens = _estimate_tokens(static_overhead_text)
+    overhead_tokens = estimate_tokens(static_overhead_text)
     text_budget_tokens = max(available_tokens - overhead_tokens, 0)
 
     if text_budget_tokens <= 0:
@@ -51,7 +53,7 @@ def split_items_into_batches(
     current_tokens = 0
 
     for item in items:
-        item_tokens = _estimate_tokens(render_item(item))
+        item_tokens = estimate_tokens(render_item(item))
         if current and current_tokens + item_tokens > text_budget_tokens:
             batches.append(current)
             current, current_tokens = [], 0
