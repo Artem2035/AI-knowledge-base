@@ -36,9 +36,10 @@ def split_items_into_batches(
     if budget_fn is None:
         return [list(items)]
 
-
-
     available_tokens = budget_fn(system_instruction, response_model)
+    if available_tokens is None:  # NEW
+        return [list(items)]
+
     overhead_tokens = estimate_tokens(static_overhead_text)
     text_budget_tokens = max(available_tokens - overhead_tokens, 0)
 

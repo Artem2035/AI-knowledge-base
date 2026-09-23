@@ -97,7 +97,7 @@ from llm.common import (LLMRateLimitError, LLMSchemaError, LLMPromptTooLargeErro
                         is_rate_limit_error,
                         is_request_too_large_error,
                         parse_retry_after,
-                        repair_json)
+                        repair_json, estimate_tokens, chars_per_token)
 
 from orchestrator.budget import LLMBudget, LLMFreeLimitReached
 from storage.models import TaskStatus
@@ -123,33 +123,6 @@ class GroqSchemaError(LLMSchemaError):
 class GroqPromptTooLargeError(LLMPromptTooLargeError):
     """Промпт+система+ожидаемый output превышают доступный TPM-бюджет.
     Поднимается ДО сетевого вызова — вызывающий код должен порезать текст."""
-
-
-def _chars_per_token(text: str) -> float:
-    """Единая эвристика chars/token, переиспользуемая и оценкой, и
-    авто-обрезкой — чтобы эти две операции не расходились в оценках
-    (именно расхождение в 2.0 vs 2.3 приводило к тому, что чанк,
-    посчитанный "подходящим", на самом деле не помещался в бюджет)."""
-    if not text:
-        return 4.0
-    cyrillic = sum(1 for ch in text if "а" <= ch.lower() <= "я" or ch.lower() == "ё")
-    ratio = cyrillic / max(len(text), 1)
-    return 2.3 if ratio > 0.3 else 4.0
-
-
-def _estimate_tokens(text: str) -> int:
-    """Грубая оценка количества токенов без внешних зависимостей.
-    Для кириллицы токенизаторы в среднем дают ~2.2-2.5 символа/токен
-    (хуже, чем для английского ~4 символа/токен), поэтому оцениваем
-    консервативно по доле кириллицы в тексте, чтобы не занижать расход.
-
-    Это "сырая" (naive) оценка ДО калибровки по роли — см.
-    TokenEstimateCalibrator ниже, который корректирует именно эту оценку
-    по факту предыдущих вызовов конкретной роли (учитывая, в т.ч.,
-    эффект Groq prompt caching)."""
-    if not text:
-        return 0
-    return int(len(text) / _chars_per_token(text)) + 1
 
 # Модели, для которых Groq поддерживает constrained decoding
 # (response_format={"type": "json_schema", "json_schema": {"strict": True, ...}}) —
@@ -543,7 +516,7 @@ class GroqClient:
         чтобы вызывающий код (extractor_critic) мог заранее решить, резать
         ли текст источника на чанки, вместо того чтобы ловить 413."""
         schema_hint = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
-        overhead = _estimate_tokens(system_instruction) + _estimate_tokens(schema_hint)
+        overhead = estimate_tokens(system_instruction) + estimate_tokens(schema_hint)
         total_available = self._limiter.available_tokens()
         # берём min с полным лимитом окна (available_tokens уже учитывает
         # то, что "занято" другими вызовами в последнюю минуту, а также
@@ -580,7 +553,7 @@ class GroqClient:
                 response_model, system_instruction, force_json_object=True
             )
 
-        system_tokens = _estimate_tokens(full_system)
+        system_tokens = estimate_tokens(full_system)
         max_prompt_tokens = self._limiter._limit - self.RESERVED_OUTPUT_TOKENS - system_tokens
 
         if max_prompt_tokens <= 200:
@@ -592,10 +565,10 @@ class GroqClient:
                 "реальному тарифу Groq."
             )
 
-        prompt_tokens = _estimate_tokens(prompt)
+        prompt_tokens = estimate_tokens(prompt)
         if prompt_tokens > max_prompt_tokens:
             prompt = self._auto_truncate_prompt(prompt, max_prompt_tokens, role=role)
-            prompt_tokens = _estimate_tokens(prompt)
+            prompt_tokens = estimate_tokens(prompt)
 
         # "Наивная" (по символам) оценка полного расхода на вызов, ДО
         # калибровки по роли. Именно эта величина сравнивается с реальным
@@ -710,11 +683,11 @@ class GroqClient:
         не умеет резать длинные источники (в отличие от extractor_critic,
         где чанкинг уже есть), запрос всё равно уйдёт и не уронит задачу
         ошибкой GroqPromptTooLargeError."""
-        chars_per_token = _chars_per_token(prompt)
+        text_chars_per_token = chars_per_token(prompt)
         marker = "\n\n[…текст автоматически обрезан из-за лимита токенов Groq API…]"
-        marker_tokens = _estimate_tokens(marker)
+        marker_tokens = estimate_tokens(marker)
         allowed_tokens = max(max_prompt_tokens - marker_tokens, 50)
-        allowed_chars = int(allowed_tokens * chars_per_token * 0.92)  # запас 8%
+        allowed_chars = int(allowed_tokens * text_chars_per_token * 0.92)  # запас 8%
 
         if len(prompt) <= allowed_chars:
             return prompt
@@ -731,7 +704,7 @@ class GroqClient:
             "стоит добавить чанкинг на уровне вызывающей роли, как в "
             "extractor_critic.py, чтобы не терять хвост текста.",
             role, len(prompt), len(truncated),
-            _estimate_tokens(prompt), max_prompt_tokens,
+            estimate_tokens(prompt), max_prompt_tokens,
         )
         return truncated + marker
 

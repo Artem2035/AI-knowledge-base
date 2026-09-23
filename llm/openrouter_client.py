@@ -59,7 +59,7 @@ from llm.common import (LLMRateLimitError, LLMSchemaError, LLMPromptTooLargeErro
                         LLMSchemaError,
                         is_rate_limit_error,
                         is_request_too_large_error,
-                        parse_retry_after,
+                        parse_retry_after, LLMProviderOverloadedError,
                         repair_json, estimate_tokens)
 
 from orchestrator.budget import LLMBudget, LLMFreeLimitReached
@@ -84,7 +84,7 @@ class OpenRouterPromptTooLargeError(LLMPromptTooLargeError):
     """413 от API, либо промпт заведомо больше context_budget_tokens
     (см. OpenRouterClient.available_prompt_budget_tokens)."""
 
-class OpenRouterProviderOverloadedError(Exception):
+class OpenRouterProviderOverloadedError(LLMProviderOverloadedError):
     """Апстрим-провайдер модели (за OpenRouter) временно перегружен —
     ответ вида {"choices": None, "error": {"code": 503, "metadata":
     {"error_type": "provider_overloaded"}}}. Retryable и failover-triggering

@@ -178,7 +178,7 @@ class Settings(BaseSettings):
     # ---- Объединение заметок в конце workflow ----
     # См. staging/draft_merge.py — ноль LLM-вызовов, чистая пересборка уже
     # написанного текста ПОСЛЕ Writer+Critic, ПЕРЕД validation/staging.
-    enable_draft_merging: bool = Field(default=False)
+    enable_draft_merging: bool = Field(default=True)
 
     # Как именно объединять, когда enable_draft_merging=True:
     # "all" (дефолт) — ВСЕ написанные заметки (action=create) сливаются в

@@ -58,6 +58,11 @@ class LLMPromptTooLargeError(LLMError):
     контекста. Поднимается ДО (или вместо) сетевого вызова — вызывающий
     код должен порезать текст (см. llm/chunking.py)."""
 
+class LLMProviderOverloadedError(LLMError):
+    """Апстрим-провайдер модели временно перегружен (напр. OpenRouter
+    503/provider_overloaded). Retryable и failover-triggering — не
+    проблема качества ответа модели, а временная недоступность
+    инфраструктуры за конкретной моделью-кандидатом."""
 
 # ---------------------------------------------------------------------------
 # JSON repair (раньше было продублировано в groq_client.py/openrouter_client.py)
