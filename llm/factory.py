@@ -2,31 +2,18 @@
 Единственная точка выбора активного LLM-провайдера. Orchestrator вызывает
 create_llm_client(...) один раз при старте — дальше вся система работает с
 объектом, реализующим generate_structured(...), не зная, какой конкретно
-провайдер (и, для 'openrouter', какая конкретно из моделей-кандидатов под
-капотом) используется.
+провайдер используется.
 
-Провайдеры в MVP:
-- 'groq' (прежний, по умолчанию) — один клиент, одна модель на все роли
-  (плюс отдельная extraction-модель, см. create_extraction_llm_client).
-- 'openrouter' (новый) — РОЛЬ-BASED РОУТИНГ + client-side failover через
-  llm/router.py::RoleRoutingLLMClient между группами бесплатных моделей
-  OpenRouter (списки моделей-кандидатов на роль, см.
-  config/settings.py::openrouter_planning_models/openrouter_writing_models):
-    * planning-группа — дефолт: outline_planner, elaborator, critic,
-      vault_dedup, folder_assignment, researcher_selection.
-    * writing-группа — ТОЛЬКО synthesizer_write (Writer).
-
-ИЗМЕНЕНИЕ: отдельный llm/multi_model_client.py::MultiModelOpenRouterClient
-убран — его failover-логика слита прямо в llm/router.py::
-RoleRoutingLLMClient (см. докстринг там). Здесь достаточно построить ДЛЯ
-КАЖДОЙ РОЛИ-ГРУППЫ обычный список OpenRouterClient (по одному на модель) и
-передать его в RoleRoutingLLMClient как default_client/role_map[role] —
-роутер сам разворачивает список в failover-группу.
-
-Чтобы добавить ещё одного провайдера в будущем — реализовать тот же
-интерфейс (llm/base.py::LLMClient Protocol) в llm/<provider>_client.py по
-образцу llm/groq_client.py / llm/openrouter_client.py и добавить один elif
-сюда. roles/*, orchestrator/state_machine.py трогать не нужно.
+v4-A1 (см. docs/groq_token_budget.md §4, вариант A1): create_extraction_llm_client
+теперь принимает опциональный primary_client — уже созданный основной
+GroqClient (self.llm в Orchestrator). Если groq_extraction_model совпадает
+с groq_model (дефолт проекта — оба "openai/gpt-oss-120b") и флаг
+settings.groq_share_limiter_when_same_model включён (дефолт True) —
+extraction-клиент переиспользует TokenRateLimiter/TokenEstimateCalibrator
+основного клиента вместо создания собственных. Без этого два клиента,
+физически делящих один TPM Groq, независимо резервировали бы токены "не
+зная" друг о друге — риск превышения реального лимита суммой двух
+локальных резервов, невидимый в логах ни одного из клиентов по отдельности.
 """
 from __future__ import annotations
 
@@ -106,20 +93,19 @@ def _create_openrouter_router(settings: Settings):
     )
 
 
-def create_extraction_llm_client(settings: Settings, budget: LLMBudget):
-    """Отдельный клиент для роли extractor_critic/elaborator — самая
-    частая по числу вызовов роль (см. docs/architecture.md §5.3).
+def create_extraction_llm_client(settings: Settings, budget: LLMBudget, primary_client=None):
+    """Отдельный клиент для роли extractor_critic/elaborator.
 
-    На Groq использует другую модель (settings.groq_extraction_model) с
-    отдельным TPM-профилем — единственной роли, где регулярно не хватает
-    TPM обычной модели.
-
-    На OpenRouter (и для любого другого будущего провайдера без отдельного
-    TPM-профиля extraction-модели) elaborator и так уходит на
-    planning-группу (дефолт роутера, см. _create_openrouter_router) —
-    отдельной МОДЕЛИ не требуется, но отдельный БЮДЖЕТ (throttle) всё
-    равно полезен, поэтому просто строится ещё один роутер со своим
-    независимым набором LLMBudget внутри."""
+    primary_client (НОВОЕ, v4-A1): основной LLM-клиент задачи (обычно
+    Orchestrator.self.llm), ЕСЛИ он уже создан. Используется только для
+    провайдера 'groq' и только когда:
+      1) settings.groq_share_limiter_when_same_model=True (дефолт),
+      2) settings.groq_extraction_model == settings.groq_model,
+      3) primary_client — реальный экземпляр GroqClient (не роутер
+         OpenRouter и не заглушка).
+    Если хотя бы одно условие не выполнено — поведение НЕ отличается от
+    прежнего: создаётся полностью независимый GroqClient со своим
+    TokenRateLimiter/TokenEstimateCalibrator (как и было до v4-A1)."""
     if settings.llm_provider != "groq":
         return create_llm_client(settings, budget)
 
@@ -131,7 +117,32 @@ def create_extraction_llm_client(settings: Settings, budget: LLMBudget):
             "groq_tpm_limit": settings.groq_extraction_tpm_limit,
         }
     )
-    return GroqClient(settings=extraction_settings, budget=budget)
+
+    shared_limiter = None
+    shared_calibrator = None
+    if (
+        getattr(settings, "groq_share_limiter_when_same_model", True)
+        and settings.groq_extraction_model == settings.groq_model
+        and isinstance(primary_client, GroqClient)
+    ):
+        shared_limiter = primary_client._limiter
+        shared_calibrator = primary_client._calibrator
+        import logging
+
+        logging.getLogger(__name__).info(
+            "create_extraction_llm_client: модель extraction-клиента (%s) "
+            "совпадает с основной — переиспользуем TokenRateLimiter/"
+            "TokenEstimateCalibrator основного клиента (groq_share_limiter_"
+            "when_same_model=True).",
+            settings.groq_extraction_model,
+        )
+
+    return GroqClient(
+        settings=extraction_settings,
+        budget=budget,
+        shared_limiter=shared_limiter,
+        shared_calibrator=shared_calibrator,
+    )
 
 
 def budget_limits_for_provider(settings: Settings) -> tuple[int, int]:

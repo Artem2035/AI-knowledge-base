@@ -2,19 +2,6 @@
 Общие для ВСЕХ провайдеров LLM (Groq, OpenRouter, ...) утилиты и
 провайдер-нейтральная иерархия исключений.
 
-Почему это выделено отдельно, а не оставлено дублированным по клиентам:
-repair_json/_WORD_DIGITS были продублированы между groq_client.py и
-openrouter_client.py осознанно (см. докстринг openrouter_client.py —
-"чтобы не тянуть зависимость друг на друга") и это было безопасно, т.к.
-это чистые функции без побочных эффектов.
-
-Дублирование КЛАССОВ ИСКЛЮЧЕНИЙ безопасным не было: roles/extractor_critic.py
-ловит конкретные GroqPromptTooLargeError/GroqSchemaError (импортируя их
-напрямую из llm.groq_client). Если активный провайдер — OpenRouter (см.
-llm/router.py::RoleRoutingLLMClient), тот поднимает СВОИ собственные
-OpenRouterSchemaError и т.п. — except в extractor_critic.py на них не
-срабатывает, ошибка улетает наружу необработанной и роняет задачу целиком.
-
 Итог: роли (roles/*.py) и общий код (llm/chunking.py и т.п.) должны
 ловить ТОЛЬКО типы из этого модуля (LLMRateLimitError/LLMSchemaError/
 LLMPromptTooLargeError), никогда Groq*/OpenRouter*-специфичные классы
@@ -130,23 +117,57 @@ def parse_retry_after(message: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Грубая оценка числа токенов без внешних зависимостей. У Groq поверх этого
-# есть калибровка по роли (TokenEstimateCalibrator в groq_client.py) — она
-# остаётся там, т.к. специфична для TPM-лимитера Groq. Здесь — только
-# базовая "наивная" оценка, достаточная и для OpenRouter (где нет TPM
-# leaky-bucket, но нужна хотя бы грубая прикидка бюджета промпта).
+# Грубая оценка числа токенов без внешних зависимостей.
+#
+# ИЗМЕНЕНИЕ (B4 из groq_token_budget.md): коэффициенты symb/token и порог
+# доли кириллицы раньше были хардкожены прямо здесь (2.3 / 4.0 / 0.3) и
+# не были проверены на реальных промптах проекта — это один из источников
+# систематической погрешности в цепочке "наивная оценка -> лимитер ->
+# калибратор" (либо завышение -> ложные ожидания/голодание, либо
+# занижение -> недоиспользование бюджета).
+#
+# Коэффициенты вынесены АРГУМЕНТАМИ функций (не читаются из
+# config/settings.py напрямую) по двум причинам:
+# 1) common.py специально спроектирован провайдер-нейтральным и не должен
+#    тянуть зависимость на config/settings.py (см. докстринг модуля выше
+#    про то, почему исключения не дублируются, а общий код — да, но без
+#    зависимостей на конкретный провайдер/конфиг);
+# 2) значения по умолчанию здесь ПОЛНОСТЬЮ совпадают со старым хардкодом
+#    — вызывающий код (GroqClient), у которого ЕСТЬ доступ к Settings,
+#    сам решает, передавать ли настроенные из groq_chars_per_token_*
+#    значения, или использовать дефолты. Любой другой (будущий) провайдер
+#    без своих настроек продолжает получать точно то же поведение, что
+#    было раньше, без каких-либо изменений на своей стороне.
 # ---------------------------------------------------------------------------
 
 
-def chars_per_token(text: str) -> float:
+def chars_per_token(
+        text: str,
+        *,
+        cyrillic_ratio_threshold: float = 0.3,
+        cyrillic_chars_per_token: float = 2.3,
+        latin_chars_per_token: float = 4.0,
+) -> float:
     if not text:
-        return 4.0
+        return latin_chars_per_token
     cyrillic = sum(1 for ch in text if "а" <= ch.lower() <= "я" or ch.lower() == "ё")
     ratio = cyrillic / max(len(text), 1)
-    return 2.3 if ratio > 0.3 else 4.0
+    return cyrillic_chars_per_token if ratio > cyrillic_ratio_threshold else latin_chars_per_token
 
 
-def estimate_tokens(text: str) -> int:
+def estimate_tokens(
+        text: str,
+        *,
+        cyrillic_ratio_threshold: float = 0.3,
+        cyrillic_chars_per_token: float = 2.3,
+        latin_chars_per_token: float = 4.0,
+) -> int:
     if not text:
         return 0
-    return int(len(text) / chars_per_token(text)) + 1
+    cpt = chars_per_token(
+        text,
+        cyrillic_ratio_threshold=cyrillic_ratio_threshold,
+        cyrillic_chars_per_token=cyrillic_chars_per_token,
+        latin_chars_per_token=latin_chars_per_token,
+    )
+    return int(len(text) / cpt) + 1

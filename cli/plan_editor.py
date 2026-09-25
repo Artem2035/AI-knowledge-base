@@ -42,6 +42,24 @@ def _select_note_index(plan: Plan, prompt: str) -> int | None:
         return None
     return idx - 1
 
+def _parse_indices(raw: str, count: int) -> list[int] | None:
+    """Разбирает строку вида '2,4,5' (1-based номера, как в
+    _select_note_index/_select_subpoint_index) в список 0-based индексов,
+    отсортированный по УБЫВАНИЮ и без дублей — такой порядок позволяет
+    удалять элементы последовательными pop() без пересчёта индексов
+    оставшихся элементов после каждого удаления."""
+    try:
+        indices = [int(x.strip()) - 1 for x in raw.split(",") if x.strip()]
+    except ValueError:
+        console.print("[red]Не удалось разобрать номера — используйте запятую как разделитель.[/red]")
+        return None
+    if not indices:
+        console.print("[red]Не указано ни одного номера.[/red]")
+        return None
+    if any(i < 0 or i >= count for i in indices):
+        console.print(f"[red]Номер вне диапазона [1, {count}].[/red]")
+        return None
+    return sorted(set(indices), reverse=True)
 
 def _select_subpoint_index(note: OutlineNote) -> int | None:
     if not note.subpoints:
@@ -71,11 +89,23 @@ def _add_note(plan: Plan) -> None:
 
 
 def _remove_note(plan: Plan) -> None:
-    idx = _select_note_index(plan, "Номер заметки для удаления")
-    if idx is None:
+    if not plan.notes:
+        console.print("[dim]Заметок нет.[/dim]")
         return
-    removed = plan.notes.pop(idx)
-    console.print(f"[dim]Удалена заметка «{removed.title}».[/dim]")
+    raw = typer.prompt(f"Номера заметок для удаления через запятую (1-{len(plan.notes)})")
+    indices = _parse_indices(raw, len(plan.notes))
+    if indices is None:
+        return
+
+    removed_titles = [plan.notes[i].title for i in indices]  # уже в порядке убывания индексов
+    for i in indices:
+        plan.notes.pop(i)
+
+    if len(removed_titles) == 1:
+        console.print(f"[dim]Удалена заметка «{removed_titles[0]}».[/dim]")
+    else:
+        listing = ", ".join(f"«{t}»" for t in reversed(removed_titles))  # вернуть исходный порядок для вывода
+        console.print(f"[dim]Удалено заметок: {len(removed_titles)} ({listing}).[/dim]")
 
 
 def _rename_note(plan: Plan) -> None:
@@ -98,15 +128,30 @@ def _add_subpoint(plan: Plan) -> None:
 
 
 def _remove_subpoint(plan: Plan) -> None:
-    idx = _select_note_index(plan, "Из какой заметки удалить подпункт")
+    idx = _select_note_index(plan, "Из какой заметки удалить подпункт(ы)")
     if idx is None:
         return
     note = plan.notes[idx]
-    sp_idx = _select_subpoint_index(note)
-    if sp_idx is None:
+    if not note.subpoints:
+        console.print("[dim]Подпунктов нет.[/dim]")
         return
-    removed = note.subpoints.pop(sp_idx)
-    console.print(f"[dim]Удалён подпункт «{removed.heading}».[/dim]")
+
+    for i, sp in enumerate(note.subpoints, start=1):
+        console.print(f"  {i}. {sp.heading}")
+    raw = typer.prompt(f"Номера подпунктов через запятую (1-{len(note.subpoints)})")
+    indices = _parse_indices(raw, len(note.subpoints))
+    if indices is None:
+        return
+
+    removed_headings = [note.subpoints[i].heading for i in indices]
+    for i in indices:
+        note.subpoints.pop(i)
+
+    if len(removed_headings) == 1:
+        console.print(f"[dim]Удалён подпункт «{removed_headings[0]}».[/dim]")
+    else:
+        listing = ", ".join(f"«{h}»" for h in reversed(removed_headings))
+        console.print(f"[dim]Удалено подпунктов: {len(removed_headings)} ({listing}).[/dim]")
 
 
 def _edit_subpoint(plan: Plan) -> None:
@@ -126,10 +171,10 @@ _EDIT_MENU = (
     ("1", "Утвердить план"),
     ("2", "Отменить задачу"),
     ("3", "Добавить заметку"),
-    ("4", "Удалить заметку"),
+    ("4", "Удалить заметку(и)"),
     ("5", "Переименовать заметку"),
     ("6", "Добавить подпункт"),
-    ("7", "Удалить подпункт"),
+    ("7", "Удалить подпункт(ы)"),
     ("8", "Изменить подпункт (заголовок/covers)"),
 )
 _EDIT_ACTIONS = {

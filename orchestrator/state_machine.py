@@ -116,7 +116,16 @@ class Orchestrator:
             rpm_soft_limit=ext_rpm,
             rpd_soft_limit=ext_rpd,
         )
-        self.extraction_client = create_extraction_llm_client(settings, self.extraction_budget)
+        # v4-A1 (см. docs/groq_token_budget.md §4, llm/factory.py::
+        # create_extraction_llm_client): передаём уже созданный self.llm —
+        # если модель extraction-клиента совпадает с основной (дефолт
+        # проекта), фабрика переиспользует TokenRateLimiter/
+        # TokenEstimateCalibrator основного клиента вместо создания
+        # независимого — устраняет риск, что два клиента, физически деля
+        # один TPM Groq, резервируют токены "не зная" друг о друге.
+        self.extraction_client = create_extraction_llm_client(
+            settings, self.extraction_budget, primary_client=self.llm
+        )
 
     def close(self) -> None:
         self.db.close()
