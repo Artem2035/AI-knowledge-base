@@ -14,7 +14,7 @@ docs/
 ├── llm/           _index, core, groq_client, schemas, prompts, chunking
 ├── orchestrator/  _index, state_machine, budget
 ├── storage/       _index, models
-├── config/        _index, settings
+├── config/        _index, settings, env
 ├── roles/         _index, outline_planner, elaborator, vault_analyst, synthesizer_writer, critic
 ├── staging/       _index, changeset, checkpoint, commit, diff, draft_merge
 ├── vault/         _index, db, reader, index, writer
@@ -34,7 +34,7 @@ docs/
 3. `orchestrator/` → `llm/` (`core` → `groq_client` → `schemas` → `prompts` → `chunking`) — LLM-слой.
 4. `roles/` — роли.
 5. `vault/`, `staging/`, `validation/` — всё вокруг Vault без LLM.
-6. `tools/`, `cli/`, `config/` — периферия.
+6. `tools/`, `cli/`, `config/` — периферия (для первого запуска начните с `config/env.md`).
 
 Термины — `GLOSSARY.md`.
 
@@ -52,6 +52,7 @@ docs/
 | Цикл одного LLM-вызова (flow) | `flows/llm_cycle.md` |
 | `storage/models.py` | `storage/models.md` |
 | `config/settings.py` | `config/settings.md` |
+| руководство по настройке `.env` | `config/env.md` |
 | `roles/outline_planner.py` | `roles/outline_planner.md` |
 | `roles/elaborator.py` | `roles/elaborator.md` |
 | `roles/vault_analyst.py` | `roles/vault_analyst.md` |
