@@ -150,7 +150,7 @@ class Settings(BaseSettings):
     # Множитель к реальному TPM-лимиту модели — держим запас, чтобы неточная
     # оценка токенов сама по себе не провоцировала 429 (было захардкожено
     # как safety_margin=0.85 в конструкторе TokenRateLimiter).
-    groq_limiter_safety_margin: float = Field(default=0.85, gt=0.0, le=1.0)
+    groq_limiter_safety_margin: float = Field(default=0.95, gt=0.0, le=1.0)
 
     # Adaptive safety margin (вариант 3): что происходит с лимитом сразу
     # после РЕАЛЬНОГО 429 от API.

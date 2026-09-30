@@ -456,6 +456,7 @@ class TokenRateLimiter:
         adjust_last_reservation, register_rate_limit_hit) не блокируются.
         Спим кусками до 5 с, чтобы заново оценивать _limit — он может
         вырасти за счёт восстановления margin."""
+        already_logged = False
         while True:
             with self._lock:
                 wall_now = time.time()
@@ -482,12 +483,14 @@ class TokenRateLimiter:
 
                 next_minute_start = (self._window_idx + 1) * 60
                 sleep_for = max(next_minute_start - wall_now + self._boundary_margin, 0.2)
-                logger.info(
-                    "TokenRateLimiter: ждём начала следующей минуты %.1fs "
-                    "(used=%d, limit=%d, need=%d, margin=%.0f%%)",
-                    sleep_for, self._used, self._limit, estimated_tokens,
-                    100 * self._margin_penalty,
-                )
+                if not already_logged:
+                    logger.info(
+                        "TokenRateLimiter: ждём начала следующей минуты %.1fs "
+                        "(used=%d, limit=%d, need=%d, margin=%.0f%%)",
+                        sleep_for, self._used, self._limit, estimated_tokens,
+                        100 * self._margin_penalty,
+                    )
+                    already_logged = True
             time.sleep(min(sleep_for, 5.0))
 
     def adjust_last_reservation(self, actual_tokens: int) -> None:

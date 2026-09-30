@@ -70,6 +70,7 @@ def _make_response(content: str, *, usage: dict | None = None):
     usage_obj = types.SimpleNamespace(
         total_tokens=usage.get("total_tokens", 0),
         completion_tokens=usage.get("completion_tokens", 0),
+        prompt_tokens=usage.get("prompt_tokens", 0),
         prompt_tokens_details=details,
     )
     return types.SimpleNamespace(choices=[choice], usage=usage_obj)
@@ -325,6 +326,33 @@ class TestOutputReservationCalibration:
 
         budget = client.available_prompt_budget_tokens("sys", _DummyOutput)
         assert budget > 1000  # бюджет считается от ёмкости, а не от остатка
+
+    def test_prompt_ratio_independent_of_output_reserve(self, monkeypatch):
+        """Регрессия: prompt-ratio калибруется только по input и не должен
+        зависеть от резерва под output (раньше naive включал резерв, и
+        коэффициент 'плавал' при смене резерва)."""
+        def fake_create(**kwargs):
+            return _make_response(
+                '{"value": "ok"}',
+                usage={"prompt_tokens": 600, "completion_tokens": 50, "total_tokens": 650},
+            )
+
+        _install_fake_openai(monkeypatch, fake_create)
+        from llm.groq_client import GroqClient
+
+        ratios = []
+        for reserve in (300, 3000):
+            client = GroqClient(
+                settings=_settings(groq_reserved_output_tokens_default=reserve),
+                budget=LLMBudget(10, 100, 100),
+            )
+            client.generate_structured(
+                role="critic", prompt="текст " * 200,
+                response_model=_DummyOutput, status=TaskStatus(task_id=f"reg{reserve}"),
+            )
+            ratios.append(client._calibrator._ratio_by_role["critic"])
+
+        assert ratios[0] == pytest.approx(ratios[1])
 
 class TestMarginRecoveryModes:
     """B2: TokenRateLimiter — 'linear' восстановление margin после 429
