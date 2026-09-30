@@ -92,7 +92,23 @@ class GroqPromptTooLargeError(LLMPromptTooLargeError):
     """Промпт+система+ожидаемый output превышают доступный TPM-бюджет."""
 
 _STRICT_SCHEMA_SUPPORTED_MODELS = {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
+# Модели, у которых Groq принимает reasoning_effort (low/medium/high) и
+# include_reasoning. Это ОТДЕЛЬНАЯ возможность от strict json_schema:
+# множества сейчас совпадают случайно и могут разойтись. У других
+# reasoning-моделей значения effort другие (напр. none/default), поэтому
+# для них параметры не передаём вообще.
+_REASONING_EFFORT_SUPPORTED_MODELS = {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
 
+# Уровень рассуждений по роли. Роли, которых здесь нет, идут с default
+# модели (параметр не передаётся) — напр. outline_planner: один вызов на
+# задачу, качество плана важнее экономии.
+_REASONING_EFFORT_BY_ROLE: dict[str, str] = {
+    "folder_assignment": "low",
+    "vault_dedup": "low",
+    "critic": "low",
+    "synthesizer_write": "low",
+    "elaborator": "medium",
+}
 
 def _to_strict_json_schema(schema: dict) -> dict:
     """Рекурсивно приводит JSON Schema из Pydantic model_json_schema() к виду,
@@ -143,6 +159,12 @@ def _is_schema_unsupported_error(exc: Exception) -> bool:
             "missing properties",
         )
     )
+
+def _is_reasoning_param_error(exc: Exception) -> bool:
+        """API отклонил reasoning_effort/include_reasoning (напр. значение не
+        поддерживается моделью). Оптимизация не должна ронять вызов."""
+        text = str(exc).lower()
+        return any(m in text for m in ("reasoning_effort", "include_reasoning", "reasoning_format"))
 
 
 class TokenEstimateCalibrator:
@@ -296,34 +318,23 @@ class CacheObservability:
 class TokenRateLimiter:
     """Клиентский лимитер по токенам в минуту (TPM).
 
-    Комбинирует ДВА независимых ограничения (вариант 4 — leaky-bucket):
+    Окно ФИКСИРОВАННОЕ, привязанное к календарной минуте (как считает
+    Groq Console): лимит действует в интервале [hh:mm:00, hh:mm+1:00) и
+    полностью сбрасывается на границе минуты. Расход, накопленный в
+    предыдущей минуте, в новую не переносится.
 
-    1. Sliding-window (как раньше) — жёсткая защита: сумма зарезервированных
-       токенов за последние 60 секунд никогда не превышает self._limit.
-       Сам по себе этот механизм НЕ запрещает потратить весь лимит одним
-       всплеском в начале окна.
+    Два механизма:
+    1. Фиксированное минутное окно — сумма зарезервированных токенов в
+       ТЕКУЩЕЙ календарной минуте не превышает self._limit. Если места
+       нет — ждём начала следующей минуты (+ небольшой запас на рассинхрон
+       часов с сервером Groq).
+    2. Adaptive safety margin — register_rate_limit_hit() ужимает
+       эффективный лимит после РЕАЛЬНОГО 429, затем лимит восстанавливается
+       ("linear" или "step") за margin_recovery_seconds.
 
-    2. Leaky-bucket (новое) — ограничивает РАВНОМЕРНЫЙ темп расхода
-       (limit/60 токенов в секунду) поверх sliding-window. Запрос
-       разрешается, только если накопленный с начала текущей "минуты
-       темпа" расход не опережает то, что должно было быть потрачено при
-       равномерном темпе (+15% буфер гибкости, чтобы редкие короткие
-       вызовы не спотыкались об идеально линейный график). Это делает
-       структурно невозможным сам всплеск, а не только реагирует на него
-       постфактум.
-
-    Также реализует adaptive safety margin (вариант 3):
-    register_rate_limit_hit() ужимает эффективный лимит сразу после
-    РЕАЛЬНОГО 429 от API, с плавным восстановлением через
-    margin_recovery_seconds секунд без новых 429.
-
-    v4-B2: добавлен параметр recovery_mode ("step" | "linear") — см.
-    Settings.groq_margin_recovery_mode за полное обоснование выбора
-    дефолта "linear". Коротко: "step" держит margin_penalty ПОЛНОСТЬЮ
-    ужатым весь margin_recovery_seconds, затем скачком возвращает 100% —
-    "linear" вместо этого линейно поднимает margin_penalty от значения на
-    момент штрафа к 1.0 в течение того же окна, устраняя ступеньку без
-    изменения общей длительности "осторожного" периода после 429.
+    Замечание: запрос, зарезервированный в конце минуты, Groq может
+    засчитать уже в следующую (сетевая задержка). boundary_margin_seconds
+    и safety_margin частично компенсируют это, но не гарантируют.
     """
 
     def __init__(
@@ -334,26 +345,31 @@ class TokenRateLimiter:
         margin_min_penalty: float = 0.5,
         margin_recovery_seconds: float = 300.0,
         recovery_mode: str = "linear",
+        boundary_margin_seconds: float = 0.5,
     ):
         self._base_limit = max(int(tpm_limit * safety_margin), 1)
         self._limit = self._base_limit
-        self._window: deque[tuple[float, int]] = deque()
         self._lock = threading.RLock()
 
+        # Состояние фиксированного окна: номер календарной минуты
+        # (int(unix_time // 60)) и сколько токенов в ней уже зарезервировано.
+        self._window_idx: int = int(time.time() // 60)
+        self._used: int = 0
+        # (номер минуты, размер резерва) последней резервации — нужна для
+        # adjust_last_reservation(). Если минута уже сменилась, поправку
+        # применять некуда: тот расход давно обнулён.
+        self._last_reservation: tuple[int, int] | None = None
+        # Запас после границы минуты: часы могут слегка расходиться с
+        # серверными, лучше подождать чуть дольше, чем поймать 429.
+        self._boundary_margin = boundary_margin_seconds
+
         self._margin_penalty = 1.0
-        # v4-B2: значение margin_penalty СРАЗУ ПОСЛЕ последнего штрафа —
-        # нужно как отправная точка для линейной интерполяции к 1.0.
-        # Хранится отдельно от текущего self._margin_penalty, т.к. при
-        # "linear" режиме текущее значение меняется на каждой проверке
-        # (см. _maybe_recover_margin), а точка отсчёта должна оставаться
-        # фиксированной до следующего реального 429.
         self._penalty_value_at_last_hit: float = 1.0
         self._last_penalty_at: float | None = None
         self._recovery_after_seconds = margin_recovery_seconds
         self._penalty_factor = margin_penalty_factor
         self._min_penalty = margin_min_penalty
         self._recovery_mode = recovery_mode if recovery_mode in ("step", "linear") else "linear"
-
     # -- adaptive safety margin --------------------------------
 
     def register_rate_limit_hit(self) -> None:
@@ -414,60 +430,94 @@ class TokenRateLimiter:
                 self._limit, self._recovery_after_seconds,
             )
 
-    # -- sliding window -----------------------------------------------------
+    # -- фиксированное минутное окно ---------------------------------------
 
-    def _prune(self, now: float) -> int:
-        while self._window and now - self._window[0][0] > 60:
-            self._window.popleft()
-        return sum(tokens for _, tokens in self._window)
+    def _roll_window(self, wall_now: float) -> None:
+        """Если началась новая календарная минута — обнуляем расход.
+        Вызывать только под self._lock."""
+        idx = int(wall_now // 60)
+        if idx != self._window_idx:
+            self._window_idx = idx
+            self._used = 0
 
     def available_tokens(self) -> int:
         with self._lock:
-            now = time.monotonic()
-            self._maybe_recover_margin(now)
-            used = self._prune(now)
-            return max(self._limit - used, 0)
+            self._maybe_recover_margin(time.monotonic())
+            self._roll_window(time.time())
+            return max(self._limit - self._used, 0)
 
     def wait_and_reserve(self, estimated_tokens: int) -> None:
-        """Блокирует поток, пока не появится место И по sliding-window, И
-                по leaky-bucket темпу. Резервирует место сразу (оптимистично);
-                реальный расход корректируется через adjust_last_reservation()."""
-        with self._lock:
-            while True:
-                now = time.monotonic()
-                self._maybe_recover_margin(now)
-                used = self._prune(now)
+        """Блокирует поток, пока в ТЕКУЩЕЙ календарной минуте не появится
+        место, и резервирует его оптимистично (по оценке); реальный расход
+        подменяет adjust_last_reservation().
 
-                sliding_ok = used + estimated_tokens <= self._limit
+        Сон происходит ВНЕ блокировки: пока один поток ждёт следующей
+        минуты, другие клиенты с общим лимитером (available_tokens,
+        adjust_last_reservation, register_rate_limit_hit) не блокируются.
+        Спим кусками до 5 с, чтобы заново оценивать _limit — он может
+        вырасти за счёт восстановления margin."""
+        while True:
+            with self._lock:
+                wall_now = time.time()
+                self._maybe_recover_margin(time.monotonic())
+                self._roll_window(wall_now)
 
-                if sliding_ok:
-                    self._window.append((now, estimated_tokens))
+                fits = self._used + estimated_tokens <= self._limit
+                # Запрос больше всего лимита никогда не поместится даже в
+                # пустую минуту — пропускаем его в пустое окно, иначе
+                # вечное ожидание. Реальный отказ, если он будет, придёт
+                # от API как 413/429 и обработается клиентом.
+                oversized_but_window_empty = self._used == 0 and estimated_tokens > self._limit
+
+                if fits or oversized_but_window_empty:
+                    if oversized_but_window_empty:
+                        logger.warning(
+                            "TokenRateLimiter: запрос (~%d токенов) больше "
+                            "лимита минуты (%d) — пропускаем в пустое окно.",
+                            estimated_tokens, self._limit,
+                        )
+                    self._used += estimated_tokens
+                    self._last_reservation = (self._window_idx, estimated_tokens)
                     return
 
-                oldest_ts, _ = self._window[0]
-                sleep_for = max(60 - (now - oldest_ts) + 0.1, 0.2)
-
+                next_minute_start = (self._window_idx + 1) * 60
+                sleep_for = max(next_minute_start - wall_now + self._boundary_margin, 0.2)
                 logger.info(
-                    "TokenRateLimiter: ждём %.1fs (used=%d, limit=%d, need=%d, margin=%.0f%%)",
-                    sleep_for, used, self._limit, estimated_tokens,
+                    "TokenRateLimiter: ждём начала следующей минуты %.1fs "
+                    "(used=%d, limit=%d, need=%d, margin=%.0f%%)",
+                    sleep_for, self._used, self._limit, estimated_tokens,
                     100 * self._margin_penalty,
                 )
-                time.sleep(min(sleep_for, 5.0))
+            time.sleep(min(sleep_for, 5.0))
 
     def adjust_last_reservation(self, actual_tokens: int) -> None:
-        """Подменяет оценочный резерв ЭФФЕКТИВНЫМ расходом (уже за вычетом
-        закэшированных Groq токенов — см. GroqClient._call_with_retry),
-        повышая точность и sliding-window, и leaky-bucket бюджета со
-        временем."""
+        """Заменяет оценочный резерв последней резервации фактическим
+        расходом (за вычетом закэшированных токенов, см.
+        GroqClient._call_with_retry). Если минута резервации уже закончилась,
+        поправка не применяется: расход той минуты обнулён."""
         with self._lock:
-            if self._window:
-                self._window[-1] = (self._window[-1][0], actual_tokens)
+            if self._last_reservation is None:
+                return
+            idx, reserved = self._last_reservation
+            self._roll_window(time.time())
+            if idx != self._window_idx:
+                return
+            self._used = max(self._used - reserved + actual_tokens, 0)
+            self._last_reservation = (idx, actual_tokens)
 
-    def force_wait(self, seconds: float) -> None:
-        """Используется, когда Groq всё же вернул 429 с явным retry-after —
-        держим лок, чтобы никто другой не полез параллельно в это окно."""
+    def capacity_tokens(self) -> int:
+        """Полная ёмкость календарной минуты с учётом текущего штрафа margin
+        (БЕЗ вычета уже потраченного в этой минуте).
+
+        Нужна для планирования размера батчей: остаток текущей минуты
+        (available_tokens) в конце минуты может быть близок к нулю, хотя
+        wait_and_reserve() дождётся следующей минуты и полный лимит снова
+        станет доступен. Размер батча должен зависеть от того, что влезет
+        в ПУСТУЮ минуту, а не от того, что осталось прямо сейчас.
+        """
         with self._lock:
-            time.sleep(max(seconds, 0.1))
+            self._maybe_recover_margin(time.monotonic())
+            return self._limit
 
 
 class GroqClient:
@@ -553,6 +603,7 @@ class GroqClient:
         self._account_for_prompt_cache = getattr(settings, "groq_account_for_prompt_cache", False)
         self._cache_observability = shared_cache_observability or CacheObservability()
         self._strict_schema_supported = settings.groq_model in _STRICT_SCHEMA_SUPPORTED_MODELS
+        self._reasoning_supported = settings.groq_model in _REASONING_EFFORT_SUPPORTED_MODELS
 
         from openai import OpenAI
 
@@ -573,23 +624,27 @@ class GroqClient:
         return estimate_tokens(text, **self._chars_per_token_kwargs)
 
     def available_prompt_budget_tokens(
-        self,
-        system_instruction: str,
-        response_model: type[BaseModel],
+            self,
+            system_instruction: str,
+            response_model: type[BaseModel],
     ) -> int:
         """Сколько токенов остаётся под сам prompt (без system/schema/output),
-        чтобы вызывающий код (extractor_critic) мог заранее решить, резать
-        ли текст источника на чанки, вместо того чтобы ловить 413."""
+        чтобы вызывающий код (llm/chunking.py) мог заранее разбить список
+        элементов на батчи.
+
+        Бюджет считается от ПОЛНОЙ ёмкости минутного окна (capacity_tokens),
+        а не от остатка текущей минуты: фиксированное окно сбрасывается на
+        границе минуты, и wait_and_reserve() при необходимости дождётся её.
+        Иначе в конце минуты остаток близок к нулю, батчинг раздробил бы
+        список по одному элементу и лишний раз потратил вызовы
+        (MAX_LLM_CALLS_PER_TASK).
+        """
         schema_hint = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
         overhead = self._estimate_tokens(system_instruction) + self._estimate_tokens(schema_hint)
-        total_available = self._limiter.available_tokens()
-        # v4-B1: RESERVED_OUTPUT_TOKENS -> дефолтный резерв (см. __init__).
-        # Здесь НЕТ role-специфичной калибровки намеренно: этот метод
-        # вызывается llm/chunking.py ДО того, как известна конкретная роль
-        # батча в некоторых путях вызова (сигнатура не принимает role) —
-        # используется консервативный дефолт, не заниженный калиброванный
-        # резерв, чтобы не рисковать переоценкой доступного места под батч.
-        budget = total_available - overhead - self._reserved_output_default
+        total_capacity = self._limiter.capacity_tokens()
+        # Консервативный дефолтный резерв под output, без role-калибровки:
+        # метод вызывается до того, как известна роль (см. прежний комментарий).
+        budget = total_capacity - overhead - self._reserved_output_default
         return max(budget, 0)
 
     def generate_structured(
@@ -648,6 +703,7 @@ class GroqClient:
         naive_estimate = system_tokens + prompt_tokens + reserved_output
         calibrated_estimate = self._calibrator.correct(role, naive_estimate)
 
+        extra_body = self._build_reasoning_extra_body(role)
         try:
             raw_json, completion_tokens = self._call_with_retry(
                 prompt=prompt,
@@ -658,6 +714,7 @@ class GroqClient:
                 fallback_system=fallback_system,
                 role=role,
                 naive_estimate=naive_estimate,
+                extra_body=extra_body,
             )
             parsed = self._parse_with_repair(raw_json, response_model)
             self.budget.register_call(status, role=role, ok=True)
@@ -735,6 +792,20 @@ class GroqClient:
             + schema_hint
         )
         return response_format, full_system
+
+    def _build_reasoning_extra_body(self, role: str) -> dict | None:
+        """Параметры рассуждений для конкретной роли. None — модель их не
+        поддерживает, ничего не передаём (совместимость с другими моделями).
+        Через extra_body, а не именованными аргументами: include_reasoning нет
+        в типизации openai SDK, а reasoning_effort появился только в
+        поздних версиях (requirements.txt допускает openai>=1.30)."""
+        if not self._reasoning_supported:
+            return None
+        body: dict = {"include_reasoning": False}  # текст рассуждений нам не нужен
+        effort = _REASONING_EFFORT_BY_ROLE.get(role)
+        if effort:
+            body["reasoning_effort"] = effort
+        return body
 
     def _auto_truncate_prompt(
         self, prompt: str, max_prompt_tokens: int, *, role: str
@@ -822,6 +893,7 @@ class GroqClient:
         fallback_system: str | None = None,
         role: str = "",
         naive_estimate: int = 0,
+        extra_body: dict | None = None
     ) -> tuple[str, int]:
         """Возвращает (raw_json_content, completion_tokens). completion_tokens
         добавлен к прежней сигнатуре (v4-B1) — вызывающий код
@@ -831,7 +903,7 @@ class GroqClient:
         self._limiter.wait_and_reserve(estimated_tokens)
 
         try:
-            response = self._client.chat.completions.create(
+            create_kwargs = dict(
                 model=self.settings.groq_model,
                 messages=[
                     {"role": "system", "content": system_instruction},
@@ -840,6 +912,9 @@ class GroqClient:
                 response_format=response_format,
                 timeout=self.settings.groq_timeout_seconds,
             )
+            if extra_body:
+                create_kwargs["extra_body"] = extra_body
+            response = self._client.chat.completions.create(**create_kwargs)
             content = response.choices[0].message.content
             if content is None:
                 raise RuntimeError("Groq вернул пустой ответ (content=None)")
@@ -879,6 +954,17 @@ class GroqClient:
 
             return content, completion_tokens
         except Exception as exc:
+            if extra_body and _is_reasoning_param_error(exc):
+                logger.warning(
+                    "Groq отклонил параметры рассуждений (%s) — разовый повтор без них.", exc
+                )
+                return self._call_with_retry(
+                    prompt=prompt, system_instruction=system_instruction,
+                    estimated_tokens=estimated_tokens, response_format=response_format,
+                    fallback_format=fallback_format, fallback_system=fallback_system,
+                    role=role, naive_estimate=naive_estimate, extra_body=None,
+                )
+
             if (
                 response_format.get("type") == "json_schema"
                 and _is_schema_unsupported_error(exc)

@@ -203,6 +203,24 @@ def test_factory_unknown_provider_raises():
     with pytest.raises(ValueError):
         create_llm_client(settings, budget)
 
+def test_groq_passes_reasoning_params_only_for_supported_model(monkeypatch):
+    captured = []
+
+    def fake_create(**kwargs):
+        captured.append(kwargs)
+        return _make_response('{"value": "ok"}')
+
+    _install_fake_openai(monkeypatch, fake_create)
+    from llm.groq_client import GroqClient
+
+    status = TaskStatus(task_id="r1")
+    supported = GroqClient(settings=_settings(groq_model="openai/gpt-oss-120b"), budget=LLMBudget(5, 100, 100))
+    supported.generate_structured(role="critic", prompt="p", response_model=_DummyOutput, status=status)
+    assert captured[-1]["extra_body"] == {"include_reasoning": False, "reasoning_effort": "low"}
+
+    other = GroqClient(settings=_settings(groq_model="qwen/qwen3.8-27b"), budget=LLMBudget(5, 100, 100))
+    other.generate_structured(role="critic", prompt="p", response_model=_DummyOutput, status=status)
+    assert "extra_body" not in captured[-1]
 
 # ---------------------------------------------------------------------------
 # НОВЫЕ тесты (v4) — по одному на каждое из четырёх изменений бюджета
@@ -296,6 +314,17 @@ class TestOutputReservationCalibration:
         assert reserved < 1500
         assert len(call_log) == 5
 
+    def test_prompt_budget_not_starved_at_end_of_minute(self, monkeypatch):
+        _install_fake_openai(monkeypatch, lambda **kw: _make_response('{"value": "ok"}'))
+        monkeypatch.setattr("time.time", lambda: 1_700_000_055.0)  # конец минуты
+
+        from llm.groq_client import GroqClient
+
+        client = GroqClient(settings=_settings(groq_tpm_limit=8000), budget=LLMBudget(10, 100, 100))
+        client._limiter.wait_and_reserve(7900)  # почти вся минута израсходована
+
+        budget = client.available_prompt_budget_tokens("sys", _DummyOutput)
+        assert budget > 1000  # бюджет считается от ёмкости, а не от остатка
 
 class TestMarginRecoveryModes:
     """B2: TokenRateLimiter — 'linear' восстановление margin после 429
@@ -494,3 +523,4 @@ class TestConfigurableCharsPerToken:
         # что GroqClient реально читает коэффициенты из Settings, а не
         # только полагается на хардкод llm/common.py.
         assert naive_with_custom > naive_with_default
+

@@ -186,76 +186,103 @@ int] = {}`, `self._lock = threading.Lock()`.
 ---
 
 ## 5. `class TokenRateLimiter`
- 
-**Описание.** Клиентский лимитер по токенам в минуту (TPM) — центральный механизм `GroqClient`, а не опциональная деталь (реальный лимит Groq free tier — 8000 TPM, самое узкое место среди RPM/RPD/TPM/TPD). Реально работают два механизма:
- 
-1. **Sliding-window** — сумма зарезервированных токенов за последние 60 секунд не превышает `self._limit`. Сам по себе не запрещает потратить весь лимит одним всплеском в начале окна.
-2. **Adaptive safety margin** — `register_rate_limit_hit()` ужимает `self._limit` сразу после РЕАЛЬНОГО 429, затем лимит восстанавливается линейно (`"linear"`, дефолт) или ступенькой (`"step"`) за `margin_recovery_seconds`.
-> **Leaky-bucket НЕ реализован.** В докстринге класса в коде упомянут «равномерный темп `limit/60` + 15% буфер», но в `wait_and_reserve` проверяется только условие `sliding_ok` (`used + estimated_tokens <= self._limit`). Никакого пропорционального темпа в коде нет, поэтому всплеск в начале окна возможен.
- 
-### 5.1. `__init__(self, tpm_limit, safety_margin=0.85, margin_penalty_factor=0.8, margin_min_penalty=0.5, margin_recovery_seconds=300.0, recovery_mode="linear")`
- 
+
+**Описание.** Клиентский лимитер по токенам в минуту (TPM), центральный механизм `GroqClient`. Реальный лимит Groq free tier для `openai/gpt-oss-120b` — 8000 TPM, самое узкое место среди RPM/RPD/TPM/TPD.
+
+Окно **фиксированное, привязанное к календарной минуте** (как считает Groq Console): лимит действует в интервале `[hh:mm:00, hh:mm+1:00)` и полностью сбрасывается на границе минуты. Расход прошлой минуты в новую не переносится. Окно определяется настенными часами (`time.time()`), а не `time.monotonic()`, потому что монотонные часы не связаны с границами минут.
+
+Два механизма:
+
+1. **Фиксированное минутное окно.** Сумма токенов, зарезервированных в текущей календарной минуте, не превышает `self._limit`. Если места нет, поток ждёт начала следующей минуты плюс `boundary_margin_seconds`.
+2. **Adaptive safety margin.** `register_rate_limit_hit()` ужимает `self._limit` после РЕАЛЬНОГО 429, затем лимит восстанавливается линейно (`"linear"`, дефолт) или ступенькой (`"step"`) за `margin_recovery_seconds`. Восстановление считается по `time.monotonic()`.
+
+> **История.** До этой правки окно было скользящим (60 секунд от самой старой записи), из-за чего лимитер ждал дольше, чем нужно: если бюджет уходил в 13:01:05, окно освобождалось в 13:02:05, а у Groq лимит обнулялся в 13:02:00. Leaky-bucket в коде никогда не был реализован.
+
+### 5.1. `__init__(self, tpm_limit, safety_margin=0.85, margin_penalty_factor=0.8, margin_min_penalty=0.5, margin_recovery_seconds=300.0, recovery_mode="linear", boundary_margin_seconds=0.5)`
+
 | Имя | Тип | Назначение |
 |---|---|---|
 | `tpm_limit` | `int` | Реальный TPM-лимит модели. Из `settings.groq_tpm_limit`. |
 | `safety_margin` | `float` | Множитель запаса (`0.85` = не более 85%). Из `settings.groq_limiter_safety_margin`. |
-| `margin_penalty_factor` | `float` | Во сколько раз умножается `_margin_penalty` за одно срабатывание 429 (`0.8` = минус 20%). |
+| `margin_penalty_factor` | `float` | Во сколько раз умножается `_margin_penalty` за одно срабатывание 429. |
 | `margin_min_penalty` | `float` | Нижняя граница `_margin_penalty` при серии 429. |
 | `margin_recovery_seconds` | `float` | Длительность восстановления после последнего 429. |
 | `recovery_mode` | `str` | `"step"` или `"linear"`; любое другое значение молча заменяется на `"linear"`. |
- 
-**Атрибуты:** `_base_limit = max(int(tpm_limit * safety_margin), 1)`, `_limit = _base_limit`, `_window: deque[(monotonic_ts, tokens)]`, `_lock = threading.RLock()`, `_margin_penalty = 1.0`, `_penalty_value_at_last_hit = 1.0` (точка отсчёта линейного восстановления), `_last_penalty_at = None`.
- 
+| `boundary_margin_seconds` | `float` | Запас после границы минуты на рассинхрон часов с серверами Groq. **Не вынесен в `Settings`**: `GroqClient` его не передаёт, действует дефолт `0.5`. |
+
+**Атрибуты:**
+- `_base_limit = max(int(tpm_limit * safety_margin), 1)`, `_limit = _base_limit`;
+- `_lock = threading.RLock()`;
+- `_window_idx: int` — номер текущей календарной минуты (`int(time.time() // 60)`);
+- `_used: int` — сколько токенов уже зарезервировано в этой минуте;
+- `_last_reservation: tuple[int, int] | None` — `(номер минуты, размер резерва)` последней резервации;
+- `_boundary_margin`;
+- `_margin_penalty = 1.0`, `_penalty_value_at_last_hit = 1.0` (точка отсчёта линейного восстановления), `_last_penalty_at = None`.
+
 **Исключения:** не поднимает.
- 
+
 ### 5.2. `register_rate_limit_hit(self) -> None`
- 
-Вызывается `GroqClient` после РЕАЛЬНОГО 429 от API. Под `_lock`:
-- `_margin_penalty = max(_margin_penalty * penalty_factor, min_penalty)` — множитель применяется к ТЕКУЩЕМУ (возможно, частично восстановленному) значению, поэтому серия 429 накапливается вплоть до `min_penalty`;
-- `_penalty_value_at_last_hit = _margin_penalty`; `_last_penalty_at = time.monotonic()` — **таймер восстановления стартует заново** при каждом 429;
+
+Без изменений. Вызывается `GroqClient` после РЕАЛЬНОГО 429 от API. Под `_lock`:
+- `_margin_penalty = max(_margin_penalty * penalty_factor, min_penalty)`. Множитель применяется к ТЕКУЩЕМУ (возможно, частично восстановленному) значению, поэтому серия 429 накапливается вплоть до `min_penalty`;
+- `_penalty_value_at_last_hit = _margin_penalty`, `_last_penalty_at = time.monotonic()`. Таймер восстановления стартует заново при каждом 429;
 - `_limit = max(int(_base_limit * _margin_penalty), 1)`;
 - `logger.warning(...)`.
+
 ### 5.3. `_maybe_recover_margin(self, now: float) -> None` (приватный)
- 
-Выходит сразу, если `_margin_penalty >= 1.0` или `_last_penalty_at is None`. Иначе `elapsed = now - _last_penalty_at`:
-- **`"step"`**: пока `elapsed < recovery_seconds`, `_limit` НЕ меняется; по истечении — `_margin_penalty = 1.0`, `_limit = _base_limit`, `_last_penalty_at = None`.
-- **`"linear"`**: `progress = min(elapsed / recovery_seconds, 1.0)` (при `recovery_seconds <= 0` — `1.0`); `_margin_penalty = start + (1 - start) * progress`, где `start = _penalty_value_at_last_hit`; `_limit` пересчитывается при каждом вызове. При `progress >= 1.0` — полное восстановление и сброс `_last_penalty_at`.
-Вызывается из `available_tokens` и `wait_and_reserve`.
- 
-### 5.4. `_prune(self, now: float) -> int` (приватный)
- 
-Удаляет из `_window` записи старше 60 секунд, возвращает сумму токенов оставшихся записей.
- 
+
+Без изменений. `now` — значение `time.monotonic()`.
+- **`"step"`**: пока `elapsed < recovery_seconds`, `_limit` не меняется; по истечении — полное восстановление.
+- **`"linear"`**: `progress = min(elapsed / recovery_seconds, 1.0)`, `_margin_penalty = start + (1 - start) * progress`, `_limit` пересчитывается при каждом вызове.
+
+### 5.4. `_roll_window(self, wall_now: float) -> None` (приватный)
+
+Заменяет прежний `_prune`. Вычисляет `idx = int(wall_now // 60)`. Если `idx != _window_idx`, началась новая календарная минута: `_window_idx = idx`, `_used = 0`. Вызывать только под `_lock`.
+
 ### 5.5. `available_tokens(self) -> int`
- 
-Под `_lock`: `_maybe_recover_margin`, `_prune`, возвращает `max(_limit - used, 0)`. Используется в `GroqClient.available_prompt_budget_tokens` (§6.3). Поскольку берёт тот же `_lock`, что и `wait_and_reserve`, **блокируется, пока другой поток спит внутри `wait_and_reserve`** (см. §5.6).
- 
-### 5.6. `wait_and_reserve(self, estimated_tokens: int) -> None`
- 
-Блокирует поток, пока в скользящем окне не появится место, и резервирует его ОПТИМИСТИЧНО (по оценке); фактический расход потом подменяет `adjust_last_reservation`.
- 
-Всё тело выполняется под `with self._lock:`, цикл `while True`:
-1. `_maybe_recover_margin`, `_prune`;
-2. если `used + estimated_tokens <= _limit` — `_window.append((now, estimated_tokens))` и выход;
-3. иначе `sleep_for = max(60 - (now - oldest_ts) + 0.1, 0.2)`, где `oldest_ts` — время самой старой записи окна; `time.sleep(min(sleep_for, 5.0))` и новая итерация.
-**Важно:** сон происходит **при захваченном `_lock`**. Дробление на куски до 5 секунд не освобождает блокировку — оно лишь заставляет пересчитывать окно. При общем лимитере основного и extraction-клиентов (`groq_share_limiter_when_same_model`) второй клиент, `available_tokens`, `adjust_last_reservation` и `register_rate_limit_hit` ждут окончания ожидания.
- 
-**Исключения:** явных нет, но см. §5.9 (пустое окно).
- 
-### 5.7. `adjust_last_reservation(self, actual_tokens: int) -> None`
- 
-Под `_lock` заменяет ПОСЛЕДНЮЮ запись окна (`_window[-1]`) на `(тот_же_timestamp, actual_tokens)`. Пустое окно — ничего не делает. Функция не знает, чья это запись: при параллельных вызовах из двух клиентов последней может оказаться чужая резервация (см. §5.9).
- 
-### 5.8. `force_wait(self, seconds: float) -> None`
- 
-Под `_lock` делает `time.sleep(max(seconds, 0.1))` — весь лимитер блокируется на время `retry_after`, пока ждёт этот поток.
- 
-### 5.9. Известные ограничения (по коду, не по докстрингам)
- 
-- **Leaky-bucket отсутствует** (см. выше) — защита от всплеска в начале окна не реализована.
-- **Пустое окно:** если `estimated_tokens > _limit`, а окно пусто, условие `sliding_ok` ложно, и `oldest_ts, _ = self._window[0]` даст `IndexError`. Штатно исключено проверкой `max_prompt_tokens` в `generate_structured`, но откалиброванная оценка (`correct`) может вырасти до 1.5× наивной, так что теоретически возможно.
-- **Резервация без корректировки:** если после `wait_and_reserve` запрос завершился исключением, запись остаётся в окне с оценочным значением до истечения 60 секунд. При откате на `json_object` (`_call_with_retry`) резервация делается повторно, первая остаётся.
-- **Приватный доступ:** `GroqClient.generate_structured` читает `self._limiter._limit` напрямую.
+
+Под `_lock`: `_maybe_recover_margin(time.monotonic())`, `_roll_window(time.time())`, возвращает `max(_limit - _used, 0)`, то есть **остаток текущей календарной минуты**. К концу минуты он может быть близок к нулю. **Не используйте его для планирования размера батчей**, для этого есть `capacity_tokens()` (§5.6). Блокируется только на время короткой проверки в другом потоке (сон в `wait_and_reserve` идёт вне блокировки), но по-прежнему ждёт, пока `force_wait` (§5.9) держит `_lock`.
+
+### 5.6. `capacity_tokens(self) -> int`
+
+**Описание.** Полная ёмкость календарной минуты с учётом текущего штрафа margin, **без вычета** уже потраченного. Под `_lock`: `_maybe_recover_margin(time.monotonic())`, возвращает `_limit`.
+
+Нужна для планирования размера батчей. Остаток текущей минуты в её конце близок к нулю, хотя `wait_and_reserve()` дождётся следующей минуты и полный лимит снова станет доступен, поэтому размер батча должен зависеть от того, что влезет в ПУСТУЮ минуту. После реального 429 ёмкость уменьшается (возвращается `_limit`, а не `_base_limit`), так что батчи автоматически сужаются.
+
+**Кто вызывает:** `GroqClient.available_prompt_budget_tokens` (§6.3).
+
+### 5.7. `wait_and_reserve(self, estimated_tokens: int) -> None`
+
+Блокирует поток, пока в ТЕКУЩЕЙ календарной минуте не появится место, и резервирует его ОПТИМИСТИЧНО (по оценке); фактический расход потом подменяет `adjust_last_reservation`.
+
+Цикл `while True`; проверка выполняется под `with self._lock:`, **сон — вне блокировки**:
+1. `_maybe_recover_margin`, `_roll_window`;
+2. `fits = _used + estimated_tokens <= _limit`;
+3. `oversized_but_window_empty = _used == 0 and estimated_tokens > _limit`. Запрос больше всего лимита не поместится даже в пустую минуту, поэтому он пропускается в пустое окно с `logger.warning`, иначе ожидание было бы вечным. Реальный отказ, если он будет, придёт от API как 413/429 и обработается клиентом;
+4. если `fits` или `oversized_but_window_empty` — `_used += estimated_tokens`, `_last_reservation = (_window_idx, estimated_tokens)`, выход;
+5. иначе `sleep_for = max(next_minute_start - wall_now + boundary_margin, 0.2)`, где `next_minute_start = (_window_idx + 1) * 60`. После выхода из блока `with` вызывается `time.sleep(min(sleep_for, 5.0))`, затем новая итерация. Кусками по 5 с спим, чтобы заново оценивать `_limit`: он может вырасти за счёт восстановления margin.
+
+Поскольку сон идёт вне `_lock`, при общем лимитере основного и extraction-клиентов (`groq_share_limiter_when_same_model`) второй клиент и вызовы `available_tokens`, `capacity_tokens`, `adjust_last_reservation`, `register_rate_limit_hit` не блокируются на время ожидания.
+
+**Исключения:** не поднимает.
+
+### 5.8. `adjust_last_reservation(self, actual_tokens: int) -> None`
+
+Под `_lock` заменяет оценочный резерв ПОСЛЕДНЕЙ резервации фактическим расходом (за вычетом закэшированных токенов, если включён `groq_account_for_prompt_cache`): `_used = max(_used - reserved + actual_tokens, 0)`, `_last_reservation = (idx, actual_tokens)`.
+
+Если `_last_reservation is None` или минута резервации уже закончилась (`idx != _window_idx` после `_roll_window`), поправка не применяется: расход той минуты обнулён. Функция не знает, чья это резервация, поэтому при параллельных вызовах из двух клиентов последней может оказаться чужая (см. §5.10).
+
+### 5.9. `force_wait(self, seconds: float) -> None`
+
+Без изменений: под `_lock` делает `time.sleep(max(seconds, 0.1))`. Весь лимитер блокируется на время `retry_after`, пока ждёт этот поток. В отличие от `wait_and_reserve`, сон здесь остаётся ПОД блокировкой (намеренно: после реального 429 никто не должен резервировать окно).
+
+### 5.10. Известные ограничения (по коду, не по докстрингам)
+
+- **Граница минуты.** Запрос, зарезервированный в конце минуты, Groq может засчитать уже в следующую (сетевая задержка). `boundary_margin_seconds` и `safety_margin=0.85` риск снижают, но не устраняют. Если 429 на границах минут всё же повторяются, увеличьте `boundary_margin_seconds` до 1–2 с (потребует вынести параметр в `Settings` и `GroqClient.__init__`).
+- **Предположение о часах.** Выравнивание сделано по `time.time()` (UTC-границы минут). Если Groq считает минуту иначе (например, от первого запроса), окно будет смещено.
+- **Резервация без корректировки.** Если после `wait_and_reserve` запрос завершился исключением, запись остаётся в `_used` с оценочным значением до конца текущей минуты (раньше — до истечения 60 секунд). При откате на `json_object` (`_call_with_retry`) резервация делается повторно, первая остаётся.
+- **Параллельные клиенты.** `_last_reservation` одна на лимитер, поэтому при общем лимитере двух клиентов `adjust_last_reservation` может поправить чужую резервацию.
+- **Приватный доступ.** `GroqClient.generate_structured` читает `self._limiter._limit` напрямую.
 
 ## 6. `class GroqClient`
 
@@ -303,18 +330,15 @@ shared-версии) `TokenRateLimiter`/`TokenEstimateCalibrator`, опреде�
 
 ### 6.3. `available_prompt_budget_tokens(self, system_instruction: str, response_model: type[BaseModel]) -> int`
 
-**Описание.** Часть неявного расширенного контракта, которым пользуется
-`llm/chunking.py::split_items_into_batches`
-(`docs_llm_schemas_prompts_chunking.md §C.1`). Отвечает "сколько токенов
-остаётся под сам текст промпта" — ДО того, как известна конкретная роль
-батча в некоторых путях вызова, поэтому используется консервативный
-дефолтный резерв (`self._reserved_output_default`), не заниженный
-role-калиброванный.
+**Описание.** Часть неявного расширенного контракта, которым пользуется `llm/chunking.py::split_items_into_batches` (`chunking.md §1`). Отвечает «сколько токенов остаётся под сам текст промпта».
 
-**Возвращаемое значение:** `int` — `max(total_available - overhead -
-reserved_output_default, 0)`, где `total_available =
-self._limiter.available_tokens()`, `overhead = estimate_tokens(system_instruction)
-+ estimate_tokens(schema_json)`.
+Бюджет считается от **полной ёмкости** минутного окна (`TokenRateLimiter.capacity_tokens()`, §5.6), а **не от остатка текущей минуты** (`available_tokens()`). Причина: окно фиксированное и сбрасывается на границе минуты, а `wait_and_reserve()` при необходимости дождётся её. Если считать от остатка, то в конце минуты бюджет близок к нулю, `split_items_into_batches` уходит в ветку `text_budget_tokens <= 0` и режет список по одному элементу на батч, что тратит лишние вызовы (`MAX_LLM_CALLS_PER_TASK`). Цена решения: в худшем случае батч ждёт до ~60 с вместо лишних API-вызовов.
+
+Метод вызывается ДО того, как известна конкретная роль батча, поэтому используется консервативный дефолтный резерв под output (`self._reserved_output_default`), а не role-калиброванный.
+
+**Возвращаемое значение:** `int` — `max(capacity - overhead - reserved_output_default, 0)`, где `capacity = self._limiter.capacity_tokens()`, `overhead = estimate_tokens(system_instruction) + estimate_tokens(schema_json)`.
+
+**Исключения:** не поднимает.
 
 ### 6.4. `generate_structured(self, *, role, prompt, response_model, status, system_instruction=None) -> T`
 
@@ -333,7 +357,7 @@ self._limiter.available_tokens()`, `overhead = estimate_tokens(system_instructio
 5. Считает `system_tokens`, получает `reserved_output =
    self._calibrator.reserved_output_tokens(role, default=...)`.
 6. Вычисляет `max_prompt_tokens = self._limiter._limit - reserved_output -
-   system_tokens`. Если `<= 200` — `GroqPromptTooLargeError`.
+   system_tokens` (от ёмкости окна, не от остатка текущей минуты). Если `<= 200` — `GroqPromptTooLargeError`.
 7. Если `estimate_tokens(prompt) > max_prompt_tokens` —
    `self._auto_truncate_prompt(...)` (§6.6).
 8. `naive_estimate = system_tokens + prompt_tokens + reserved_output`;
@@ -477,6 +501,7 @@ completion_tokens)`. `completion_tokens = 0`, если Groq не вернул `u
 | `groq_extraction_model` / `groq_extraction_tpm_limit` / `groq_extraction_rpd_soft_limit` | `../llm/core.md §3.3` | Отдельная конфигурация extraction-клиента. |
 | `max_llm_calls_per_task` | `LLMBudget.__init__` (не `GroqClient` напрямую) | Общий потолок вызовов на задачу. |
 | `groq_rpm_soft_limit` / `groq_rpd_soft_limit` | `LLMBudget.__init__` | Soft-лимиты (`../orchestrator/budget.md §3`). |
+| — (не в `Settings`) | `TokenRateLimiter.__init__(boundary_margin_seconds=...)` | Запас после границы минуты, дефолт `0.5` с; `GroqClient` его не передаёт (см. §5.1, §5.10). |
 
 Документация по `llm/groq_client.py` завершена. Путь одного вызова целиком
 (`Orchestrator → роль → GroqClient → Groq API`) — см. `../flows/llm_cycle.md`.
