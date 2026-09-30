@@ -5,93 +5,69 @@ map-reduce: планирование структуры заметок и зап
 содержания, см. gemini/prompts/planner.py про принцип разделения.
 """
 from __future__ import annotations
-
-# ---------------------------------------------------------------------------
-# Шаг 1 — Writer: по одному вызову на КАЖДУЮ заметку из плана. Получает
-# только evidence, назначенный этой заметке (а не весь список), поэтому
-# промпт на порядок меньше, чем был в одном большом вызове.
-# ---------------------------------------------------------------------------
+from llm.prompts.common import LANGUAGE_RULE
 
 # Блок форматирования вынесен в отдельную константу (а не вплетён единым
 # куском в WRITE_SYSTEM_INSTRUCTION), чтобы его можно было переиспользовать
 # отдельно (например, для будущей роли "reformat existing note") и чтобы
 # при правках форматирования не задевать остальную часть инструкции по
 # содержанию/ссылкам/языку.
-#
-# Принцип: элементы форматирования (callout, списки, код) — это
-# ИНСТРУМЕНТЫ ПО СМЫСЛУ, а не обязательный чек-лист на каждую заметку.
-# Явно НЕТ пункта "используй минимум N элементов" — предыдущая версия
-# промпта требовала фиксированную структуру (обязательный callout в
-# начале, обязательный нумерованный и маркированный список и т.д.), из-за
-# чего модель добавляла притянутые списки из одного пункта и пустые
-# предупреждения там, где по содержанию их не было — то есть подгоняла
-# материал под форму вместо обратного.
+
 FORMATTING_GUIDANCE = (
-    "ФОРМАТИРОВАНИЕ (Obsidian Flavored Markdown). Используй элементы ТОЛЬКО "
-    "по смыслу конкретной заметки — не по шаблону; пустой/притянутый элемент "
-    "хуже, чем его отсутствие:\n"
-    "— Callout `> [!type] Заголовок`: abstract — резюме перед деталями (не "
-    "для короткой заметки); warning — частая ошибка/неочевидное поведение; "
-    "tip — практический совет; info — важное уточнение контекста.\n"
-    "— Списки: нумерованный — только реальная последовательность шагов; "
-    "маркированный — перечисление однородных фактов/вариантов.\n"
-    "— **жирный** — ключевые термины; `код` — имена функций/методов/путей; "
-    "курсив — смысловой акцент, умеренно.\n"
-    "— Блоки ```язык — только для реально иллюстрирующего примера.\n"
-    "— LaTeX: инлайн $x^2$; блок-формула (вывод, система уравнений) — "
-    "двойные $$ на отдельных строках, не оборачивай в ```. Только для "
-    "объективно математических/технических тем."
+    "FORMATTING (Obsidian Flavored Markdown). Use elements ONLY where the "
+    "specific note's content calls for them — not by template; an empty or "
+    "forced element is worse than none:\n"
+    "- Callout `> [!type] Title`: abstract — a summary before details (not "
+    "for a short note); warning — a common mistake/non-obvious behavior; "
+    "tip — a practical tip; info — an important context clarification.\n"
+    "- Lists: numbered — only for a real sequence of steps; bulleted — for "
+    "enumerating homogeneous facts/options.\n"
+    "- **bold** — key terms; `code` — function/method/path names; italics — "
+    "semantic emphasis, sparingly.\n"
+    "- ```language blocks — only for a genuinely illustrative example.\n"
+    "- LaTeX: inline $x^2$; block formula (derivation, system of equations) "
+    "— double $$ on separate lines, do not wrap in ```. Only for objectively "
+    "mathematical/technical topics."
 )
 
-# noinspection LanguageDetectionInspection
 WRITE_SYSTEM_INSTRUCTION = (
-    "Ты — Obsidian Writer. Пишешь ОДНУ заметку по плану (заголовок/action/"
-    "папка заданы, не обсуждаются). Для action='create': tags, body_md, "
-    "links_out. Для action='update': append_section — только новый "
-    "материал, НЕ повторяй существующее содержимое.\n\n"
-    "ОБЪЁМ: целевой диапазон слов задан в промпте ниже. Обычно ~1 страница. "
-    "При заявленных 2 страницах структурируй через ##, разделы выбирай по "
-    "смыслу темы. Фактов меньше, чем нужно для объёма — пиши короче и "
-    "честно (минимум 3 содержательных абзаца), не растягивай повторами и "
-    "неподтверждёнными деталями.\n\n"
+    "You are the Obsidian Writer. You write ONE note according to the plan "
+    "(title/action/folder are fixed, not up for discussion). For "
+    "action='create': tags, body_md, links_out. For action='update': "
+    "append_section — only NEW material, do NOT repeat existing content.\n\n"
+    "SOURCE MATERIAL: base the note strictly on the facts provided per "
+    "section. Do not pad with repetition and do not add specific details "
+    "(numbers, dates, versions, names) that are absent from the provided "
+    "facts.\n\n"
     f"{FORMATTING_GUIDANCE}\n\n"
-    "ССЫЛКИ: links_out — только заголовки заметок Vault (никогда не URL), "
-    "точно как в переданном списке (включая дефисы). Ссылку на тему вне "
-    "списка добавляй только если это самостоятельная концепция, не на "
-    "каждый незнакомый термин.\n\n"
-    "ЗАПРЕЩЕНО: свой раздел/предложение 'См. также'/'Related notes' внутри "
-    "body_md/append_section — '## Связанные заметки' система формирует САМА "
-    "из links_out, дублирование ломает вывод. Другие ключи YAML frontmatter "
-    "(кроме title/tags/created) — не предлагай, система их игнорирует.\n\n"
-    "ЯЗЫК: русский, кроме общепринятых терминов (SQL, Python, RAG — не "
-    "переводить). Не копируй текст источника дословно — пересказ своими "
-    "словами с указанием источника факта."
+    "LINKS: links_out — only Vault note titles (never URLs), exactly as in "
+    "the provided list (including hyphens). Add a link to a topic outside "
+    "the list only if it is a self-contained concept, not for every "
+    "unfamiliar term.\n\n"
+    "FORBIDDEN: your own 'See also'/'Related notes' section/sentence inside "
+    "body_md/append_section — the '## Связанные заметки' section is built by "
+    "the system itself from links_out, duplication breaks the output. Do not "
+    "propose YAML frontmatter keys other than title/tags/created — the "
+    "system ignores them.\n\n"
+    + LANGUAGE_RULE
+    + " This applies to body_md, append_section and tags. Do not copy "
+    "source text verbatim — paraphrase in your own words."
 )
 
-# Добавляется к WRITE_SYSTEM_INSTRUCTION ТОЛЬКО когда
-# settings.enable_draft_merging=True (см. orchestrator/state_machine.py) —
-# Writer не знает, С КЕМ КОНКРЕТНО заметка будет объединена (это решается
-# пользователем только в самом конце, см. staging/draft_merge.py), но
-# может заранее писать так, чтобы объединение с ЛЮБЫМИ соседями по плану
-# проходило чище. Не устраняет риск содержательного пересечения тем
-# (для этого модель должна была бы видеть текст соседних заметок), но
-# снимает самый частый и самый заметный источник "склеенности" —
-# шаблонные вступления/заключения и повтор общего определения темы плана
-# в каждой заметке.
 MERGE_AWARENESS_GUIDANCE = (
-    "ВАЖНО: эта заметка впоследствии МОЖЕТ быть объединена пользователем с "
-    "другими заметками этого же плана в одну большую (тогда её заголовок "
-    "станет разделом '##' внутри объединённой заметки, см. правило выше про "
-    "то, что заголовок зафиксирован планом). Поэтому:\n"
-    "— НЕ пиши шаблонное вступление вида 'В этой заметке рассмотрим...' или "
-    "заключение вида 'Подводя итог...' / 'В заключение...' — при объединении "
-    "с соседними разделами такие фразы повторяются на каждый раздел и "
-    "выглядят избыточно.\n"
-    "— Если заметка предполагает базовое определение общей темы плана — "
-    "дай его КОРОТКО, одной фразой, и сразу переходи к специфике именно "
-    "ЭТОЙ заметки, а не темы в целом (разворачивать общее определение — "
-    "задача заметки, посвящённой самой теме, а не каждого её аспекта).\n"
-    "— Оставайся строго в рамках заявленного заголовка, не отклоняйся в "
-    "объяснение смежных концепций — по плану им, скорее всего, посвящены "
-    "отдельные заметки."
+    "IMPORTANT: this note MAY later be merged by the user with other notes "
+    "of the same plan into one large note (then its title becomes a '##' "
+    "section inside the merged note; see the rule above that the title is "
+    "fixed by the plan). Therefore:\n"
+    "- DO NOT write a boilerplate introduction like 'In this note we will "
+    "consider...' or a conclusion like 'To sum up...' / 'In conclusion...' — "
+    "when merged with neighboring sections such phrases repeat in every "
+    "section and look redundant.\n"
+    "- If the note presumes a basic definition of the plan's overall topic — "
+    "give it BRIEFLY, in one phrase, and move on to the specifics of THIS "
+    "note, not the topic as a whole (expanding the general definition is "
+    "the job of the note devoted to the topic itself, not of each aspect).\n"
+    "- Stay strictly within the declared title, do not drift into "
+    "explaining adjacent concepts — per the plan they most likely have "
+    "separate notes."
 )

@@ -25,7 +25,7 @@ app = typer.Typer(add_completion=False, help="Персональная AI-сис
 console = Console()
 
 logging.basicConfig(level=logging.WARNING)
-
+logging.getLogger("llm.groq_client").setLevel(logging.INFO)
 
 def _run_and_report(orch: Orchestrator, *, raw_query: str | None, resume_task_id: str | None, settings) -> None:
     """Общая логика запуска (новая задача или resume) + единый вывод

@@ -106,7 +106,7 @@ _REASONING_EFFORT_BY_ROLE: dict[str, str] = {
     "folder_assignment": "low",
     "vault_dedup": "low",
     "critic": "low",
-    "synthesizer_write": "low",
+    "synthesizer_write": "medium",
     "elaborator": "medium",
 }
 
@@ -680,9 +680,14 @@ class GroqClient:
         # groq_reserved_output_min_tokens). Это освобождает бюджет под
         # prompt/батчи для коротких по ответу ролей (critic, vault_dedup,
         # folder_assignment) без риска для длинных (synthesizer_write).
+        by_role = getattr(self.settings, "groq_reserved_output_by_role", {})
         reserved_output = self._calibrator.reserved_output_tokens(
-            role, default=self._reserved_output_default
+            role, default=by_role.get(role, self._reserved_output_default)
         )
+
+        # reserved_output = self._calibrator.reserved_output_tokens(
+        #     role, default=self._reserved_output_default
+        # )
         max_prompt_tokens = self._limiter._limit - reserved_output - system_tokens
 
         if max_prompt_tokens <= 200:
@@ -700,8 +705,14 @@ class GroqClient:
             prompt = self._auto_truncate_prompt(prompt, max_prompt_tokens, role=role)
             prompt_tokens = self._estimate_tokens(prompt)
 
-        naive_estimate = system_tokens + prompt_tokens + reserved_output
-        calibrated_estimate = self._calibrator.correct(role, naive_estimate)
+        # Калибруем только ВХОД (system+prompt); резерв под output — отдельное
+        # слагаемое со своей EMA (иначе коэффициент, выученный при одном
+        # резерве, применяется к оценке с другим).
+        naive_input = system_tokens + prompt_tokens
+        calibrated_estimate = self._calibrator.correct(role, naive_input) + reserved_output
+
+        #naive_estimate = system_tokens + prompt_tokens + reserved_output
+        #calibrated_estimate = self._calibrator.correct(role, naive_estimate)
 
         extra_body = self._build_reasoning_extra_body(role)
         try:
@@ -713,9 +724,10 @@ class GroqClient:
                 fallback_format=fallback_format,
                 fallback_system=fallback_system,
                 role=role,
-                naive_estimate=naive_estimate,
+                naive_estimate=naive_input,
                 extra_body=extra_body,
             )
+
             parsed = self._parse_with_repair(raw_json, response_model)
             self.budget.register_call(status, role=role, ok=True)
             # v4-B1: обучаем калибратор реальной длиной ОТВЕТА (отдельно
@@ -744,12 +756,11 @@ class GroqClient:
         force_json_object: bool = False,
     ) -> tuple[dict, str]:
         """Строгий json_schema для gpt-oss-20b/120b (constrained decoding,
-                схема НЕ дублируется текстом в промпте — Groq применяет её сам).
-                Для остальных моделей, а также при force_json_object=True (см.
-                ниже — используется для fallback-вызова после отказа API от
-                строгой схемы) — json_object + текстовая схема как подсказка
-                (best-effort), это ЕДИНСТВЕННЫЙ режим, где модель вообще видит
-                состав полей схемы текстом."""
+        схема НЕ дублируется текстом в промпте — Groq применяет её сам).
+        Для остальных моделей, а также при force_json_object=True (fallback
+        после отказа API от строгой схемы) — json_object + текстовая схема
+        как подсказка (best-effort). Служебные суффиксы — на английском;
+        язык ТЕКСТОВЫХ значений задаётся LANGUAGE_RULE в инструкции роли."""
         base_instruction = (system_instruction or "").strip()
 
         if self._strict_schema_supported and not force_json_object:
@@ -764,15 +775,16 @@ class GroqClient:
             }
             full_system = (
                 base_instruction
-                + "\n\nОтвечай валидным JSON-объектом. Формат ответа принудительно "
-                  "проверяется API согласно заданной схеме — не добавляй markdown-"
-                  "разметку (```), текст до/после JSON и не придумывай поля, "
-                  "которых нет в схеме. ОБЯЗАТЕЛЬНО включай ВСЕ поля схемы в "
-                  "ответ, даже если для конкретного случая они неприменимы — "
-                  "используй пустую строку \"\" или пустой список [] вместо "
-                  "того, чтобы пропустить поле целиком (пропуск обязательного "
-                  "поля — ошибка формата, даже если по смыслу роли оно сейчас "
-                  "не нужно)."
+                + "\n\nRespond with a valid JSON object. The response format "
+                  "is enforced by the API according to the given schema — do "
+                  "not add markdown fences (```), text before/after the JSON, "
+                  "or fields that are not in the schema. Field names and "
+                  "enum values must stay exactly as in the schema (never "
+                  "translate them). ALWAYS include ALL schema fields, even "
+                  "if they do not apply — use an empty string \"\" or an "
+                  "empty list [] instead of omitting the field (omitting a "
+                  "required field is a format error, even if the role does "
+                  "not need it right now)."
             )
             return response_format, full_system
 
@@ -780,14 +792,15 @@ class GroqClient:
         schema_hint = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
         full_system = (
             base_instruction
-            + "\n\nОтвечай СТРОГО валидным JSON-объектом, соответствующим "
-              "следующей JSON Schema. Включай ВСЕ поля из схемы, даже если "
-              "для них нет содержательного значения (используй \"\" или []), "
-              "не пропускай поля. Никакого текста до/после JSON, никакой "
-              "markdown-разметки (```), только сырой JSON. Все числовые поля "
-              "(например confidence) пиши ТОЛЬКО цифрами в формате 0.9, "
-              "НИКОГДА не пиши число словами (не пиши 'Nine', не пиши "
-              "'девять') и не ставь пробел между целой и дробной частью.\n\n"
+            + "\n\nRespond STRICTLY with a valid JSON object matching the "
+              "following JSON Schema. Include ALL schema fields, even if "
+              "there is no meaningful value (use \"\" or []), do not omit "
+              "fields. Field names and enum values must stay exactly as in "
+              "the schema (never translate them). No text before/after the "
+              "JSON, no markdown fences (```), only raw JSON. Write all "
+              "numeric fields (e.g. confidence) ONLY as digits like 0.9, "
+              "NEVER as words (not 'Nine', not 'девять') and do not put a "
+              "space between the integer and fractional parts.\n\n"
               "JSON Schema:\n"
             + schema_hint
         )
@@ -928,6 +941,34 @@ class GroqClient:
                 cached = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
                 cache_hit = cached > 0
 
+                # Отдельно логируем usage по роли: input/output/reasoning/кэш,
+                # оценку резерва против факта и тайминги Groq (extra-поля usage).
+                prompt_tokens_real = int(getattr(usage, "prompt_tokens", 0) or 0)
+                out_details = getattr(usage, "completion_tokens_details", None)
+                reasoning = getattr(out_details, "reasoning_tokens", None) if out_details else None
+                finish_reason = getattr(response.choices[0], "finish_reason", None)
+
+                def _t(name: str) -> str:
+                    v = getattr(usage, name, None)
+                    return f"{v:.2f}" if isinstance(v, (int, float)) else "-"
+
+                logger.info(
+                    "\n Groq usage [%s]: input=%d (кэш=%d) output=%d (reasoning=%s) total=%d | "
+                    "резерв: naive=%d, откалиброван=%d, факт/резерв=%.2f | finish=%s | "
+                    "время, с: queue=%s prompt=%s completion=%s total=%s",
+                    role, prompt_tokens_real, cached, completion_tokens,
+                    reasoning if reasoning is not None else "-", int(actual_total),
+                    naive_estimate, estimated_tokens,
+                    (int(actual_total) / estimated_tokens) if estimated_tokens else 0.0,
+                    finish_reason, _t("queue_time"), _t("prompt_time"),
+                    _t("completion_time"), _t("total_time"),
+                )
+                if finish_reason == "length":
+                    logger.warning(
+                        "Groq [%s]: ответ обрезан по длине (finish_reason=length) — "
+                        "ожидайте GroqSchemaError.", role,
+                    )
+
                 if self._account_for_prompt_cache:
                     effective_tokens = max(int(actual_total) - cached, 0)
                 else:
@@ -935,8 +976,11 @@ class GroqClient:
 
                 self._limiter.adjust_last_reservation(effective_tokens)
 
-                if role and naive_estimate:
-                    self._calibrator.observe(role, naive_estimate, effective_tokens)
+                if role and naive_estimate and prompt_tokens_real > 0:
+                    # naive_estimate теперь — оценка только входа; сверяем с
+                    # реальным prompt_tokens (без кэша, если он учитывается в бюджете).
+                    actual_input = prompt_tokens_real - (cached if self._account_for_prompt_cache else 0)
+                    self._calibrator.observe(role, naive_estimate, max(actual_input, 1))
 
                 if role:
                     self._cache_observability.observe(role, cache_hit)  # только факт хита

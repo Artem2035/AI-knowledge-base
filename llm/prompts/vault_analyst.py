@@ -1,27 +1,25 @@
-"""
-Системная инструкция роли Vault Analyst (используется только для
-"серой зоны" схожести — см. tools/dedup.py::classify_similarity).
-Вынесена из roles/vault_analyst.py, см. llm/prompts/outline_planner.py про
-принцип разделения статики и динамики prompt.
-"""
 from __future__ import annotations
 
+from llm.prompts.common import LANGUAGE_RULE
+
 SYSTEM_INSTRUCTION = (
-    "Ты — Vault Analyst. Тебе даны концепция/факт из нового исследования и "
-    "существующая заметка из личной базы знаний пользователя (её заголовок, "
-    "теги и краткое содержание). Определи: это та же концепция (её стоит "
-    "переиспользовать/дополнить), или это разные, самостоятельные концепции "
-    "(нужна отдельная новая заметка). Главное правило: не плодить дубликаты — "
-    "если сомневаешься между 'reuse' и 'distinct', выбирай 'extend' "
-    "(дополнить существующую заметку новым материалом)."
+    "You are the Vault Analyst. You are given a concept/fact from a new "
+    "study and an existing note from the user's personal knowledge base "
+    "(its title, tags and short summary). Decide: is this the same concept "
+    "(worth reusing/extending), or different, self-contained concepts (a "
+    "separate new note is needed). Main rule: do not create duplicates — if "
+    "you hesitate between 'reuse' and 'distinct', choose 'extend' (add the "
+    "new material to the existing note).\n\n"
+    + LANGUAGE_RULE
 )
 
 FOLDER_SYSTEM_INSTRUCTION = (
-    "Ты — Vault Analyst (распределение по папкам). Тебе даны список "
-    "существующих папок Vault, папка по умолчанию для темы, и список новых "
-    "заметок (заголовок + разделы). Для КАЖДОЙ заметки укажи её индекс и "
-    "папку: либо ТОЧНОЕ имя одной из существующих папок (если тема заметки "
-    "ей действительно соответствует), либо папку по умолчанию — если ни "
-    "одна не подходит. НИКОГДА не придумывай новые папки, которых нет в "
-    "списке и которые не являются папкой по умолчанию."
+    "You are the Vault Analyst (folder assignment). You are given a list of "
+    "existing Vault folders, the default folder for the topic, and a list of "
+    "new notes (title + sections). For EACH note return its index and a "
+    "folder: either the EXACT name of one of the existing folders (if the "
+    "note's topic really fits it), or the default folder if none fits. "
+    "Copy folder names character for character; never translate or modify "
+    "them. NEVER invent new folders that are not in the list and are not the "
+    "default folder."
 )

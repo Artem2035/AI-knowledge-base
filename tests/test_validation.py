@@ -185,3 +185,23 @@ def test_all_outline_headings_present_no_warning(tmp_path):
 
     assert not any(i.code == "missing_outline_heading" for i in report.warnings)
     db.close()
+
+def test_english_body_gets_language_warning(tmp_path):
+    db = _db(tmp_path)
+    body = ("Retrieval-augmented generation combines a retriever with a generator. " * 6)
+    draft = DraftNote(action=NoteAction.CREATE, path="Знания/En.md", title="En", body_md=body)
+    report = run_validation(StagingChangeset(task_id="t12", creates=[draft]), db, allow_delete=False)
+    assert report.ok  # warning не блокирует approve
+    assert any(i.code == "note_language_mismatch" for i in report.warnings)
+    db.close()
+
+
+def test_russian_body_with_code_no_language_warning(tmp_path):
+    db = _db(tmp_path)
+    body = ("Эмбеддинг — числовое векторное представление текста, при котором близкие "
+            "по смыслу объекты оказываются рядом в пространстве. " * 3
+            + "\n\n```python\nimport numpy as np\nvec = np.zeros(384)\n```\n")
+    draft = DraftNote(action=NoteAction.CREATE, path="Знания/Ru.md", title="Ru", body_md=body)
+    report = run_validation(StagingChangeset(task_id="t13", creates=[draft]), db, allow_delete=False)
+    assert not any(i.code == "note_language_mismatch" for i in report.issues)
+    db.close()

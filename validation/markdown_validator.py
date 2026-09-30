@@ -7,6 +7,35 @@ from storage.models import DraftNote, ValidationIssue, NoteAction
 _md = MarkdownIt("commonmark")
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+_URL_RE = re.compile(r"https?://\S+")
+_MATH_BLOCK_RE = re.compile(r"\$\$.*?\$\$", re.DOTALL)
+_MATH_INLINE_RE = re.compile(r"\$[^$\n]+\$")
+
+# Порог мягкий: русский текст с терминами даёт ~0.6-0.9, полностью
+# английский — около 0. Слишком короткие тексты не проверяем (шум).
+_MIN_CYRILLIC_SHARE = 0.3
+_MIN_LETTERS_FOR_LANG_CHECK = 200
+
+
+def _cyrillic_share(text: str) -> tuple[float, int]:
+    """Доля кириллицы среди букв ПРОЗЫ (без кода, URL и формул).
+    Возвращает (доля, число учтённых букв). Нет букв -> (1.0, 0)."""
+    cleaned = _CODE_FENCE_RE.sub(" ", text)
+    cleaned = _MATH_BLOCK_RE.sub(" ", cleaned)
+    cleaned = _MATH_INLINE_RE.sub(" ", cleaned)
+    cleaned = _INLINE_CODE_RE.sub(" ", cleaned)
+    cleaned = _URL_RE.sub(" ", cleaned)
+
+    cyr = lat = 0
+    for ch in cleaned.lower():
+        if "а" <= ch <= "я" or ch == "ё":
+            cyr += 1
+        elif "a" <= ch <= "z":
+            lat += 1
+    total = cyr + lat
+    return (cyr / total if total else 1.0), total
+
 def _count_substantial_paragraphs(text: str, min_chars: int = 40) -> int:
     tokens = _md.parse(text)
     count = 0
@@ -64,6 +93,18 @@ def validate_markdown_body(draft: DraftNote) -> list[ValidationIssue]:
                 ),
                 draft_id=draft.draft_id,
             ))
+    # Дешёвая защита от «съезда» body_md на английский после перевода
+    # системных инструкций (см. LANGUAGE_RULE в llm/prompts/common.py).
+    share, letters = _cyrillic_share(text)
+    if letters >= _MIN_LETTERS_FOR_LANG_CHECK and share < _MIN_CYRILLIC_SHARE:
+        issues.append(ValidationIssue(
+            level="warning", code="note_language_mismatch",
+            message=(
+                f"Доля кириллицы в тексте заметки всего {share:.0%} — возможно, "
+                "модель написала заметку не на русском. Проверьте перед approve."
+            ),
+            draft_id=draft.draft_id,
+        ))
 
     return issues
 

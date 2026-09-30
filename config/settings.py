@@ -267,6 +267,10 @@ class Settings(BaseSettings):
     groq_chars_per_token_latin: float = Field(default=4.0, gt=0.0)
     groq_cyrillic_ratio_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
 
+    # Резерв под output для холодного старта конкретных ролей (пока нет
+    # наблюдений EMA). Роли вне словаря используют groq_reserved_output_tokens_default.
+    groq_reserved_output_by_role: dict[str, int] = Field(default_factory=dict)
+
     # ---- Объединение заметок в конце workflow ----
     # См. staging/draft_merge.py — ноль LLM-вызовов, чистая пересборка уже
     # написанного текста ПОСЛЕ Writer+Critic, ПЕРЕД validation/staging.
