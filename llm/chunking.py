@@ -33,6 +33,8 @@ def split_items_into_batches(
         return []
 
     budget_fn = getattr(client, "available_prompt_budget_tokens", None)
+    count = getattr(client, "estimate_tokens", None) or estimate_tokens
+
     if budget_fn is None:
         return [list(items)]
 
@@ -40,7 +42,7 @@ def split_items_into_batches(
     if available_tokens is None:  # NEW
         return [list(items)]
 
-    overhead_tokens = estimate_tokens(static_overhead_text)
+    overhead_tokens = count(static_overhead_text)
     text_budget_tokens = max(available_tokens - overhead_tokens, 0)
 
     if text_budget_tokens <= 0:

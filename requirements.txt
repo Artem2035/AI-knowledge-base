@@ -17,3 +17,4 @@ sentence-transformers>=3.0
 numpy>=1.26
 pytest>=8.0
 pytest-mock>=3.14
+tiktoken>=0.7.0

@@ -200,6 +200,11 @@ def pending():
     for t in tasks:
         console.print(f"- {t}")
 
+    # console.print(
+    #     f"- [bold]{cp.task_id}[/bold] "
+    #     f"«{preview}»  {task_date}"
+    # )
+
 
 @app.command()
 def index():

@@ -166,6 +166,28 @@ def _is_reasoning_param_error(exc: Exception) -> bool:
         text = str(exc).lower()
         return any(m in text for m in ("reasoning_effort", "include_reasoning", "reasoning_format"))
 
+# Отдельное множество: токенайзер o200k корректен только для gpt-oss,
+# даже если другие модели позже получат strict json_schema.
+_TIKTOKEN_SUPPORTED_MODELS = {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
+
+_REQUEST_OVERHEAD_TOKENS = 120
+def _try_load_tiktoken_encoding():
+    """Пытается загрузить кодировку gpt-oss. Любой сбой (нет пакета, нет
+    сети для первой загрузки словаря) — не фатален: возвращаем None, и
+    клиент работает на посимвольной эвристике, как раньше."""
+    try:
+        import tiktoken
+    except ImportError:
+        logger.warning("tiktoken не установлен — оценка токенов по эвристике.")
+        return None
+    for name in ("o200k_harmony", "o200k_base"):
+        try:
+            return tiktoken.get_encoding(name)
+        except Exception as exc:
+            logger.debug("tiktoken: кодировка %s недоступна: %s", name, exc)
+    logger.warning("tiktoken: ни одна кодировка не загрузилась — используем эвристику.")
+    return None
+
 
 class TokenEstimateCalibrator:
     """Адаптивная калибровка "наивной" оценки токенов ОТДЕЛЬНО ПО КАЖДОЙ РОЛИ.
@@ -560,7 +582,13 @@ class GroqClient:
             cyrillic_chars_per_token=getattr(settings, "groq_chars_per_token_cyrillic", 2.3),
             latin_chars_per_token=getattr(settings, "groq_chars_per_token_latin", 4.0),
         )
-
+        # Новый ключ Settings (в репозитории его пока нет): groq_use_tiktoken: bool = True
+        self._encoding = None
+        if (
+                getattr(settings, "groq_use_tiktoken", True)
+                and settings.groq_model in _TIKTOKEN_SUPPORTED_MODELS
+        ):
+            self._encoding = _try_load_tiktoken_encoding()
         # v4-A1: если передан shared_limiter/shared_calibrator (см.
         # llm/factory.py::create_extraction_llm_client) — переиспользуем
         # ИХ вместо создания новых. Это единственный способ, которым два
@@ -622,8 +650,13 @@ class GroqClient:
         )
 
     def _estimate_tokens(self, text: str) -> int:
-        """Обёртка над llm.common.estimate_tokens с коэффициентами,
-        настроенными из Settings (см. v4-B4)."""
+        """Точный подсчёт через tiktoken для gpt-oss; иначе — эвристика из
+        llm/common.py с коэффициентами из Settings."""
+        if not text:
+            return 0
+        if self._encoding is not None:
+            # encode_ordinary: спецтокены в тексте заметок не должны ронять подсчёт
+            return len(self._encoding.encode_ordinary(text))
         return estimate_tokens(text, **self._chars_per_token_kwargs)
 
     def available_prompt_budget_tokens(
@@ -642,7 +675,12 @@ class GroqClient:
         список по одному элементу и лишний раз потратил вызовы
         (MAX_LLM_CALLS_PER_TASK).
         """
-        schema_hint = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+        overhead += _REQUEST_OVERHEAD_TOKENS
+        #schema_hint = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+        schema_hint = json.dumps(
+            _to_strict_json_schema(response_model.model_json_schema()),
+            ensure_ascii=False, separators=(",", ":"),
+        )
         overhead = self._estimate_tokens(system_instruction) + self._estimate_tokens(schema_hint)
         total_capacity = self._limiter.capacity_tokens()
         # Консервативный дефолтный резерв под output, без role-калибровки:
@@ -672,7 +710,15 @@ class GroqClient:
             fallback_format, fallback_system = self._build_response_format_and_system(
                 response_model, system_instruction, force_json_object=True
             )
-
+        # в generate_structured, вместо system_tokens = self._estimate_tokens(full_system):
+        system_tokens = self._estimate_tokens(full_system) + _REQUEST_OVERHEAD_TOKENS
+        if self._strict_schema_supported:
+            # В strict-режиме схема не входит в full_system, но входит в промпт Groq
+            schema_json = json.dumps(
+                _to_strict_json_schema(response_model.model_json_schema()),
+                ensure_ascii=False, separators=(",", ":"),
+            )
+            system_tokens += self._estimate_tokens(schema_json)
         system_tokens = self._estimate_tokens(full_system)
 
         # v4-B1: РАНЬШЕ здесь стоял self.RESERVED_OUTPUT_TOKENS (статичная
@@ -836,7 +882,9 @@ class GroqClient:
         не умеет резать длинные источники (в отличие от extractor_critic,
         где чанкинг уже есть), запрос всё равно уйдёт и не уронит задачу
         ошибкой GroqPromptTooLargeError."""
-        text_chars_per_token = chars_per_token(prompt, **self._chars_per_token_kwargs)
+        text_chars_per_token = len(prompt) / max(self._estimate_tokens(prompt), 1)
+        #tiktokentext_chars_per_token = chars_per_token(prompt, **self._chars_per_token_kwargs)
+
         marker = "\n\n[…текст автоматически обрезан из-за лимита токенов Groq API…]"
         marker_tokens = self._estimate_tokens(marker)
         allowed_tokens = max(max_prompt_tokens - marker_tokens, 50)

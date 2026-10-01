@@ -12,6 +12,7 @@ checkpoint.plan при persist("plan_approved"), отдельной синхро
 from __future__ import annotations
 
 import typer
+import re
 from rich.console import Console
 from rich.tree import Tree
 
@@ -49,6 +50,9 @@ def _parse_indices(raw: str, count: int) -> list[int] | None:
     удалять элементы последовательными pop() без пересчёта индексов
     оставшихся элементов после каждого удаления."""
     try:
+        if '-' in raw:
+            l = re.findall(r'(\d+-\d+|\d)', raw)
+            console.print(f"номера - {l}")
         indices = [int(x.strip()) - 1 for x in raw.split(",") if x.strip()]
     except ValueError:
         console.print("[red]Не удалось разобрать номера — используйте запятую как разделитель.[/red]")
