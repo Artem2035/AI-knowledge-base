@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import re
 
-from storage.models import OutlineNote, SectionDraft
+from datetime import datetime, timezone
 
+from storage.models import DraftNote, NoteAction, NoteAnnotation, OutlineNote, SectionDraft
+from tools.markdown_tools import build_note_path
 # Порог вставки резюме-callout: короткой заметке резюме не нужно.
 ABSTRACT_MIN_SECTIONS = 8
 
@@ -129,3 +131,58 @@ def add_domain_tag(tags: list[str], domain: str) -> list[str]:
     """Добавляет тег домена вида 'domain/technical' (без дублей)."""
     tag = f"domain/{domain}"
     return tags if tag in tags else [*tags, tag]
+
+def build_draft_note(
+    note: OutlineNote,
+    sections: list[SectionDraft],
+    annotation: NoteAnnotation | None,
+    *,
+    domain: str,
+    mark_source: str | None = None,
+) -> DraftNote:
+    """Детерминированно собирает DraftNote из готовых секций и аннотации (без LLM).
+
+    Путь, action, папку и заголовок решает ПЛАН (как и раньше: модель их не
+    выбирает). create: тело заметки, теги (+ domain/<домен>), links_out и
+    abstract берутся из аннотации. update: только append_section из
+    собранных секций; аннотатор для update не вызывается, поэтому теги,
+    ссылки и резюме игнорируются. Пустое тело update даёт append_section=None —
+    это поймает валидатор (empty_body), перезаписи файла не произойдёт.
+
+    Исключения: ValueError — action="update" без existing_path.
+    """
+    frontmatter = {"created": datetime.now(timezone.utc).date().isoformat()}
+    if mark_source:
+        frontmatter["source"] = mark_source
+
+    if note.action == "update":
+        if not note.existing_path:
+            raise ValueError(f"Для action='update' не указан existing_path: {note.title!r}")
+        body, unverified = assemble_note_markdown(note, sections, domain=domain, for_update=True)
+        return DraftNote(
+            note_id=note.note_id,
+            action=NoteAction.UPDATE,
+            path=note.existing_path,
+            title=note.title,
+            folder=note.folder,
+            frontmatter=frontmatter,
+            append_section=body or None,
+            unverified_sections=unverified,
+        )
+
+    body, unverified = assemble_note_markdown(
+        note, sections, domain=domain,
+        abstract=annotation.abstract if annotation else "",
+    )
+    return DraftNote(
+        note_id=note.note_id,
+        action=NoteAction.CREATE,
+        path=build_note_path(note.folder, note.title),
+        title=note.title,
+        folder=note.folder,
+        frontmatter=frontmatter,
+        body_md=body,
+        tags=add_domain_tag(list(annotation.tags) if annotation else [], domain),
+        links_out=list(annotation.links_out) if annotation else [],
+        unverified_sections=unverified,
+    )

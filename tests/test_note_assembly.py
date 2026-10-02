@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from storage.models import OutlineNote, OutlineSubpoint, SectionDraft
+from storage.models import OutlineNote, OutlineSubpoint, SectionDraft, NoteAnnotation, NoteAction
 from tools.note_assembly import (
     PLACEHOLDER_MARKDOWN, add_domain_tag, assemble_note_markdown, close_unbalanced_fence,
-    has_balanced_fences, normalize_headings, prepare_section, strip_leading_duplicate_heading,
+    has_balanced_fences, normalize_headings, prepare_section, strip_leading_duplicate_heading, build_draft_note,
 )
 
 
@@ -75,3 +75,66 @@ def test_humanities_gets_general_warning_on_top():
 def test_add_domain_tag_no_duplicates():
     assert add_domain_tag(["rag"], "technical") == ["rag", "domain/technical"]
     assert add_domain_tag(["domain/technical"], "technical") == ["domain/technical"]
+
+def _secs(note, **flags):
+    return [
+        SectionDraft(note_id=note.note_id, subpoint_id=sp.subpoint_id,
+                     markdown=f"Текст {sp.heading}", needs_check=flags.get(sp.heading, False))
+        for sp in note.subpoints
+    ]
+
+
+def test_build_draft_note_create_collects_tags_links_and_unverified():
+    note = _note(2)
+    note.folder = "Знания/Тема"
+    ann = NoteAnnotation(note_id=note.note_id, tags=["rag"], links_out=["Другая"])
+    draft = build_draft_note(note, _secs(note, A=True), ann, domain="technical",
+                             mark_source="model-knowledge")
+
+    assert draft.action == NoteAction.CREATE and draft.note_id == note.note_id
+    assert draft.path == "Знания/Тема/N.md"
+    assert draft.tags == ["rag", "domain/technical"]
+    assert draft.links_out == ["Другая"]
+    assert draft.unverified_sections == ["A"]
+    assert draft.frontmatter["source"] == "model-knowledge"
+    assert draft.body_md.startswith("## A") and draft.append_section is None
+
+
+def test_build_draft_note_without_annotation_still_gets_domain_tag():
+    note = _note(1)
+    draft = build_draft_note(note, _secs(note), None, domain="life_management")
+    assert draft.tags == ["domain/life_management"] and draft.links_out == []
+
+
+def test_build_draft_note_abstract_only_for_big_create_notes():
+    big = _note(8)
+    ann = NoteAnnotation(note_id=big.note_id, abstract="Резюме")
+    assert "[!abstract]" in build_draft_note(big, _secs(big), ann, domain="technical").body_md
+
+    big.action, big.existing_path = "update", "Знания/Старая.md"
+    upd = build_draft_note(big, _secs(big), ann, domain="technical")
+    assert "[!abstract]" not in (upd.append_section or "")
+
+
+def test_build_draft_note_update_uses_append_section_and_ignores_tags():
+    note = _note(2)
+    note.action, note.existing_path = "update", "Знания/Старая.md"
+    ann = NoteAnnotation(note_id=note.note_id, tags=["x"], links_out=["Y"])
+    draft = build_draft_note(note, _secs(note), ann, domain="technical")
+
+    assert draft.action == NoteAction.UPDATE and draft.path == "Знания/Старая.md"
+    assert draft.append_section.startswith("## A")
+    assert draft.body_md == "" and draft.tags == [] and draft.links_out == []
+
+
+def test_build_draft_note_update_without_subpoints_gives_none_for_validator():
+    note = OutlineNote(title="Пусто", action="update", existing_path="Старая.md")
+    assert build_draft_note(note, [], None, domain="technical").append_section is None
+
+
+def test_build_draft_note_update_without_existing_path_raises():
+    import pytest
+    note = _note(1)
+    note.action = "update"
+    with pytest.raises(ValueError):
+        build_draft_note(note, [], None, domain="technical")

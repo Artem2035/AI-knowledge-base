@@ -5,26 +5,23 @@
 перезаписывается ПОСЛЕ КАЖДОГО завершённого шага (а не только в конце
 пайплайна). Это принципиально отличается от StagingChangeset — тот
 создаётся только на последнем шаге ("staged"), поэтому бесполезен, если
-задача остановилась раньше (а именно так и происходит при исчерпании
-MAX_LLM_CALLS_PER_TASK на этапе extracting — самом "дорогом" по числу
-вызовов).
+задача остановилась раньше (например, на исчерпании
+MAX_LLM_CALLS_PER_TASK посреди elaboration).
 
 Инвариант: чекпоинт хранит уже провалидированные структурированные данные
-(Plan, SourceCandidate[], Evidence[], ...) — те же Pydantic-модели, что и
-так летают между roles/*, поэтому сериализация/десериализация тривиальна
-и не завязана на конкретный LLM-провайдер.
+(Plan, SectionDraft[], NoteAnnotation[]) — те же Pydantic-модели, что и
+так летают между roles/*, поэтому сериализация тривиальна и не завязана
+на конкретный LLM-провайдер.
 
 Гранулярность resume:
-- Planning / Researching-selection / Fetching / Vault-analysis / Synthesis —
-  шаг целиком "сделан" или "не сделан" (флаг *_done).
-- Extracting — самый частый источник остановки, поэтому гранулярность
-  на уровне ОТДЕЛЬНОГО ИСТОЧНИКА: extracted_source_ids хранит source_id
-  уже обработанных источников, чтобы при resume не пересчитывать evidence
-  по источникам, которые уже были обработаны до остановки.
-- Note Planning — как и Extracting, гранулярность на уровне ОТДЕЛЬНОГО
-  БАТЧА (см. note_plan_batches_done) — на темах с большим числом подтем/
-  фактов один вызов planning может не поместиться в TPM-бюджет Groq так же,
-  как это происходит на этапе extraction.
+- Planning / Vault-analysis — шаг целиком (флаги *_done).
+- Elaboration — на уровне ОТДЕЛЬНОГО ПОДПУНКТА: elaborated_subpoint_ids
+  хранит subpoint_id уже написанных разделов (включая placeholder'ы), sections
+  — их готовый markdown.
+- Annotation — на уровне ОТДЕЛЬНОЙ ЗАМЕТКИ: annotated_note_ids и annotations.
+- DraftNote в чекпоинте НЕ хранятся: сборка заметки из sections и annotations
+  детерминирована и дёшева (tools/note_assembly.py::build_draft_note), поэтому
+  при каждом запуске собирается заново.
 """
 from __future__ import annotations
 
@@ -36,11 +33,9 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from storage.models import (
-    DraftNote,
-    Evidence,
-    ExistingNote,
+    NoteAnnotation,
     Plan,
-    Relationship,
+    SectionDraft,
     SourceCandidate,
     TaskStatus,
 )
@@ -50,12 +45,14 @@ logger = logging.getLogger(__name__)
 # Бампать при несовместимых изменениях структуры чекпоинта — старые
 # чекпоинты с другой версией просто не загрузятся (см. load_checkpoint),
 # вместо того чтобы упасть с невнятной ошибкой валидации Pydantic.
-# v4: TaskStatus.gemini_calls_used/gemini_calls_log переименованы в
-# llm_calls_used/llm_calls_log (Gemini исключён как провайдер, остался
-# только Groq) — старые чекпоинты (v3) с этими полями больше не
-# провалидируются как TaskStatus, поэтому версия бампнута; они просто
-# не подхватятся при resume (см. README про то, что делать в этом случае).
-CHECKPOINT_VERSION = 4
+# v4: TaskStatus.gemini_calls_* переименованы в llm_calls_*.
+# v5: цепочка Elaborator→Evidence→Writer→Critic заменена на
+# Elaborator(markdown)→Annotator→сборка кодом. Убраны evidence,
+# existing_notes, synthesis_done, written_note_indices, drafts,
+# relationships; extraction_* переименованы в elaboration_*; добавлены
+# sections, annotation_done, annotated_note_ids, annotations. Чекпоинты v4
+# не подхватываются (задачу нужно запустить заново командой 'ask').
+CHECKPOINT_VERSION = 5
 
 
 class TaskCheckpoint(BaseModel):
@@ -66,54 +63,43 @@ class TaskCheckpoint(BaseModel):
     raw_query: str
     language: str
 
-    # Человекочитаемая метка последнего завершённого шага — используется
-    # только для отображения пользователю (resumable/сообщения), логика
-    # resume опирается на *_done флаги ниже, а не на эту строку.
+    # Человекочитаемая метка последнего завершённого шага — только для
+    # отображения; логика resume опирается на *_done флаги ниже.
     last_completed_stage: str = "created"
 
     status: TaskStatus
 
-    # Накопительный расход LLM-вызовов по ВСЕМ попыткам (для отчёта
-    # пользователю). Отдельно от status.llm_calls_used, который считает
-    # вызовы только в рамках ТЕКУЩЕЙ сессии/попытки — см.
-    # MAX_LLM_CALLS_PER_TASK в orchestrator/budget.py: лимит применяется
-    # к сессии, иначе задачу нельзя было бы никогда докрутить после
-    # однократного исчерпания.
+    # Накопительный расход LLM-вызовов по ВСЕМ попыткам (для отчёта).
+    # Отдельно от status.llm_calls_used (только текущая сессия).
     total_llm_calls_used: int = 0
 
-    plan: Plan | None = None  # теперь Plan с .notes
-    # НОВОЕ: явное подтверждение плана пользователем (inline-confirm в
-    # cli/main.py::ask). Отделено от самого факта "plan is not None",
-    # т.к. план может быть уже построен (1 дешёвый вызов), но ещё НЕ
-    # утверждён — например, если пользователь ответил "нет" и задача
-    # остановилась ДО траты бюджета на elaboration. При resume такой
-    # задачи подтверждение будет запрошено снова, а не пропущено.
+    plan: Plan | None = None
+    # Явное подтверждение плана пользователем: отделено от "plan is not None",
+    # т.к. план может быть построен, но ещё не утверждён.
     plan_approved: bool = False
 
+    # -- поля web-режима (RESEARCH_MODE=web заблокирован в Orchestrator.run,
+    # оставлены без изменений до решения по web-ролям) --
     raw_candidates_done: bool = False
     raw_candidates: list[SourceCandidate] = Field(default_factory=list)
-
     sources_selected_done: bool = False
     selected_sources: list[SourceCandidate] = Field(default_factory=list)
-
     sources_fetched_done: bool = False
     fetched_sources: list[SourceCandidate] = Field(default_factory=list)
 
-    extraction_done: bool = False
-    # unit_id = f"{source_id}#{chunk_index}" — см. roles/extractor_critic.py::ExtractionUnit
-    extracted_unit_ids: list[str] = Field(default_factory=list)
-    evidence: list[Evidence] = Field(default_factory=list)
+    # -- Elaboration: готовый markdown разделов --
+    elaboration_done: bool = False
+    elaborated_subpoint_ids: list[str] = Field(default_factory=list)
+    sections: list[SectionDraft] = Field(default_factory=list)
 
-    vault_analysis_done: bool = False  # мутирует plan.notes напрямую, отдельного списка не нужно
-    existing_notes: list[ExistingNote] = Field(default_factory=list)
+    # Vault analysis мутирует plan.notes (action/existing_path/folder) на месте,
+    # отдельного списка результатов не нужно.
+    vault_analysis_done: bool = False
 
-    synthesis_done: bool = False
-    # Map-reduce: шаг 1 (план заметок) и шаг 2 (запись по одной заметке)
-    # персистятся отдельно — резюм не должен пересчитывать ни план, ни уже
-    # написанные заметки (аналогично extracted_source_ids для extraction).
-    written_note_indices: list[int] = Field(default_factory=list)  # индекс в plan.notes
-    drafts: list[DraftNote] = Field(default_factory=list)  # накапливается по одной заметке
-    relationships: list[Relationship] = Field(default_factory=list)
+    # -- Annotation: теги, ссылки, резюме (только для action="create") --
+    annotation_done: bool = False
+    annotated_note_ids: list[str] = Field(default_factory=list)
+    annotations: list[NoteAnnotation] = Field(default_factory=list)
 
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
