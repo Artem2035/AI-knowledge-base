@@ -17,23 +17,27 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from storage.models import Kind, Domain
+
 
 # ---------------------------------------------------------------------------
 # Planner
 # ---------------------------------------------------------------------------
-class OutlineSubpointOutput(BaseModel):
-    heading: str
-    covers: str
-
-
 class OutlineNoteOutput(BaseModel):
     title: str
     subpoints: list[OutlineSubpointOutput] = Field(default_factory=list)
     rationale: str = ""
 
 
+class OutlineSubpointOutput(BaseModel):
+    heading: str
+    covers: str
+    kind: Kind = "other"
+
+
 class OutlinePlanOutput(BaseModel):
     topic_title: str
+    domain: Domain = "technical"
     summary: str = ""
     notes: list[OutlineNoteOutput] = Field(default_factory=list)
 
@@ -165,3 +169,18 @@ class FolderAssignmentItem(BaseModel):
 
 class FolderAssignmentOutput(BaseModel):
     items: list[FolderAssignmentItem] = Field(default_factory=list)
+
+# ---------------------------------------------------------------------------
+# Elaborator v2 — готовый markdown секции (RESEARCH_MODE=knowledge)
+# ---------------------------------------------------------------------------
+
+class SectionItem(BaseModel):
+    # Обязательное поле (без default): пропущенный индекс не должен молча
+    # превращаться в 0 и приписывать текст чужому разделу.
+    unit_index: int
+    markdown: str
+    needs_check: bool = False  # модель не уверена в деталях раздела
+
+
+class SectionBatchOutput(BaseModel):
+    sections: list[SectionItem] = Field(default_factory=list)

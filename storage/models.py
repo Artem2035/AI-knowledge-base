@@ -24,6 +24,35 @@ def _now() -> str:
 def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
+# ---------------------------------------------------------------------------
+# Домен темы и тип раздела (kind) — задаются планнером, правятся в plan_editor
+# ---------------------------------------------------------------------------
+
+Domain = Literal["technical", "humanities", "life_management"]
+Kind = Literal[
+    # technical
+    "definition", "mechanism", "parameters", "example", "comparison", "pitfalls",
+    # humanities
+    "context", "key_idea", "interpretations", "terms_persons", "critique", "connections",
+    # life_management
+    "principle", "when_to_apply", "steps", "scenario", "mistakes", "checklist",
+    # универсальный вариант, если ни один тип не подходит
+    "other",
+]
+
+DEFAULT_DOMAIN: str = "technical"
+
+# Единственный источник истины: какие kind допустимы в каком домене.
+DOMAIN_KINDS: dict[str, tuple[str, ...]] = {
+    "technical": ("definition", "mechanism", "parameters", "example", "comparison", "pitfalls"),
+    "humanities": ("context", "key_idea", "interpretations", "terms_persons", "critique", "connections"),
+    "life_management": ("principle", "when_to_apply", "steps", "scenario", "mistakes", "checklist"),
+}
+
+
+def normalize_kind(kind: str, domain: str) -> str:
+    """kind, не входящий в набор домена (или неизвестный домен) -> 'other'."""
+    return kind if kind in DOMAIN_KINDS.get(domain, ()) else "other"
 
 # ---------------------------------------------------------------------------
 # Task / Plan
@@ -35,11 +64,6 @@ class Task(BaseModel):
     raw_query: str
     language: str = "ru"
     created_at: str = Field(default_factory=_now)
-
-class OutlineSubpoint(BaseModel):
-    subpoint_id: str = Field(default_factory=_new_id)
-    heading: str
-    covers: str  # техзадание для Elaborator/Writer, не сам текст
 
 class OutlineNote(BaseModel):
     note_id: str = Field(default_factory=_new_id)
@@ -53,10 +77,18 @@ class OutlineNote(BaseModel):
     existing_path: str = ""
     folder: str = ""
 
+class OutlineSubpoint(BaseModel):
+    subpoint_id: str = Field(default_factory=_new_id)
+    heading: str
+    covers: str  # техзадание для Elaborator, не сам текст
+    kind: Kind = "other"  # тип раздела; допустимые значения зависят от Plan.domain
+
+
 class Plan(BaseModel):
     task_id: str
     topic_title: str
     summary: str = ""
+    domain: Domain = "technical"  # определяет планнер, правит пользователь в plan_editor
     notes: list[OutlineNote] = Field(default_factory=list)
 
 
@@ -100,6 +132,12 @@ class Evidence(BaseModel):
     # истины, которой в этом режиме просто нет.
     verified: bool = False
 
+class SectionDraft(BaseModel):
+    """Готовый markdown одного подпункта (результат Elaborator v2)."""
+    note_id: str
+    subpoint_id: str
+    markdown: str
+    needs_check: bool = False  # модель не уверена в деталях — показать в diff и в самой заметке
 
 # ---------------------------------------------------------------------------
 # Vault Analyst
@@ -157,6 +195,8 @@ class DraftNote(BaseModel):
     # переписать (заметка ушла в staging "как есть") — сигнал пользователю
     # обратить на неё особое внимание при approve. См. staging/diff.py.
     needs_review: bool = False
+    # Заголовки разделов, помеченных Elaborator как требующие проверки.
+    unverified_sections: list[str] = Field(default_factory=list)
 
 class Relationship(BaseModel):
     from_note: str

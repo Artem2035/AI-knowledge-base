@@ -675,13 +675,14 @@ class GroqClient:
         список по одному элементу и лишний раз потратил вызовы
         (MAX_LLM_CALLS_PER_TASK).
         """
-        overhead += _REQUEST_OVERHEAD_TOKENS
+
         #schema_hint = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
         schema_hint = json.dumps(
             _to_strict_json_schema(response_model.model_json_schema()),
             ensure_ascii=False, separators=(",", ":"),
         )
         overhead = self._estimate_tokens(system_instruction) + self._estimate_tokens(schema_hint)
+        overhead += _REQUEST_OVERHEAD_TOKENS
         total_capacity = self._limiter.capacity_tokens()
         # Консервативный дефолтный резерв под output, без role-калибровки:
         # метод вызывается до того, как известна роль (см. прежний комментарий).
