@@ -11,7 +11,8 @@ from tools.markdown_tools import (
     build_note_path,
     normalize_link_title,
     sanitize_wikilinks,
-    strip_wikilink_brackets, )
+    snap_link,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,23 +100,9 @@ def _to_draft_note(
     # кода (см. tools/markdown_tools.py::render_frontmatter), это
     # единственная точка правды, а не промпт.
 
-    def _resolve_link(raw: str) -> str | None:
-        link = strip_wikilink_brackets(raw).strip()
-        if not link:
-            return None
-        if "://" in link or link.startswith("www."):
-            # Модель по ошибке положила ссылку на источник в links_out —
-            # туда должны попадать только заголовки заметок Vault.
-            logger.warning(
-                "Игнорируем URL-подобное значение в links_out (это не "
-                "заголовок заметки): %r", link,
-            )
-            return None
-        return title_map.get(normalize_link_title(link), link)
-
     links_out_fixed = [
         resolved for raw in output.links_out
-        if (resolved := _resolve_link(raw)) is not None
+        if (resolved := snap_link(raw, title_map)) is not None
     ]
 
     return DraftNote(

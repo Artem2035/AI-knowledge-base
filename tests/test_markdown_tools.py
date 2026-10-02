@@ -5,7 +5,7 @@ from tools.markdown_tools import (
     build_note_path,
     render_markdown,
     slugify_filename,
-    strip_wikilink_brackets,
+    strip_wikilink_brackets, snap_link,
 )
 
 
@@ -155,3 +155,14 @@ def test_render_markdown_links_out_never_double_wrapped():
     assert "]]]]" not in rendered
     assert "[[Overview of Python environment isolation]]" in rendered
     assert "[[Обычный заголовок без скобок]]" in rendered
+
+def test_snap_link_strips_brackets_and_snaps_dash_variants():
+    title_map = {"Retrieval-Augmented Generation": "Retrieval-Augmented Generation"}
+    assert snap_link("[[Retrieval\u2011Augmented Generation]]", title_map) == "Retrieval-Augmented Generation"
+    assert snap_link("Неизвестная тема", title_map) == "Неизвестная тема"  # вне карты остаётся как есть
+
+
+def test_snap_link_rejects_urls_and_empty():
+    assert snap_link("https://example.com/a", {}) is None
+    assert snap_link("www.example.com", {}) is None
+    assert snap_link("[[ ]]", {}) is None

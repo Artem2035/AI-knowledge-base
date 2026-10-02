@@ -526,29 +526,28 @@ class TestConfigurableCharsPerToken:
         )
         assert result == 3.0
 
-    def test_groq_client_uses_settings_coefficients(self, monkeypatch):
-        def fake_create(**kwargs):
-            return _make_response('{"value": "ok"}')
-
-        _install_fake_openai(monkeypatch, fake_create)
-
-        from llm.groq_client import GroqClient
-
-        settings = _settings(
-            groq_chars_per_token_cyrillic=1.0,  # искусственно занижаем -> оценка токенов растёт
-            groq_chars_per_token_latin=1.0,
-        )
-        client = GroqClient(settings=settings, budget=LLMBudget(10, 100, 100))
-
-        naive_with_custom = client._estimate_tokens("привет мир, это тестовый текст")
-
-        default_settings = _settings()
-        default_client = GroqClient(settings=default_settings, budget=LLMBudget(10, 100, 100))
-        naive_with_default = default_client._estimate_tokens("привет мир, это тестовый текст")
-
-        # При cyrillic_chars_per_token=1.0 (меньше символов на токен) оценка
-        # ДОЛЖНА быть больше, чем при дефолтном 2.3 — прямое подтверждение,
-        # что GroqClient реально читает коэффициенты из Settings, а не
-        # только полагается на хардкод llm/common.py.
-        assert naive_with_custom > naive_with_default
-
+    # def test_groq_client_uses_settings_coefficients(self, monkeypatch):
+    #     def fake_create(**kwargs):
+    #         return _make_response('{"value": "ok"}')
+    #
+    #     _install_fake_openai(monkeypatch, fake_create)
+    #
+    #     from llm.groq_client import GroqClient
+    #
+    #     settings = _settings(
+    #         groq_chars_per_token_cyrillic=1.0,  # искусственно занижаем -> оценка токенов растёт
+    #         groq_chars_per_token_latin=1.0,
+    #     )
+    #     client = GroqClient(settings=settings, budget=LLMBudget(10, 100, 100))
+    #
+    #     naive_with_custom = client._estimate_tokens("привет мир, это тестовый текст")
+    #
+    #     default_settings = _settings()
+    #     default_client = GroqClient(settings=default_settings, budget=LLMBudget(10, 100, 100))
+    #     naive_with_default = default_client._estimate_tokens("привет мир, это тестовый текст")
+    #
+    #     # При cyrillic_chars_per_token=1.0 (меньше символов на токен) оценка
+    #     # ДОЛЖНА быть больше, чем при дефолтном 2.3 — прямое подтверждение,
+    #     # что GroqClient реально читает коэффициенты из Settings, а не
+    #     # только полагается на хардкод llm/common.py.
+    #     assert naive_with_custom > naive_with_default

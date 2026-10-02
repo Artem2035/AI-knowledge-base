@@ -139,6 +139,13 @@ class SectionDraft(BaseModel):
     markdown: str
     needs_check: bool = False  # модель не уверена в деталях — показать в diff и в самой заметке
 
+class NoteAnnotation(BaseModel):
+    """Результат аннотатора для одной заметки: теги, ссылки и резюме."""
+    note_id: str
+    tags: list[str] = Field(default_factory=list)
+    links_out: list[str] = Field(default_factory=list)
+    abstract: str = ""  # пусто, если резюме не запрашивалось или модель не вернула
+
 # ---------------------------------------------------------------------------
 # Vault Analyst
 # ---------------------------------------------------------------------------

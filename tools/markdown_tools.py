@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 import yaml
 
 from storage.models import DraftNote
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 _INVALID_FS_CHARS = re.compile(r'[\\/:*?"<>|#^\[\]]')
 _NESTED_WIKILINK_RE = re.compile(r'\[{2,}([^\[\]]+)\]{2,}')
@@ -165,3 +169,21 @@ def normalize_link_title(title: str) -> str:
     for variant, replacement in _DASH_VARIANTS.items():
         normalized = normalized.replace(variant, replacement)
     return normalized
+
+def snap_link(raw: str, title_map: dict[str, str]) -> str | None:
+    """Приводит ссылку, предложенную моделью, к каноническому заголовку:
+    снимает обрамляющие [[ ]], отбрасывает URL-подобные значения (в links_out
+    должны быть только заголовки заметок), снаппит к точному написанию
+    через title_map (normalize_link_title(title) -> title). Если заголовка
+    нет в карте — возвращает как есть (решение, допустима ли такая ссылка,
+    принимает вызывающий код). None — ссылку нужно выбросить."""
+    link = strip_wikilink_brackets(raw).strip()
+    if not link:
+        return None
+    if "://" in link or link.startswith("www."):
+        logger.warning(
+            "Игнорируем URL-подобное значение в links_out (это не "
+            "заголовок заметки): %r", link,
+        )
+        return None
+    return title_map.get(normalize_link_title(link), link)

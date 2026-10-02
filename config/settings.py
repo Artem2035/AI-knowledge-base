@@ -267,11 +267,12 @@ class Settings(BaseSettings):
     groq_chars_per_token_latin: float = Field(default=4.0, gt=0.0)
     groq_cyrillic_ratio_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
 
-    # Стартовые значения (до появления EMA по роли). 2500 для elaborator —
-    # провизорная оценка (3 секции markdown + reasoning); уточнить замером
-    # live_calibration_probe.py (колонки completion/reasoning).
+    # Стартовые значения резерва вывода (до появления EMA по роли).
+    # elaborator: провизорно, уточнить по логу «факт/резерв». outline_planner:
+    # роль вызывается один раз за задачу (калибратор её не выучит), а на
+    # дефолтном effort проба дала ~3000 токенов вывода при резерве 1500.
     groq_reserved_output_by_role: dict[str, int] = Field(
-        default_factory=lambda: {"elaborator": 2500}
+        default_factory=lambda: {"elaborator": 2500, "outline_planner": 3000}
     )
 
     # ---- Объединение заметок в конце workflow ----

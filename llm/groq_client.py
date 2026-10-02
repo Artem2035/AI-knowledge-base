@@ -107,7 +107,10 @@ _REASONING_EFFORT_BY_ROLE: dict[str, str] = {
     "vault_dedup": "low",
     "critic": "low",
     "synthesizer_write": "medium",
-    "elaborator": "medium",
+    # Замер (probe): medium даёт +28% токенов на вызов за счёт reasoning
+    # (701 против 102), видимый текст тот же. Качество кода проверяется на приёмке.
+    "elaborator": "low",
+    "annotator": "low",
 }
 
 def _to_strict_json_schema(schema: dict) -> dict:
@@ -720,7 +723,7 @@ class GroqClient:
                 ensure_ascii=False, separators=(",", ":"),
             )
             system_tokens += self._estimate_tokens(schema_json)
-        system_tokens = self._estimate_tokens(full_system)
+        # (строка `system_tokens = self._estimate_tokens(full_system)` ниже удалена)
 
         # v4-B1: РАНЬШЕ здесь стоял self.RESERVED_OUTPUT_TOKENS (статичная
         # константа на все роли). Теперь — калиброванный по роли резерв:

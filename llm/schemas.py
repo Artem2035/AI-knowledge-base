@@ -184,3 +184,18 @@ class SectionItem(BaseModel):
 
 class SectionBatchOutput(BaseModel):
     sections: list[SectionItem] = Field(default_factory=list)
+
+# ---------------------------------------------------------------------------
+# Annotator: теги, ссылки и резюме заметки (RESEARCH_MODE=knowledge, v2)
+# ---------------------------------------------------------------------------
+class AnnotationItem(BaseModel):
+    # Обязательное поле (без default): пропущенный индекс не должен молча
+    # превращаться в 0 и приписывать аннотацию чужой заметке.
+    index: int
+    tags: list[str] = Field(default_factory=list)
+    links_out: list[str] = Field(default_factory=list)
+    abstract: str = ""
+
+
+class AnnotationBatchOutput(BaseModel):
+    items: list[AnnotationItem] = Field(default_factory=list)
