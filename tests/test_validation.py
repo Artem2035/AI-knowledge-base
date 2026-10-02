@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from storage.models import DraftNote, NoteAction, OutlineNote, OutlineSubpoint, Plan, StagingChangeset
+from tools.note_assembly import PLACEHOLDER_MARKDOWN
 from validation import run_validation
 from vault.db import VaultDB
 from vault.index import VaultIndexer
@@ -204,4 +205,62 @@ def test_russian_body_with_code_no_language_warning(tmp_path):
     draft = DraftNote(action=NoteAction.CREATE, path="Знания/Ru.md", title="Ru", body_md=body)
     report = run_validation(StagingChangeset(task_id="t13", creates=[draft]), db, allow_delete=False)
     assert not any(i.code == "note_language_mismatch" for i in report.issues)
+    db.close()
+
+def _structural(report):
+    return [i for i in report.warnings if i.code == "note_too_short_structural"]
+
+
+def test_note_of_code_list_and_table_has_no_structural_warning(tmp_path):
+    db = _db(tmp_path)
+    body = (
+        "## Раздел\n\n- пункт один\n- пункт два\n\n"
+        "```python\nx = 1\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n"
+    )
+    draft = DraftNote(action=NoteAction.CREATE, path="Знания/Блоки.md", title="Блоки", body_md=body)
+    report = run_validation(StagingChangeset(task_id="v1", creates=[draft]), db, allow_delete=False)
+    assert report.ok and not _structural(report)
+    db.close()
+
+
+def test_three_paragraphs_have_no_structural_warning(tmp_path):
+    db = _db(tmp_path)
+    para = "Достаточно длинный абзац, чтобы он считался содержательным блоком."
+    draft = DraftNote(action=NoteAction.CREATE, path="Знания/Абзацы.md", title="Абзацы",
+                      body_md=f"{para}\n\n{para}\n\n{para}")
+    report = run_validation(StagingChangeset(task_id="v2", creates=[draft]), db, allow_delete=False)
+    assert not _structural(report)
+    db.close()
+
+
+def test_callouts_and_placeholder_do_not_count_as_content(tmp_path):
+    db = _db(tmp_path)
+    body = (
+        "> [!abstract] Кратко\n> Длинное резюме заметки, которое не должно считаться блоком.\n\n"
+        "## A\n\n> [!warning] Требует проверки\n> Детали этого раздела могут быть неточными.\n\n"
+        f"{PLACEHOLDER_MARKDOWN}\n\n"
+        "## B\n\nЕдинственный настоящий абзац заметки, достаточно длинный для подсчёта."
+    )
+    draft = DraftNote(action=NoteAction.CREATE, path="Знания/Заглушки.md", title="Заглушки", body_md=body)
+    report = run_validation(StagingChangeset(task_id="v3", creates=[draft]), db, allow_delete=False)
+    issues = _structural(report)
+    assert report.ok and len(issues) == 1 and "только 1" in issues[0].message
+    db.close()
+
+
+def test_unbalanced_fence_is_error(tmp_path):
+    db = _db(tmp_path)
+    draft = DraftNote(action=NoteAction.CREATE, path="Знания/Fence.md", title="Fence",
+                      body_md="Текст заметки достаточно длинный для проверки.\n\n```python\nx = 1")
+    report = run_validation(StagingChangeset(task_id="v4", creates=[draft]), db, allow_delete=False)
+    assert not report.ok and any(i.code == "unbalanced_code_fence" for i in report.errors)
+    db.close()
+
+
+def test_inline_triple_backticks_are_not_flagged(tmp_path):
+    db = _db(tmp_path)
+    draft = DraftNote(action=NoteAction.CREATE, path="Знания/Inline.md", title="Inline",
+                      body_md="Тройные кавычки ``` внутри строки это просто текст, а не ограждение блока кода.")
+    report = run_validation(StagingChangeset(task_id="v5", creates=[draft]), db, allow_delete=False)
+    assert not any(i.code == "unbalanced_code_fence" for i in report.issues)
     db.close()

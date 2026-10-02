@@ -38,16 +38,16 @@ from pathlib import Path
 from config.settings import Settings
 from llm.factory import budget_limits_for_provider, create_llm_client, extraction_budget_limits, \
     create_extraction_llm_client
-from llm.prompts.synthesizer_writer import WRITE_SYSTEM_INSTRUCTION, MERGE_AWARENESS_GUIDANCE
 from orchestrator.budget import LLMBudget, LLMFreeLimitReached, LLMTaskBudgetExceeded
 
 from retrieval.search import VaultSearcher
-from roles import critic, elaborator, outline_planner, synthesizer_writer, vault_analyst
+from roles import annotator, elaborator, outline_planner, synthesizer_writer, vault_analyst
 from staging.changeset import save_changeset
 from staging.checkpoint import save_checkpoint, delete_checkpoint, TaskCheckpoint, load_checkpoint
 from storage.models import StagingChangeset, Task, TaskStatus
 from tools.dedup import try_create_embedder
 from tools.markdown_tools import slugify_filename
+from tools.note_assembly import build_draft_note
 from validation import run_validation
 from vault.db import VaultDB
 from vault.index import VaultIndexer
@@ -156,24 +156,22 @@ class Orchestrator:
           Уже завершённые шаги (согласно чекпоинту) пропускаются, бюджет
           LLM-вызовов открывается заново на эту сессию.
 
-        plan_confirm_cb: если передан, вызывается РОВНО ОДИН РАЗ на задачу
-        (флаг checkpoint.plan_approved) сразу после построения/загрузки Plan —
-        ДО самого дорогого по бюджету этапа (elaborating). Если callback
-        вернул False — контролируемая остановка (аналогично исчерпанию
-        бюджета): прогресс (сам план) уже сохранён в чекпоинте, elaboration
-        ещё не начиналась, ни один "дорогой" вызов не потрачен.
+        Порядок шагов: planning → утверждение плана → elaboration (готовый
+        markdown разделов) → vault analysis → аннотатор (теги, ссылки,
+        резюме) → детерминированная сборка DraftNote → merge (опционально)
+        → relationships → validation → staging.
 
-        Если callback не передан (например, в тестах, вызывающих Orchestrator
-        напрямую без CLI) — план утверждается автоматически, поведение
-        совпадает с прежним.
+        DraftNote в чекпоинте не хранятся: сборка из sections и annotations
+        дёшева и детерминирована, поэтому выполняется заново на каждом запуске.
 
-        Точка расширения на будущее: сюда же позже добавится возможность
-        ПРАВИТЬ Plan между построением и подтверждением (удаление/изменение/
-        добавление notes и subpoints) — plan_confirm_cb можно будет заменить
-        на plan_review_cb: Callable[[Plan], Plan | None], где возвращённый
-        (изменённый) Plan подставляется в checkpoint.plan перед persist, а
-        None означает отказ. Сигнатура ЭТОГО метода менять не придётся —
-        только реализацию callback'а в cli/main.py.
+        plan_confirm_cb: вызывается РОВНО ОДИН РАЗ на задачу (флаг
+        checkpoint.plan_approved) сразу после построения/загрузки Plan —
+        ДО самого дорогого этапа (elaboration). Если вернул False —
+        контролируемая остановка, ни один «дорогой» вызов не потрачен.
+        Если не передан — план утверждается автоматически.
+
+        merge_confirm_cb: вызывается после сборки заметок, ДО валидации, и
+        только при settings.enable_draft_merging=True.
         """
 
         def report(stage: str) -> None:
@@ -194,8 +192,8 @@ class Orchestrator:
 
         def persist(stage_label: str) -> None:
             """Сохраняет чекпоинт немедленно после успешного завершения
-            шага. Вызывается часто (в т.ч. внутри цикла extracting после
-            КАЖДОГО источника/подтемы) — это и есть механизм resume."""
+            шага. Вызывается часто (после каждого батча elaboration и
+            аннотатора) — это и есть механизм resume."""
             checkpoint.last_completed_stage = stage_label
             checkpoint.status = status
             checkpoint.total_llm_calls_used = base_total_calls + status.llm_calls_used
@@ -230,8 +228,8 @@ class Orchestrator:
                         stopped=True,
                         message=(
                             "План конспекта не утверждён. Задача остановлена ДО "
-                            "траты бюджета Groq на elaboration/synthesis — сам "
-                            "план (1 дешёвый вызов) сохранён.\n"
+                            "траты бюджета Groq на elaboration — сам план "
+                            "(1 дешёвый вызов) сохранён.\n"
                             f"Продолжить (план будет показан снова): "
                             f"python -m cli.main resume {task.task_id}"
                         ),
@@ -241,28 +239,27 @@ class Orchestrator:
             else:
                 report("План уже утверждён (из чекпоинта) — пропускаем подтверждение.")
 
-            # -- Elaborating (только knowledge-режим) --
-            if not checkpoint.extraction_done:
-                status.stage = "extracting"
-                evidence = list(checkpoint.evidence)
-                already_done = set(checkpoint.extracted_unit_ids)
+            # -- Elaboration: готовый markdown каждого подпункта -----------
+            if not checkpoint.elaboration_done:
+                report(f"Написание разделов ({self.settings.llm_provider})…")
+                status.stage = "elaborating"
 
-                def _on_batch_done(subpoint_ids, new_evidence):
-                    evidence.extend(new_evidence)
-                    checkpoint.evidence = evidence
-                    checkpoint.extracted_unit_ids.extend(subpoint_ids)
-                    persist("extracting")
+                def _on_elaboration_batch(subpoint_ids, new_sections):
+                    checkpoint.sections.extend(new_sections)
+                    checkpoint.elaborated_subpoint_ids.extend(subpoint_ids)
+                    persist("elaborating")
 
                 elaborator.elaborate_outline(
                     plan, self.extraction_client, status,
-                    already_done_subpoint_ids=already_done,
-                    on_batch_done=_on_batch_done,
+                    already_done_subpoint_ids=set(checkpoint.elaborated_subpoint_ids),
+                    on_batch_done=_on_elaboration_batch,
                     max_subpoints_per_batch=self.settings.max_subpoints_per_generation_batch,
                 )
-                checkpoint.extraction_done = True
-                persist("extraction_done")
+                checkpoint.elaboration_done = True
+                persist("elaboration_done")
             else:
-                evidence = checkpoint.evidence
+                report("Разделы уже написаны (из чекпоинта) — пропускаем.")
+            sections = checkpoint.sections
 
             # -- Vault analysis --------------------------------------------
             if not checkpoint.vault_analysis_done:
@@ -284,79 +281,54 @@ class Orchestrator:
                 checkpoint.vault_analysis_done = True
                 persist("vault_analysis_done")
             else:
-                existing_notes = checkpoint.existing_notes
                 report("Анализ Vault уже выполнен (из чекпоинта) — пропускаем.")
 
-            # -- Synthesis (без отдельного planning-шага — сразу по plan.notes) --
-            if not checkpoint.synthesis_done:
-                status.stage = "synthesizing"
+            # -- Annotation: теги, ссылки, резюме (только action="create") --
+            if not checkpoint.annotation_done:
+                report(f"Аннотирование заметок ({self.settings.llm_provider})…")
+                status.stage = "annotating"
+                _, title_map = synthesizer_writer.prepare_linking_context(plan.notes)
 
-                known_titles, title_map = synthesizer_writer.prepare_linking_context(plan.notes)
-                already_written = set(checkpoint.written_note_indices)
-                drafts = list(checkpoint.drafts)
+                def _on_annotation_batch(note_ids, new_annotations):
+                    checkpoint.annotations.extend(new_annotations)
+                    checkpoint.annotated_note_ids.extend(note_ids)
+                    persist("annotating")
 
-                if already_written:
-                    report(f"Пропускаем {len(already_written)} уже написанных "
-                        "заметок (из чекпоинта)."
-                    )
-
-
-                mark_source = (
-                    KNOWLEDGE_MODE_FRONTMATTER_SOURCE
-                    if self.settings.research_mode == "knowledge"
-                    else None
+                annotator.annotate_notes(
+                    plan, sections, title_map, self.llm, status,
+                    already_done_note_ids=set(checkpoint.annotated_note_ids),
+                    on_batch_done=_on_annotation_batch,
                 )
-                # Один статичный вариант системного промпта на всю задачу —
-                # см. llm/prompts/synthesizer_writer.py::MERGE_AWARENESS_GUIDANCE.
-                # Не привязано к тому, реально ли пользователь потом что-то
-                # объединит — только к тому, что такая возможность включена
-                # (у пользователя есть шанс воспользоваться merge_confirm_cb).
-                write_system_instruction = (
-                    WRITE_SYSTEM_INSTRUCTION + "\n\n" + MERGE_AWARENESS_GUIDANCE
-                    if self.settings.enable_draft_merging
-                    else WRITE_SYSTEM_INSTRUCTION
-                )
-
-                for i, note in enumerate(plan.notes):
-                    if i in already_written:
-                        continue
-                    report(f"Написание заметки «{note.title}» ({self.settings.llm_provider})…")
-                    draft = critic.run_critic_cycle(
-                        note, evidence, known_titles, title_map,
-                        self.llm, status,
-                        max_rounds=self.settings.max_critic_rounds,
-                        mark_source=mark_source,
-                        system_instruction=write_system_instruction,
-                    )
-                    if draft.needs_review:
-                        report(
-                            f"⚠ Критик не одобрил заметку «{note.title}» после "
-                            f"{draft.critic_rounds} попыт(ки/ок) — сохранена как есть."
-                        )
-                    drafts.append(draft)
-                    checkpoint.drafts = drafts
-                    checkpoint.written_note_indices.append(i)
-                    # Персист ПОСЛЕ КАЖДОЙ заметки (включая критик-раунды
-                    # внутри неё) — именно на этом шаге теперь самый частый
-                    # риск упереться в бюджет вызовов.
-                    persist("synthesizing")
-
-                checkpoint.relationships = synthesizer_writer.build_relationships(drafts)
-                checkpoint.synthesis_done = True
-                persist("synthesis_done")
-                relationships = checkpoint.relationships
+                checkpoint.annotation_done = True
+                persist("annotation_done")
             else:
-                drafts = checkpoint.drafts
-                relationships = checkpoint.relationships
-                report("Синтез уже выполнен (из чекпоинта) — пропускаем.")
+                report("Аннотации уже готовы (из чекпоинта) — пропускаем.")
+
+            # -- Сборка DraftNote (без LLM, каждый раз заново) --------------
+            report("Сборка заметок…")
+            status.stage = "assembling"
+            mark_source = (
+                KNOWLEDGE_MODE_FRONTMATTER_SOURCE
+                if self.settings.research_mode == "knowledge"
+                else None
+            )
+            annotations_by_note = {a.note_id: a for a in checkpoint.annotations}
+            drafts = [
+                build_draft_note(
+                    note, sections, annotations_by_note.get(note.note_id),
+                    domain=plan.domain, mark_source=mark_source,
+                )
+                for note in plan.notes
+            ]
 
             # -- Объединение готовых заметок (опционально, БЕЗ LLM) --------
-            # Только здесь, ПОСЛЕ synthesis_done (все drafts уже написаны и
-            # прошли Critic) и ДО validation/staging — см.
-            # config/settings.py::enable_draft_merging.
             if self.settings.enable_draft_merging and merge_confirm_cb is not None:
                 report("Объединение заметок (если выбрано пользователем)…")
                 drafts = merge_confirm_cb(drafts)
+
+            # Связи считаются ПОСЛЕ merge: иначе они ссылались бы на пути
+            # заметок, которых после объединения уже нет.
+            relationships = synthesizer_writer.build_relationships(drafts)
 
             # -- Validation + Staging (без LLM, всегда выполняются заново,
             # т.к. дёшевы и должны учитывать текущее состояние db/Vault) ----
@@ -376,8 +348,8 @@ class Orchestrator:
             status.stage = "staged"
             save_changeset(self.settings.staging_dir, changeset)
 
-            # Задача успешно доведена до staging — чекпоинт больше не нужен:
-            # дальнейшее состояние живёт в StagingChangeset, а не в нём.
+            # Задача доведена до staging — чекпоинт больше не нужен:
+            # дальнейшее состояние живёт в StagingChangeset.
             delete_checkpoint(self.settings.checkpoint_dir, task.task_id)
 
             status.finished = True
@@ -392,10 +364,6 @@ class Orchestrator:
         except (LLMFreeLimitReached, LLMTaskBudgetExceeded) as exc:
             status.stage = "stopped"
             status.stopped_reason = str(exc)
-            # Обновляем сохранённый статус/накопленный счётчик даже если
-            # новый шаг целиком не завершился (например, упали в середине
-            # planning) — last_completed_stage при этом не меняется,
-            # т.к. persist() вызывается с уже известной меткой шага.
             persist(checkpoint.last_completed_stage)
             logger.warning("Задача %s остановлена: %s", task.task_id, exc)
             return RunResult(

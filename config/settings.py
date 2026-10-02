@@ -272,13 +272,13 @@ class Settings(BaseSettings):
     # роль вызывается один раз за задачу (калибратор её не выучит), а на
     # дефолтном effort проба дала ~3000 токенов вывода при резерве 1500.
     groq_reserved_output_by_role: dict[str, int] = Field(
-        default_factory=lambda: {"elaborator": 2500, "outline_planner": 3000}
+        default_factory=lambda: {"elaborator": 2500, "outline_planner": 3000, "annotator": 2000}
     )
 
     # ---- Объединение заметок в конце workflow ----
     # См. staging/draft_merge.py — ноль LLM-вызовов, чистая пересборка уже
     # написанного текста ПОСЛЕ Writer+Critic, ПЕРЕД validation/staging.
-    enable_draft_merging: bool = Field(default=True)
+    enable_draft_merging: bool = Field(default=False)
 
     # Как именно объединять, когда enable_draft_merging=True:
     # "all" (дефолт) — ВСЕ написанные заметки (action=create) сливаются в

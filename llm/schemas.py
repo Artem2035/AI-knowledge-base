@@ -81,31 +81,6 @@ class EvidenceBatchOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Elaborator — используется только в RESEARCH_MODE=knowledge (см.
-# roles/elaborator.py). В отличие от EvidenceItem/EvidenceBatchOutput выше,
-# здесь нет unit_index/contradicts_indices — не с чем сверять противоречия
-# между "единицами текста источника", т.к. текста источника нет: вход —
-# сама подтема, а не чанк чужого текста.
-# ---------------------------------------------------------------------------
-
-
-class ElaborationItem(BaseModel):
-    statement: str
-    confidence: float = Field(ge=0.0, le=1.0)
-    is_definition: bool = False
-    critic_note: str = ""
-    # Индекс подтемы в списке, переданном в промпте текущего батча (0-based)
-    # — позволяет раскрывать НЕСКОЛЬКО подтем одним вызовом и корректно
-    # приписать каждый факт к его настоящей подтеме в коде-обвязке (см.
-    # roles/elaborator.py), тот же принцип, что EvidenceItem.unit_index.
-    unit_index: int = 0
-
-
-class ElaborationOutput(BaseModel):
-    evidence: list[ElaborationItem] = Field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
 # Vault dedup (только "серая зона")
 # ---------------------------------------------------------------------------
 
@@ -114,51 +89,6 @@ class DedupDecisionOutput(BaseModel):
     same_concept: bool
     decision: Literal["reuse", "extend", "distinct"]
     reasoning: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Synthesizer + Writer (объединены)
-# ---------------------------------------------------------------------------
-
-
-class FrontmatterField(BaseModel):
-    key: str
-    value: str
-
-
-class DraftNoteOutput(BaseModel):
-    action: Literal["create", "update"]
-    existing_path: str = ""  # обязателен при action="update", должен совпасть с одним из переданных ExistingNote
-    title: str
-    folder: str = ""
-    frontmatter_extra: list[FrontmatterField] = Field(default_factory=list)
-    body_md: str = ""
-    tags: list[str] = Field(default_factory=list)
-    links_out: list[str] = Field(default_factory=list)
-    append_section: str = ""  # если непусто и action="update" — добавляем блок, не переписываем всё
-
-
-class SynthesisOutput(BaseModel):
-    notes: list[DraftNoteOutput] = Field(default_factory=list)
-
-# ---------------------------------------------------------------------------
-# Synthesizer — Note Planner (шаг 1 map-reduce)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Critic — ревью уже написанной заметки (см. roles/critic.py). Работает
-# ПОСЛЕ Writer, на готовом DraftNote, а не на сыром evidence — проверяет
-# итоговый текст.
-# ---------------------------------------------------------------------------
-
-
-class CriticVerdictOutput(BaseModel):
-    verdict: Literal["ok", "rewrite"]
-    # Заполняется только при verdict="rewrite" — конкретные, adresуемые
-    # замечания, которые Writer сможет учесть на повторном проходе (не общие
-    # фразы вроде "сделай лучше", а конкретные пункты: "раздел X дублирует
-    # раздел Y", "утверждение про Z не подкреплено ни одним evidence" и т.п.)
-    feedback: str = ""
 
 # ---------------------------------------------------------------------------
 # папки для заметок
