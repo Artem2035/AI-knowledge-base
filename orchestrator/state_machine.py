@@ -44,10 +44,11 @@ from retrieval.search import VaultSearcher
 from roles import annotator, elaborator, outline_planner, synthesizer_writer, vault_analyst
 from staging.changeset import save_changeset
 from staging.checkpoint import save_checkpoint, delete_checkpoint, TaskCheckpoint, load_checkpoint
+from staging.draft_merge import fix_links_after_merge
 from storage.models import StagingChangeset, Task, TaskStatus
 from tools.dedup import try_create_embedder
 from tools.markdown_tools import slugify_filename
-from tools.note_assembly import build_draft_note
+from tools.note_assembly import build_draft_note, apply_inline_links, build_moc
 from validation import run_validation
 from vault.db import VaultDB
 from vault.index import VaultIndexer
@@ -325,9 +326,26 @@ class Orchestrator:
             if self.settings.enable_draft_merging and merge_confirm_cb is not None:
                 report("Объединение заметок (если выбрано пользователем)…")
                 drafts = merge_confirm_cb(drafts)
+                # ссылки других заметок на исходные заголовки -> на объединённую
+                drafts = fix_links_after_merge(drafts)
 
-            # Связи считаются ПОСЛЕ merge: иначе они ссылались бы на пути
-            # заметок, которых после объединения уже нет.
+            # -- Inline-ссылки по links_out (после слияния и чистки ссылок) --
+            drafts = [apply_inline_links(d) for d in drafts]
+
+            # -- MOC: только если осталось >=2 create-заметок ---------------
+            moc = build_moc(
+                plan, drafts, annotations_by_note,
+                domain=plan.domain,
+                default_folder=f"{self.settings.default_notes_folder}/{slugify_filename(plan.topic_title)}".strip("/"),
+                existing_paths=self.db.get_all_paths(),
+                mark_source=mark_source,
+            )
+            if moc is not None:
+                drafts.insert(0, moc)
+
+            # Связи считаются ПОСЛЕ merge и MOC: иначе они ссылались бы на
+            # пути заметок, которых после объединения уже нет, или не видели
+            # бы рёбер MOC.
             relationships = synthesizer_writer.build_relationships(drafts)
 
             # -- Validation + Staging (без LLM, всегда выполняются заново,

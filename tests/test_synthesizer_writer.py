@@ -33,3 +33,26 @@ def test_build_relationships_unresolved_title_falls_back_to_title_itself():
     rels = build_relationships([d1])
 
     assert rels[0].to_note == "Неизвестная тема"
+
+def test_prepare_linking_context_uses_file_stem_for_update_notes():
+    notes = [
+        OutlineNote(title="Плановое имя", action="update", existing_path="Знания/Файл в Vault.md"),
+        OutlineNote(title="Новая"),
+    ]
+    known_titles, title_map = prepare_linking_context(notes)
+
+    assert known_titles == ["Новая", "Файл в Vault"]
+    assert title_map["Плановое имя"] == "Файл в Vault"
+    assert title_map["Файл в Vault"] == "Файл в Vault"
+
+
+def test_build_relationships_resolves_link_to_update_note_by_file_stem():
+    upd = DraftNote(action=NoteAction.UPDATE, path="Знания/Файл в Vault.md", title="Плановое имя",
+                    append_section="## Р\n\nТекст")
+    new = DraftNote(action=NoteAction.CREATE, path="Знания/Новая.md", title="Новая",
+                    links_out=["Файл в Vault"])
+
+    rels = build_relationships([upd, new])
+
+    assert rels[0].from_note == "Знания/Новая.md"
+    assert rels[0].to_note == "Знания/Файл в Vault.md"

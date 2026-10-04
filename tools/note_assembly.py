@@ -12,8 +12,9 @@ import re
 
 from datetime import datetime, timezone
 
-from storage.models import DraftNote, NoteAction, NoteAnnotation, OutlineNote, SectionDraft
-from tools.markdown_tools import build_note_path
+from storage.models import DraftNote, NoteAction, NoteAnnotation, OutlineNote, SectionDraft, Plan
+from tools.markdown_tools import build_note_path, normalize_link_title, insert_wikilinks
+
 # Порог вставки резюме-callout: короткой заметке резюме не нужно.
 ABSTRACT_MIN_SECTIONS = 8
 
@@ -25,12 +26,20 @@ PLACEHOLDER_MARKDOWN = "_Раздел не удалось сгенерирова
 _FENCE_LINE_RE = re.compile(r"^\s{0,3}```")
 _HEADING_LINE_RE = re.compile(r"^(#{1,6})(\s+.*)$")
 
-_HUMANITIES_CALLOUT = (
+HUMANITIES_CALLOUT = (
     "> [!warning] Проверьте факты\n"
     "> Даты, цитаты и имена в этой заметке сгенерированы без источников — "
     "сверьте их перед использованием."
 )
+# Для update блок дописывается в конец существующей заметки: callout
+# должен говорить только о добавленных разделах.
+HUMANITIES_UPDATE_CALLOUT = (
+    "> [!warning] Проверьте факты\n"
+    "> Даты, цитаты и имена в добавленных ниже разделах сгенерированы без "
+    "источников — сверьте их перед использованием."
+)
 
+MOC_TAG = "moc"
 
 def has_balanced_fences(text: str) -> bool:
     """Чётное число строк-ограждений ``` (открытие + закрытие)."""
@@ -109,7 +118,7 @@ def assemble_note_markdown(
     unverified: list[str] = []
 
     if domain == "humanities":
-        blocks.append(_HUMANITIES_CALLOUT)
+        blocks.append(HUMANITIES_UPDATE_CALLOUT if for_update else HUMANITIES_CALLOUT)
     if not for_update and abstract.strip() and len(note.subpoints) >= ABSTRACT_MIN_SECTIONS:
         blocks.append(_callout("abstract", "Кратко", abstract.strip()))
 
@@ -185,4 +194,81 @@ def build_draft_note(
         tags=add_domain_tag(list(annotation.tags) if annotation else [], domain),
         links_out=list(annotation.links_out) if annotation else [],
         unverified_sections=unverified,
+    )
+
+def apply_inline_links(draft: DraftNote) -> DraftNote:
+    """Проставляет inline-[[ссылки]] в тело create-заметки по её links_out
+    (только первое вхождение, без кода/заголовков/таблиц, см.
+    markdown_tools.insert_wikilinks). Не применяется к update (там
+    append_section дописывается в чужой файл), к MOC и к пустому телу.
+    Ссылка заметки на саму себя не ставится."""
+    if draft.action != NoteAction.CREATE or draft.is_moc or not draft.links_out or not draft.body_md:
+        return draft
+    own = normalize_link_title(draft.title)
+    targets = [t for t in draft.links_out if normalize_link_title(t) != own]
+    new_body = insert_wikilinks(draft.body_md, targets)
+    return draft if new_body == draft.body_md else draft.model_copy(update={"body_md": new_body})
+
+
+def build_moc(
+    plan: Plan,
+    drafts: list[DraftNote],
+    annotations_by_note: dict[str, NoteAnnotation],
+    *,
+    domain: str,
+    default_folder: str,
+    existing_paths: set[str],
+    mark_source: str | None = None,
+) -> DraftNote | None:
+    """Детерминированно собирает MOC (оглавление темы) без LLM.
+
+    Возвращает None, если create-заметок меньше двух (оглавлять нечего).
+    Тело: резюме темы (plan.summary, если есть) и список [[заголовок]] с
+    abstract из аннотаций. update-заметки в список не входят.
+    links_out заполнен (для build_relationships и validate_links), но
+    секцию «Связанные заметки» для MOC render_markdown не добавляет —
+    список уже в теле.
+
+    Защита от коллизии: если путь или заголовок уже заняты (Vault или
+    другой черновик), к заголовку добавляется суффикс « (2)», « (3)»…"""
+    creates = [d for d in drafts if d.action == NoteAction.CREATE and not d.is_moc]
+    if len(creates) < 2:
+        return None
+
+    taken_paths = set(existing_paths) | {d.path for d in drafts}
+    taken_titles = {d.title for d in drafts}
+    base = f"{plan.topic_title.strip()} — обзор"
+    title, n = base, 1
+    path = build_note_path(default_folder, title)
+    while path in taken_paths or title in taken_titles:
+        n += 1
+        title = f"{base} ({n})"
+        path = build_note_path(default_folder, title)
+
+    items: list[str] = []
+    for d in creates:
+        ann = annotations_by_note.get(d.note_id) if d.note_id else None
+        abstract = " ".join(ann.abstract.split()) if ann and ann.abstract else ""
+        items.append(f"- [[{d.title}]] — {abstract}" if abstract else f"- [[{d.title}]]")
+
+    parts: list[str] = []
+    if plan.summary.strip():
+        parts.append(plan.summary.strip())
+    parts.append("## Заметки\n\n" + "\n".join(items))
+
+    frontmatter = {"created": datetime.now(timezone.utc).date().isoformat()}
+    if mark_source:
+        frontmatter["source"] = mark_source
+
+    return DraftNote(
+        note_id="",
+        action=NoteAction.CREATE,
+        path=path,
+        title=title,
+        folder=default_folder,
+        frontmatter=frontmatter,
+        body_md="\n\n".join(parts),
+        tags=add_domain_tag([MOC_TAG], domain),
+        links_out=[d.title for d in creates],
+        is_moc=True,
     )

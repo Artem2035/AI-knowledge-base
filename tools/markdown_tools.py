@@ -103,26 +103,68 @@ def render_markdown(draft: DraftNote) -> str:
         "\n",
     ]
 
-    if draft.links_out:
+    if draft.links_out and not draft.is_moc:
         related = "\n".join(f"- [[{strip_wikilink_brackets(t)}]]" for t in draft.links_out)
         parts.append(f"\n## Связанные заметки\n\n{related}\n")
 
     return "".join(parts)
 
 
-def insert_wikilinks(body_md: str, titles_to_link: list[str]) -> str:
-    """
-    Простая детерминированная простановка [[wikilink]] для первого вхождения
-    каждого заголовка из titles_to_link в тексте (без затрагивания уже
-    существующих ссылок/кода).
-    """
-    result = body_md
-    for title in sorted(titles_to_link, key=len, reverse=True):
-        if not title or f"[[{title}]]" in result:
+_FENCE_LINE_RE = re.compile(r"^\s{0,3}```")
+# Строки, в которых ссылки не ставим: заголовки, строки таблиц, шапки callout'ов.
+_NO_LINK_LINE_RE = re.compile(r"^(?:\s{0,3}#{1,6}(?:\s|$)|\s*\||\s*>\s*\[!)")
+# Фрагменты внутри строки, которые не трогаем: inline-код, формулы, [[ссылки]],
+# markdown-ссылки, URL. Группа ОДНА (захватывающая): re.split возвращает
+# чередование «обычный текст / защищённый фрагмент».
+_PROTECTED_SPAN_RE = re.compile(
+    r"(`[^`\n]*`|\$\$[^$\n]*\$\$|\$[^$\n]+\$|\[\[[^\]\n]*\]\]"
+    r"|\[[^\]\n]*\]\([^)\n]*\)|https?://\S+|www\.\S+)"
+)
+
+
+def _link_first_occurrence(lines: list[str], pattern: re.Pattern, title: str) -> list[str]:
+    """Заменяет первое допустимое вхождение pattern на [[title]] (мутирует lines)."""
+    in_fence = in_math = False
+    for i, line in enumerate(lines):
+        if _FENCE_LINE_RE.match(line):
+            in_fence = not in_fence
             continue
-        pattern = re.compile(rf"(?<!\[)\b{re.escape(title)}\b(?!\])")
-        result, n = pattern.subn(f"[[{title}]]", result, count=1)
-    return result
+        if in_fence:
+            continue
+        if line.strip() == "$$":
+            in_math = not in_math
+            continue
+        if in_math or _NO_LINK_LINE_RE.match(line):
+            continue
+        parts = _PROTECTED_SPAN_RE.split(line)
+        for j in range(0, len(parts), 2):  # чётные элементы — обычный текст
+            new, n = pattern.subn(lambda _m: f"[[{title}]]", parts[j], count=1)
+            if n:
+                parts[j] = new
+                lines[i] = "".join(parts)
+                return lines
+    return lines
+
+
+def insert_wikilinks(body_md: str, titles_to_link: list[str]) -> str:
+    """Проставляет [[wikilink]] на ПЕРВОЕ вхождение каждого заголовка
+    (точное совпадение, с границами слова, без учёта падежей).
+
+    Не трогает: fenced-код (в т.ч. незакрытый — до конца текста), inline-код,
+    формулы, строки заголовков, строки таблиц, шапки callout'ов, URL,
+    markdown-ссылки и уже существующие [[ссылки]]. Если на заголовок уже
+    есть [[ссылка]] (в т.ч. [[Заголовок|алиас]]), повторно не ставится.
+    Длинные заголовки обрабатываются первыми. Идемпотентна."""
+    if not body_md:
+        return body_md
+    lines = body_md.split("\n")
+    titles = sorted({t.strip() for t in titles_to_link if t and t.strip()}, key=len, reverse=True)
+    for title in titles:
+        if re.search(rf"\[\[{re.escape(title)}[|#\]]", "\n".join(lines)):
+            continue
+        pattern = re.compile(rf"(?<!\w){re.escape(title)}(?!\w)")
+        lines = _link_first_occurrence(lines, pattern, title)
+    return "\n".join(lines)
 
 def sanitize_wikilinks(text: str) -> str:
     """Убирает случайное дублирование скобок ([[[[X]]]] -> [[X]]),

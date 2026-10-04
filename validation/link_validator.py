@@ -3,13 +3,18 @@ from __future__ import annotations
 from storage.models import DraftNote, ValidationIssue
 from tools.markdown_tools import normalize_link_title
 from vault.db import VaultDB
-
+from pathlib import PurePosixPath
+# (импорт добавить к существующим)
 
 def validate_links(drafts: list[DraftNote], db: VaultDB) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     existing_titles = {row["title"] for row in db.get_all_notes()}
     draft_titles = {d.title for d in drafts}
-    known_titles = existing_titles | draft_titles
+    # Obsidian разрешает [[ссылку]] по имени файла, поэтому stem путей
+    # (существующих и предлагаемых) тоже считается известным именем.
+    stems = {PurePosixPath(p).stem for p in db.get_all_paths()}
+    stems |= {PurePosixPath(d.path).stem for d in drafts}
+    known_titles = existing_titles | draft_titles | stems
     known_normalized = {normalize_link_title(t): t for t in known_titles}
 
     for d in drafts:

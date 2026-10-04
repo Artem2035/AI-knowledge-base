@@ -42,3 +42,7 @@ def test_diff_keeps_legacy_needs_review_marker():
         StagingChangeset(task_id="d4", creates=[_create(needs_review=True, critic_rounds=1)])
     )
     assert "критик не одобрил" in out
+
+def test_diff_marks_moc():
+    out = render_diff_summary(StagingChangeset(task_id="d5", creates=[_create(is_moc=True)]))
+    assert "MOC" in out

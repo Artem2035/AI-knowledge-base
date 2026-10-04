@@ -109,7 +109,7 @@ def validate_markdown_body(draft: DraftNote) -> list[ValidationIssue]:
             message="Очень короткая заметка (<40 символов) — возможно, стоит объединить с другой",
             draft_id=draft.draft_id,
         ))
-    elif draft.action == NoteAction.CREATE:
+    elif draft.action == NoteAction.CREATE and not draft.is_moc:
         blocks = _count_content_blocks(text)
         if blocks < 3:
             issues.append(ValidationIssue(

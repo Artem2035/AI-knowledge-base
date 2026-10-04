@@ -204,6 +204,15 @@ class DraftNote(BaseModel):
     needs_review: bool = False
     # Заголовки разделов, помеченных Elaborator как требующие проверки.
     unverified_sections: list[str] = Field(default_factory=list)
+    # Заголовки исходных заметок, из которых собрана объединённая заметка
+    # (staging/draft_merge.py). Нужны, чтобы после слияния перенаправить
+    # ссылки других заметок на объединённую.
+    merged_from: list[str] = Field(default_factory=list)
+    # True для заметки-оглавления (MOC) темы, которую собирает код
+    # (tools/note_assembly.py::build_moc). Нужен, чтобы не рендерить в ней
+    # дублирующую секцию «Связанные заметки», не применять проверку
+    # «слишком короткая заметка» и не ставить inline-ссылки.
+    is_moc: bool = False
 
 class Relationship(BaseModel):
     from_note: str

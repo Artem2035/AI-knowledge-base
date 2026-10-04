@@ -5,7 +5,7 @@ from tools.markdown_tools import (
     build_note_path,
     render_markdown,
     slugify_filename,
-    strip_wikilink_brackets, snap_link,
+    strip_wikilink_brackets, snap_link, insert_wikilinks,
 )
 
 
@@ -166,3 +166,45 @@ def test_snap_link_rejects_urls_and_empty():
     assert snap_link("https://example.com/a", {}) is None
     assert snap_link("www.example.com", {}) is None
     assert snap_link("[[ ]]", {}) is None
+
+def test_insert_wikilinks_first_occurrence_only_and_skips_protected_zones():
+    text = (
+        "# RAG\n"
+        "> [!tip] RAG в деле\n"
+        "| RAG | да |\n"
+        "```python\nRAG = 1\n```\n"
+        "Код `RAG`, ссылка https://rag.example/RAG и [RAG](x).\n"
+        "Здесь RAG впервые в тексте. RAG ещё раз."
+    )
+    result = insert_wikilinks(text, ["RAG"])
+    assert result.count("[[RAG]]") == 1
+    assert "Здесь [[RAG]] впервые в тексте. RAG ещё раз." in result
+    assert "RAG = 1" in result and "`RAG`" in result
+
+
+def test_insert_wikilinks_unclosed_fence_protects_rest_of_text():
+    text = "Начало.\n```python\nRAG = 1\nещё RAG"
+    assert insert_wikilinks(text, ["RAG"]) == text
+
+
+def test_insert_wikilinks_word_boundary_and_existing_links():
+    assert insert_wikilinks("Pythonic и Python.", ["Python"]) == "Pythonic и [[Python]]."
+    already = "См. [[RAG|алиас]] и RAG."
+    assert insert_wikilinks(already, ["RAG"]) == already
+
+
+def test_insert_wikilinks_longer_title_first_and_idempotent():
+    text = "Векторные базы данных и Базы данных."
+    once = insert_wikilinks(text, ["Базы данных", "Векторные базы данных"])
+    assert once == "[[Векторные базы данных]] и [[Базы данных]]."
+    assert insert_wikilinks(once, ["Базы данных", "Векторные базы данных"]) == once
+
+
+def test_render_markdown_moc_has_no_related_section():
+    draft = DraftNote(
+        action=NoteAction.CREATE, path="Знания/M.md", title="M",
+        body_md="## Заметки\n\n- [[A]]\n- [[B]]", links_out=["A", "B"], is_moc=True,
+    )
+    rendered = render_markdown(draft)
+    assert "## Связанные заметки" not in rendered
+    assert rendered.count("[[A]]") == 1

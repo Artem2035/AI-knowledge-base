@@ -40,6 +40,8 @@ def render_diff_summary(changeset: StagingChangeset) -> str:
         for d in changeset.creates:
             tags = ", ".join(t for t in d.tags if not t.startswith(_DOMAIN_TAG_PREFIX)) or "—"
             lines.append(f"  + {d.path}")
+            if d.is_moc:
+                lines.append("      тип: MOC (оглавление темы)")
             lines.append(f"      заголовок: {d.title}")
             domain = _domain_of(d)
             if domain:

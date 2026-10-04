@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from storage.models import OutlineNote, OutlineSubpoint, SectionDraft, NoteAnnotation, NoteAction
+from storage.models import OutlineNote, OutlineSubpoint, SectionDraft, NoteAnnotation, NoteAction, DraftNote, Plan
 from tools.note_assembly import (
     PLACEHOLDER_MARKDOWN, add_domain_tag, assemble_note_markdown, close_unbalanced_fence,
     has_balanced_fences, normalize_headings, prepare_section, strip_leading_duplicate_heading, build_draft_note,
+    apply_inline_links, build_moc,
 )
 
 
@@ -138,3 +139,53 @@ def test_build_draft_note_update_without_existing_path_raises():
     note.action = "update"
     with pytest.raises(ValueError):
         build_draft_note(note, [], None, domain="technical")
+
+def test_humanities_update_gets_local_warning_about_added_sections():
+    body, _ = assemble_note_markdown(_note(1), [], domain="humanities", for_update=True)
+    assert body.startswith("> [!warning] Проверьте факты")
+    assert "добавленных ниже разделах" in body.split("\n\n")[0]
+
+def _draft(title, note_id="", **kw) -> DraftNote:
+    return DraftNote(action=NoteAction.CREATE, path=f"Знания/{title}.md", title=title,
+                     note_id=note_id, body_md="Текст.", **kw)
+
+
+def _plan() -> Plan:
+    return Plan(task_id="t", topic_title="Тема", summary="Резюме темы.", domain="technical")
+
+
+def test_apply_inline_links_links_target_but_not_self_update_or_moc():
+    d = _draft("A", links_out=["B", "A"]).model_copy(update={"body_md": "A связана с B и A."})
+    assert apply_inline_links(d).body_md == "A связана с [[B]] и A."
+
+    upd = DraftNote(action=NoteAction.UPDATE, path="X.md", title="X", append_section="B", links_out=["B"])
+    assert apply_inline_links(upd) is upd
+    moc = d.model_copy(update={"is_moc": True})
+    assert apply_inline_links(moc) is moc
+
+
+def test_build_moc_lists_creates_with_abstract_and_tags():
+    a, b = _draft("A", "n1"), _draft("B", "n2")
+    ann = {"n1": NoteAnnotation(note_id="n1", abstract="Кратко\nо A")}
+    moc = build_moc(_plan(), [a, b], ann, domain="technical",
+                    default_folder="Знания/Тема", existing_paths=set())
+
+    assert moc.is_moc and moc.title == "Тема — обзор"
+    assert moc.path == "Знания/Тема/Тема — обзор.md"
+    assert moc.links_out == ["A", "B"] and moc.tags == ["moc", "domain/technical"]
+    assert moc.body_md == "Резюме темы.\n\n## Заметки\n\n- [[A]] — Кратко о A\n- [[B]]"
+
+
+def test_build_moc_none_when_fewer_than_two_creates():
+    upd = DraftNote(action=NoteAction.UPDATE, path="X.md", title="X", append_section="доп.")
+    args = dict(domain="technical", default_folder="Знания", existing_paths=set())
+    assert build_moc(_plan(), [_draft("A")], {}, **args) is None
+    assert build_moc(_plan(), [_draft("A"), upd], {}, **args) is None
+
+
+def test_build_moc_avoids_path_collision():
+    result = build_moc(_plan(), [_draft("A"), _draft("B")], {}, domain="technical",
+                       default_folder="Знания/Тема",
+                       existing_paths={"Знания/Тема/Тема — обзор.md"})
+    assert result.title == "Тема — обзор (2)"
+    assert result.path == "Знания/Тема/Тема — обзор (2).md"

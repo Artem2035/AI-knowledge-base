@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from staging.draft_merge import apply_merges, merge_drafts
+from staging.draft_merge import apply_merges, merge_drafts, fix_links_after_merge
 from storage.models import DraftNote, NoteAction
 from staging.draft_merge import merge_all_drafts
+from tools.note_assembly import has_balanced_fences, HUMANITIES_CALLOUT
+
 
 def _draft(title, body, tags=None, links=None, refs=None, needs_review=False, critic_rounds=0) -> DraftNote:
     return DraftNote(
@@ -109,3 +111,59 @@ def test_merge_all_drafts_noop_with_fewer_than_two_creates():
 def test_merge_all_drafts_noop_when_zero_creates():
     update = DraftNote(action=NoteAction.UPDATE, path="X.md", title="X", append_section="доп.")
     assert merge_all_drafts([update]) == [update]
+
+def test_merge_carries_unverified_sections_with_dedup():
+    d1 = _draft("A", "Текст.").model_copy(update={"unverified_sections": ["Р1", "Общий"]})
+    d2 = _draft("B", "Текст.").model_copy(update={"unverified_sections": ["Общий", "Р2"]})
+    merged = merge_drafts([d1, d2], [0, 1])
+    assert merged.unverified_sections == ["Р1", "Общий", "Р2"]
+
+
+def test_merge_keeps_humanities_callout_once_on_top():
+    d1 = _draft("A", HUMANITIES_CALLOUT + "\n\n## Р\n\nТекст A.")
+    d2 = _draft("B", HUMANITIES_CALLOUT + "\n\n## Р\n\nТекст B.")
+    merged = merge_drafts([d1, d2], [0, 1])
+    assert merged.body_md.startswith(HUMANITIES_CALLOUT)
+    assert merged.body_md.count("Проверьте факты") == 1
+
+
+def test_merge_shift_respects_heading_ceiling():
+    d1 = _draft("A", "## a\n### b\n#### c\n##### d\n###### e")
+    merged = merge_drafts([d1, _draft("B", "Текст.")], [0, 1])
+    lines = merged.body_md.splitlines()
+    assert "### a" in lines and "#### b" in lines and "##### c" in lines
+    assert "###### d" in lines and "###### e" in lines  # потолок ######
+
+
+def test_merge_closes_unclosed_fence_and_does_not_shift_code():
+    d1 = _draft("A", "## Р\n\n```python\n# c")
+    d2 = _draft("B", "## Р2\n\nТекст.")
+    merged = merge_drafts([d1, d2], [0, 1])
+    assert has_balanced_fences(merged.body_md)
+    assert "\n# c\n" in merged.body_md  # строка кода не стала заголовком
+    assert "\n## B\n" in merged.body_md  # следующая секция вне блока кода
+
+
+def test_merge_drops_internal_and_self_links_and_records_sources():
+    d1 = _draft("A", "Текст.", links=["B", "X"])
+    d2 = _draft("B", "Текст.", links=["A", "Y", "AB"])
+    merged = merge_drafts([d1, d2], [0, 1], merged_title="AB")
+    assert merged.links_out == ["X", "Y"]
+    assert merged.merged_from == ["A", "B"]
+
+
+def test_fix_links_redirects_external_links_to_merged_note():
+    drafts = [
+        _draft("A", "Текст."), _draft("B", "Текст."),
+        _draft("C", "Текст.", links=["A", "B", "D"]),
+        _draft("D", "Текст.", links=["B", "C"]),
+    ]
+    result = fix_links_after_merge(apply_merges(drafts, [([0, 1], "AB")]))
+    by_title = {d.title: d for d in result}
+    assert by_title["C"].links_out == ["AB", "D"]   # A и B схлопнулись в одну ссылку
+    assert by_title["D"].links_out == ["AB", "C"]
+
+
+def test_fix_links_noop_without_merges():
+    drafts = [_draft("A", "Текст.", links=["B"]), _draft("B", "Текст.")]
+    assert fix_links_after_merge(drafts) == drafts

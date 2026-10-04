@@ -264,3 +264,26 @@ def test_inline_triple_backticks_are_not_flagged(tmp_path):
     report = run_validation(StagingChangeset(task_id="v5", creates=[draft]), db, allow_delete=False)
     assert not any(i.code == "unbalanced_code_fence" for i in report.issues)
     db.close()
+
+def test_link_to_file_stem_of_draft_is_not_broken(tmp_path):
+    """Ссылка по имени файла (а не по title) не должна давать broken_wikilink."""
+    db = _db(tmp_path)
+    target = DraftNote(action=NoteAction.CREATE, path="Знания/Файл.md", title="Другой заголовок",
+                       body_md="Достаточно длинный текст заметки, чтобы пройти проверку длины.")
+    source = DraftNote(action=NoteAction.CREATE, path="Знания/Источник.md", title="Источник",
+                       body_md="Достаточно длинный текст заметки, чтобы пройти проверку длины.",
+                       links_out=["Файл"])
+    report = run_validation(StagingChangeset(task_id="t14", creates=[target, source]), db, allow_delete=False)
+    assert not any(i.code == "broken_wikilink" for i in report.issues)
+    db.close()
+
+def test_moc_is_exempt_from_structural_warning(tmp_path):
+    db = _db(tmp_path)
+    moc = DraftNote(
+        action=NoteAction.CREATE, path="Знания/Тема/Обзор.md", title="Обзор", is_moc=True,
+        body_md="## Заметки\n\n- [[Первая заметка темы]]\n- [[Вторая заметка темы]]",
+        links_out=["Первая заметка темы", "Вторая заметка темы"],
+    )
+    report = run_validation(StagingChangeset(task_id="m1", creates=[moc]), db, allow_delete=False)
+    assert report.ok and not _structural(report)
+    db.close()

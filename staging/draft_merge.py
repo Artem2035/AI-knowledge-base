@@ -22,30 +22,42 @@ from __future__ import annotations
 import re
 
 from storage.models import DraftNote, NoteAction
-from tools.markdown_tools import build_note_path
+from tools.markdown_tools import build_note_path, normalize_link_title
+from tools.note_assembly import HUMANITIES_CALLOUT, close_unbalanced_fence
 
-_HEADING_RE = re.compile(r'^(#{1,5})(\s)', re.MULTILINE)
-_CODE_FENCE_RE = re.compile(r'```.*?```', re.DOTALL)
+_FENCE_LINE_RE = re.compile(r"^\s{0,3}```")
+_HEADING_LINE_RE = re.compile(r"^(#{1,6})(\s+.*)$")
 
 
 def _shift_headings(text: str, levels: int = 1) -> str:
     """Увеличивает уровень каждого Markdown-заголовка на `levels`
-    (## -> ###), НЕ трогая '#'-подобные последовательности внутри
-    fenced code blocks (```...```) — иначе строки вида '# comment'
-    в примерах кода сломались бы."""
+    (## -> ###, потолок ######), НЕ трогая строки внутри fenced code
+    blocks. Разбор построчный: незакрытый fence считается кодом до конца
+    текста, поэтому '# comment' в нём никогда не станет заголовком."""
     if not text:
         return text
 
-    def _bump(m: re.Match) -> str:
-        return ("#" * min(len(m.group(1)) + levels, 6)) + m.group(2)
+    out: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if _FENCE_LINE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if not in_fence:
+            m = _HEADING_LINE_RE.match(line)
+            if m:
+                line = "#" * min(len(m.group(1)) + levels, 6) + m.group(2)
+        out.append(line)
+    return "\n".join(out)
 
-    parts, last_end = [], 0
-    for m in _CODE_FENCE_RE.finditer(text):
-        parts.append(_HEADING_RE.sub(_bump, text[last_end:m.start()]))
-        parts.append(m.group(0))  # код не трогаем
-        last_end = m.end()
-    parts.append(_HEADING_RE.sub(_bump, text[last_end:]))
-    return "".join(parts)
+
+def _strip_humanities_callout(text: str) -> tuple[str, bool]:
+    """Вырезает общий humanities-callout из начала тела заметки (его
+    ставит tools/note_assembly.py). Возвращает (текст, был_ли_callout)."""
+    if text.startswith(HUMANITIES_CALLOUT):
+        return text[len(HUMANITIES_CALLOUT):].lstrip("\n"), True
+    return text, False
 
 
 def merge_drafts(
@@ -54,15 +66,26 @@ def merge_drafts(
     """
     Объединяет несколько готовых DraftNote (action=create) в один.
 
-    note_id объединённого драфта оставляется пустым: он использовался
-    только для validate_headings_coverage по исходному Plan
-    (validation/markdown_validator.py) — на этом этапе исходная
-    заметка-план для объединённой структуры уже не актуальна, проверка
-    просто не выполняется для этого драфта (note is None -> no-op в
-    validate_headings_coverage), это сознательный компромисс.
+    Что делает (без LLM):
+    - оборачивает body_md каждой исходной заметки в "## {title}" и сдвигает
+      её внутренние заголовки на 1 уровень глубже (код не трогается);
+    - закрывает висящий fence в исходном теле ДО склейки, иначе он
+      поглотил бы следующие секции;
+    - общий humanities-callout вырезает из исходных тел и ставит один раз
+      сверху; резюме (abstract) каждой исходной заметки остаётся под её
+      собственным "## {title}", общее резюме не создаётся;
+    - объединяет tags/source_refs/unverified_sections с дедупликацией;
+    - links_out: убирает ссылки на заметки, вошедшие в объединение, и
+      самоссылки (после слияния они указывали бы на несуществующие
+      заголовки); ссылки ДРУГИХ заметок на исходные заголовки
+      перенаправляет fix_links_after_merge();
+    - merged_from хранит заголовки исходных заметок.
 
-    Объединение UPDATE-черновиков (append_section) не поддерживается —
-    у них нет самостоятельного body_md для рендера как раздела.
+    note_id объединённого драфта пуст: исходный план для объединённой
+    структуры не актуален, validate_headings_coverage для него — no-op.
+
+    Исключения (ValueError): меньше 2 уникальных индексов; индекс вне
+    диапазона; среди выбранных есть action != create.
     """
     sorted_idx = sorted(set(indices))
     if len(sorted_idx) < 2:
@@ -75,26 +98,45 @@ def merge_drafts(
     if non_create:
         raise ValueError(f"Объединение поддерживается только для action=create: {', '.join(non_create)}")
 
-    body_parts, all_tags, all_links, all_sources = [], [], [], []
-    any_needs_review, max_critic_rounds = False, 0
+    title = merged_title.strip() or " + ".join(d.title for d in sources)
+    folder = sources[0].folder
+    path = merged_path.strip() or build_note_path(folder, title)
+
+    internal_keys = {normalize_link_title(d.title) for d in sources} | {normalize_link_title(title)}
+
+    body_parts: list[str] = []
+    all_tags: list[str] = []
+    all_links: list[str] = []
+    all_sources: list[str] = []
+    all_unverified: list[str] = []
+    merged_from: list[str] = []
+    any_needs_review, any_humanities, max_critic_rounds = False, False, 0
 
     for d in sources:
-        body_parts.append(f"## {d.title}\n\n{_shift_headings(d.body_md.strip())}")
+        body, had_callout = _strip_humanities_callout(d.body_md.strip())
+        any_humanities = any_humanities or had_callout
+        body = close_unbalanced_fence(body)
+        body_parts.append(f"## {d.title}\n\n{_shift_headings(body)}")
+
         for t in d.tags:
             if t not in all_tags:
                 all_tags.append(t)
         for link in d.links_out:
-            if link not in all_links:
-                all_links.append(link)
+            if normalize_link_title(link) in internal_keys or link in all_links:
+                continue
+            all_links.append(link)
         for ref in d.source_refs:
             if ref not in all_sources:
                 all_sources.append(ref)
+        for heading in d.unverified_sections:
+            if heading not in all_unverified:
+                all_unverified.append(heading)
+        merged_from.extend(d.merged_from or [d.title])
         any_needs_review = any_needs_review or d.needs_review
         max_critic_rounds = max(max_critic_rounds, d.critic_rounds)
 
-    title = merged_title.strip() or " + ".join(d.title for d in sources)
-    folder = sources[0].folder
-    path = merged_path.strip() or build_note_path(folder, title)
+    if any_humanities:
+        body_parts.insert(0, HUMANITIES_CALLOUT)
 
     return DraftNote(
         note_id="",
@@ -109,8 +151,36 @@ def merge_drafts(
         source_refs=all_sources,
         critic_rounds=max_critic_rounds,
         needs_review=any_needs_review,
+        unverified_sections=all_unverified,
+        merged_from=merged_from,
     )
 
+
+def fix_links_after_merge(drafts: list[DraftNote]) -> list[DraftNote]:
+    """Проход по links_out ПОСЛЕ apply_merges/merge_all_drafts: ссылки на
+    заголовки, ушедшие в объединённую заметку, перенаправляются на её
+    заголовок (по DraftNote.merged_from); самоссылки и дубли удаляются.
+    Нужен отдельным шагом: заметка вне группы слияния может ссылаться на
+    заголовок, который теперь живёт в чужой объединённой заметке.
+    Если слияний не было (ни у кого нет merged_from) — возвращает drafts
+    без изменений."""
+    redirects = {
+        normalize_link_title(old): d.title for d in drafts for old in d.merged_from
+    }
+    if not redirects:
+        return drafts
+
+    result: list[DraftNote] = []
+    for d in drafts:
+        own = normalize_link_title(d.title)
+        new_links: list[str] = []
+        for link in d.links_out:
+            target = redirects.get(normalize_link_title(link), link)
+            if normalize_link_title(target) == own or target in new_links:
+                continue
+            new_links.append(target)
+        result.append(d.model_copy(update={"links_out": new_links}) if new_links != d.links_out else d)
+    return result
 
 def apply_merges(drafts: list[DraftNote], merge_groups: list[tuple[list[int], str]]) -> list[DraftNote]:
     """Применяет НЕСКОЛЬКО непересекающихся групп слияния за один проход.

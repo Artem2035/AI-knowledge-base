@@ -115,7 +115,10 @@ def test_full_flow_produces_valid_changeset(tmp_path, monkeypatch):
 
     assert not result.stopped
     assert result.changeset.validation.ok, [i.message for i in result.changeset.validation.errors]
-    assert len(result.changeset.creates) == 2 and not result.changeset.updates
+    assert len(result.changeset.creates) == 3 and not result.changeset.updates
+    moc = [d for d in result.changeset.creates if d.is_moc]
+    assert len(moc) == 1 and moc[0].title == "Quokka topic — обзор"
+    assert moc[0].links_out == [_TITLE_A, _TITLE_B]
 
     draft_a = next(d for d in result.changeset.creates if d.title == _TITLE_A)
     assert draft_a.path == f"Знания/Quokka topic/{_TITLE_A}.md"
@@ -196,3 +199,4 @@ def test_merge_callback_runs_before_relationships(tmp_path, monkeypatch):
     # заметку; relationships строятся по ИТОГОВЫМ черновикам
     paths = {d.path for d in result.changeset.creates}
     assert all(r.from_note in paths for r in result.changeset.relationships)
+    assert not any(d.is_moc for d in result.changeset.creates)
