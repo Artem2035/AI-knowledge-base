@@ -21,7 +21,7 @@ from llm.prompts.annotator import SYSTEM_INSTRUCTION
 from llm.schemas import AnnotationBatchOutput
 from storage.models import NoteAnnotation, OutlineNote, Plan, SectionDraft, TaskStatus
 from tools.markdown_tools import normalize_link_title, snap_link
-from tools.note_assembly import ABSTRACT_MIN_SECTIONS
+from tools.note_assembly import ABSTRACT_MIN_SECTIONS, plain_text
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,6 @@ _SECTION_DIGEST_CHARS = 160
 _MIN_SECTION_DIGEST_CHARS = 40
 _NOTE_DIGEST_MAX_CHARS = 1500
 
-_CODE_RE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)  # в т.ч. незакрытый fence
 _TAG_BAD_CHARS_RE = re.compile(r"[^\w\-/]", re.UNICODE)
 
 
@@ -45,18 +44,6 @@ class AnnotationUnit:
     note: OutlineNote
     digest: str
     wants_abstract: bool
-
-
-def _plain_text(markdown: str) -> str:
-    """Текст секции без кода, таблиц, заголовков и маркеров callout."""
-    text = _CODE_RE.sub(" ", markdown)
-    lines = []
-    for ln in text.splitlines():
-        stripped = ln.strip()
-        if not stripped or stripped.startswith(("|", "#", "> [!")):
-            continue
-        lines.append(stripped.lstrip("> ").strip())
-    return re.sub(r"[*`]", "", " ".join(lines))
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -75,7 +62,7 @@ def build_digest(note: OutlineNote, sections: list[SectionDraft]) -> str:
     lines = [f"Заметка: {note.title}"]
     for sp in note.subpoints:
         sec = by_subpoint.get(sp.subpoint_id)
-        start = _truncate(_plain_text(sec.markdown), per_section) if sec else ""
+        start = _truncate(plain_text(sec.markdown), per_section) if sec else ""
         lines.append(f"- {sp.heading}: {start}" if start else f"- {sp.heading}")
     return "\n".join(lines)
 

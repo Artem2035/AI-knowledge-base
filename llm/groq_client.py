@@ -105,13 +105,11 @@ _REASONING_EFFORT_SUPPORTED_MODELS = {"openai/gpt-oss-20b", "openai/gpt-oss-120b
 _REASONING_EFFORT_BY_ROLE: dict[str, str] = {
     "folder_assignment": "low",
     "vault_dedup": "low",
-    "critic": "low",
-    "synthesizer_write": "medium",
-    # Замер (probe): medium даёт +28% токенов на вызов за счёт reasoning
-    # (701 против 102), видимый текст тот же. Качество кода проверяется на приёмке.
-    "elaborator": "low",
+    "elaborator": "low", #medium
     "annotator": "low",
 }
+# Замер (probe): medium даёт +28% токенов на вызов за счёт reasoning
+# (701 против 102), видимый текст тот же. Качество кода проверяется на приёмке.
 
 def _to_strict_json_schema(schema: dict) -> dict:
     """Рекурсивно приводит JSON Schema из Pydantic model_json_schema() к виду,

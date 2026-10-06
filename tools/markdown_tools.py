@@ -116,7 +116,7 @@ _NO_LINK_LINE_RE = re.compile(r"^(?:\s{0,3}#{1,6}(?:\s|$)|\s*\||\s*>\s*\[!)")
 # Фрагменты внутри строки, которые не трогаем: inline-код, формулы, [[ссылки]],
 # markdown-ссылки, URL. Группа ОДНА (захватывающая): re.split возвращает
 # чередование «обычный текст / защищённый фрагмент».
-_PROTECTED_SPAN_RE = re.compile(
+PROTECTED_SPAN_RE = re.compile(
     r"(`[^`\n]*`|\$\$[^$\n]*\$\$|\$[^$\n]+\$|\[\[[^\]\n]*\]\]"
     r"|\[[^\]\n]*\]\([^)\n]*\)|https?://\S+|www\.\S+)"
 )
@@ -136,7 +136,7 @@ def _link_first_occurrence(lines: list[str], pattern: re.Pattern, title: str) ->
             continue
         if in_math or _NO_LINK_LINE_RE.match(line):
             continue
-        parts = _PROTECTED_SPAN_RE.split(line)
+        parts = PROTECTED_SPAN_RE.split(line)
         for j in range(0, len(parts), 2):  # чётные элементы — обычный текст
             new, n = pattern.subn(lambda _m: f"[[{title}]]", parts[j], count=1)
             if n:

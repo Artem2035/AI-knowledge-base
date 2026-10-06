@@ -338,7 +338,6 @@ class Orchestrator:
                 domain=plan.domain,
                 default_folder=f"{self.settings.default_notes_folder}/{slugify_filename(plan.topic_title)}".strip("/"),
                 existing_paths=self.db.get_all_paths(),
-                mark_source=mark_source,
             )
             if moc is not None:
                 drafts.insert(0, moc)

@@ -4,9 +4,10 @@ from storage.models import OutlineNote, OutlineSubpoint, SectionDraft, NoteAnnot
 from tools.note_assembly import (
     PLACEHOLDER_MARKDOWN, add_domain_tag, assemble_note_markdown, close_unbalanced_fence,
     has_balanced_fences, normalize_headings, prepare_section, strip_leading_duplicate_heading, build_draft_note,
-    apply_inline_links, build_moc,
+    apply_inline_links, build_moc, first_sentence,
 )
 
+_CODE_ONLY = "```python\nx = 1\n```"
 
 def _note(n: int = 2) -> OutlineNote:
     return OutlineNote(title="N", subpoints=[
@@ -165,7 +166,8 @@ def test_apply_inline_links_links_target_but_not_self_update_or_moc():
 
 
 def test_build_moc_lists_creates_with_abstract_and_tags():
-    a, b = _draft("A", "n1"), _draft("B", "n2")
+    a = _draft("A", "n1")
+    b = _draft("B", "n2").model_copy(update={"body_md": _CODE_ONLY})  # описание не извлекается
     ann = {"n1": NoteAnnotation(note_id="n1", abstract="Кратко\nо A")}
     moc = build_moc(_plan(), [a, b], ann, domain="technical",
                     default_folder="Знания/Тема", existing_paths=set())
@@ -173,7 +175,11 @@ def test_build_moc_lists_creates_with_abstract_and_tags():
     assert moc.is_moc and moc.title == "Тема — обзор"
     assert moc.path == "Знания/Тема/Тема — обзор.md"
     assert moc.links_out == ["A", "B"] and moc.tags == ["moc", "domain/technical"]
-    assert moc.body_md == "Резюме темы.\n\n## Заметки\n\n- [[A]] — Кратко о A\n- [[B]]"
+    assert moc.body_md == (
+        "> [!abstract] Кратко\n> Резюме темы.\n\n"
+        "## Заметки\n\n- [[A]] — Кратко о A\n- [[B]]"
+    )
+
 
 
 def test_build_moc_none_when_fewer_than_two_creates():
@@ -189,3 +195,50 @@ def test_build_moc_avoids_path_collision():
                        existing_paths={"Знания/Тема/Тема — обзор.md"})
     assert result.title == "Тема — обзор (2)"
     assert result.path == "Знания/Тема/Тема — обзор (2).md"
+
+def test_prepare_section_fixes_latin_homoglyph_in_cyrillic_word():
+    text, _ = prepare_section("Это одн\u006fмерная выборка.")  # латинская o
+    assert text == "Это одн\u043eмерная выборка."              # кириллическая о
+
+
+def test_prepare_section_keeps_identifiers_and_mixed_words():
+    src = "Библиотека numpy, DataFrame, pandas и значениеDF."
+    assert prepare_section(src)[0] == src
+
+
+def test_prepare_section_does_not_touch_code():
+    src = "Код `одн\u006f` тут.\n\n```python\nн\u006f = 1\n```"
+    assert prepare_section(src)[0] == src
+
+
+def test_prepare_section_replaces_non_breaking_hyphen_outside_code_only():
+    text, _ = prepare_section("кросс\u2011валидация\n\n```\na\u2011b\n```")
+    assert "кросс-валидация" in text
+    assert "a\u2011b" in text
+
+
+def test_build_moc_has_no_source_and_skips_empty_summary():
+    plan = Plan(task_id="t", topic_title="Тема", summary="", domain="technical")
+    moc = build_moc(plan, [_draft("A"), _draft("B")], {}, domain="technical",
+                    default_folder="Знания", existing_paths=set())
+    assert "source" not in moc.frontmatter
+    assert moc.body_md.startswith("## Заметки")
+
+
+def test_build_moc_description_skips_callouts_placeholder_and_unwraps_links():
+    body = (
+        "> [!warning] Требует проверки\n> Детали раздела могут быть неточными.\n\n"
+        f"## Р\n\n{PLACEHOLDER_MARKDOWN}\n\n"
+        "## Р2\n\nПервое предложение про [[B]]. Второе предложение."
+    )
+    a = _draft("A").model_copy(update={"body_md": body})
+    b = _draft("B").model_copy(update={"body_md": _CODE_ONLY})
+    moc = build_moc(_plan(), [a, b], {}, domain="technical",
+                    default_folder="Знания", existing_paths=set())
+    assert "- [[A]] — Первое предложение про B.\n" in moc.body_md
+
+
+def test_first_sentence_does_not_split_on_abbreviation_and_truncates():
+    assert first_sentence("Это т.е. значение по умолчанию. Дальше.") == "Это т.е. значение по умолчанию."
+    long = first_sentence("слово " * 60)
+    assert long.endswith("…") and len(long) <= 151

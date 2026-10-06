@@ -119,6 +119,7 @@ def test_full_flow_produces_valid_changeset(tmp_path, monkeypatch):
     moc = [d for d in result.changeset.creates if d.is_moc]
     assert len(moc) == 1 and moc[0].title == "Quokka topic — обзор"
     assert moc[0].links_out == [_TITLE_A, _TITLE_B]
+    assert "source" not in moc[0].frontmatter
 
     draft_a = next(d for d in result.changeset.creates if d.title == _TITLE_A)
     assert draft_a.path == f"Знания/Quokka topic/{_TITLE_A}.md"

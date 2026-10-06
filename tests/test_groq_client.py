@@ -216,11 +216,11 @@ def test_groq_passes_reasoning_params_only_for_supported_model(monkeypatch):
 
     status = TaskStatus(task_id="r1")
     supported = GroqClient(settings=_settings(groq_model="openai/gpt-oss-120b"), budget=LLMBudget(5, 100, 100))
-    supported.generate_structured(role="critic", prompt="p", response_model=_DummyOutput, status=status)
+    supported.generate_structured(role="vault_dedup", prompt="p", response_model=_DummyOutput, status=status)
     assert captured[-1]["extra_body"] == {"include_reasoning": False, "reasoning_effort": "low"}
 
     other = GroqClient(settings=_settings(groq_model="qwen/qwen3.8-27b"), budget=LLMBudget(5, 100, 100))
-    other.generate_structured(role="critic", prompt="p", response_model=_DummyOutput, status=status)
+    other.generate_structured(role="vault_dedup", prompt="p", response_model=_DummyOutput, status=status)
     assert "extra_body" not in captured[-1]
 
 # ---------------------------------------------------------------------------

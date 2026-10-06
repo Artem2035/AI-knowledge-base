@@ -37,5 +37,10 @@ OUTLINE_PLANNER_SYSTEM_INSTRUCTION = (
     "   Do not force every kind into every note — use only those the topic "
     "needs; a missing kind is better than an empty one. Field names and "
     "enum values stay exactly as in the schema (never translate them).\n\n"
+    "7. Fill `summary` with one paragraph (about 4-6 sentences) that lets "
+    "a reader who knows nothing about the topic understand what it is, why "
+    "it matters, and what the set of notes covers and how the notes relate "
+    "to each other. Continuous prose, no lists, no headings. Do not give "
+    "specific numbers, dates, versions or names unless you are sure.\n\n"
     + LANGUAGE_RULE
 )
