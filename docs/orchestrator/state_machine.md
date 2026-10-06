@@ -1,201 +1,108 @@
 # Документация: `orchestrator/state_machine.py` — не-LLM конечный автомат задачи
 
-> Reference-док. Обзор пакета — `_index.md`. Исключения/бюджет вызовов —
-> `budget.md`. Сам процесс одного запроса (что вызывается в каком порядке и
-> что через что течёт) описан отдельно, в `../flows/llm_cycle.md` — там же
-> ссылки сюда за деталями конкретных сигнатур. Общие структуры данных
-> (`Plan`, `DraftNote`, `TaskStatus` и т.д.) — в `../storage/models.md`,
-> здесь не дублируются.
+> Reference-док. Обзор пакета — `_index.md`. Бюджет и исключения — `budget.md`. Порядок и содержимое шагов одного запроса — `../flows/llm_cycle.md`. Структуры данных — `../storage/models.md`.
 
-**Назначение (из докстринга модуля).** Чистый Python, который: понимает
-пользовательский запрос (нормализует `Task`); вызывает роли в фиксированной
-последовательности; прокидывает структурированные данные между этапами;
-контролирует бюджет LLM-вызовов и останавливается при исчерпании лимита
-(без fallback на платный tier); персистит прогресс после каждого шага
-(`staging/checkpoint.py`, см. `../staging/checkpoint.md §2`), чтобы задачу
-можно было продолжить позже (`resume <task_id>`); никогда сам не пишет в
-реальный Vault (это `staging/commit.py`, только после явного `approve`).
+**Назначение.** Чистый Python, который: нормализует запрос в `Task`; вызывает роли в фиксированной последовательности; прокидывает между этапами структурированные данные; контролирует бюджет LLM-вызовов и останавливается при его исчерпании (без fallback на платный tier); **сохраняет прогресс после каждого шага и батча** (`../staging/checkpoint.md`), чтобы задачу можно было продолжить через `resume <task_id>`; сам никогда не пишет в реальный Vault (это `staging/commit.py` после `approve`).
 
-Важный нюанс про бюджет при resume: `MAX_LLM_CALLS_PER_TASK` — лимит на
-ОДНУ СЕССИЮ/ПОПЫТКУ (`status.llm_calls_used` обнуляется в начале каждого
-вызова `run()`, в т.ч. при resume), а не на задачу за всё её время жизни.
-Иначе после однократного исчерпания лимита задачу нельзя было бы продолжить
-никогда. Накопительный расход по всем попыткам хранится отдельно в
-`TaskCheckpoint.total_llm_calls_used` (`../staging/checkpoint.md §2.2`) —
-только для отчёта пользователю.
+**Бюджет при resume.** `MAX_LLM_CALLS_PER_TASK` — лимит на одну **сессию**: `status.llm_calls_used` обнуляется в начале каждого `run()`, в том числе при resume. Накопительный расход по всем попыткам хранится в `TaskCheckpoint.total_llm_calls_used` (только для отчёта).
 
 ## 1. `KNOWLEDGE_MODE_FRONTMATTER_SOURCE: str = "model-knowledge"`
 
-**Описание.** Пометка `frontmatter.source` (см.
-`tools/markdown_tools.py::_ALLOWED_FRONTMATTER_KEYS`,
-`../tools/markdown_tools.md §1`) для заметок, написанных в
-`RESEARCH_MODE=knowledge` — без внешних проверяемых источников. Совпадает
-по смыслу, но не по значению написания, с
-`roles/elaborator.py::MODEL_KNOWLEDGE_SOURCE_ID = "model_knowledge"`
-(`../roles/elaborator.md`): одна константа маркирует `Evidence` (внутренний
-объект), другая — YAML frontmatter итоговой заметки (видимое пользователю
-значение).
+Значение `frontmatter.source` для заметок, написанных без внешних источников. Передаётся в `build_draft_note(mark_source=…)`. **MOC этого ключа не получает** (`build_moc` больше не принимает `mark_source`), поэтому diff не помечает MOC как «без внешних источников». Константа `roles/elaborator.py::MODEL_KNOWLEDGE_SOURCE_ID` относилась к удалённому `Evidence`.
 
 ## 2. `class OrchestratorStopped(Exception)`
 
-**Описание.** Управляемая остановка задачи — например, чекпоинт не найден
-или битый при resume, либо `settings.research_mode == "web"` (сейчас явно
-не поддерживается, см. §4). Прогресс сохранён (кроме случая, когда сам
-чекпоинт оказался нечитаем).
-
-**Конструктор:** `__init__(self, message: str, task_id: str)` — сохраняет
-`self.task_id` дополнительно к стандартному сообщению `Exception`.
+Управляемая остановка: чекпоинт не найден, повреждён или другой версии при resume; либо `settings.research_mode == "web"` (заблокирован). Конструктор `__init__(message, task_id)`.
 
 ## 3. `class RunResult` (dataclass)
-
-**Описание.** Результат вызова `Orchestrator.run(...)`.
-
-**Поля:**
 
 | Поле | Тип | Назначение |
 |---|---|---|
 | `task_id` | `str` | Идентификатор задачи. |
-| `changeset` | `StagingChangeset \| None` | `None`, если задача остановлена (не дошла до staging). |
-| `status` | `TaskStatus` | Счётчик LLM-вызовов ЭТОЙ сессии. |
-| `stopped` | `bool` | `True` — остановлена по бюджету/лимиту/отказу пользователя утвердить план. |
-| `message` | `str` | Человекочитаемое сообщение (для CLI). |
+| `changeset` | `StagingChangeset \| None` | `None`, если задача остановлена до staging. |
+| `status` | `TaskStatus` | Счётчик вызовов этой сессии. |
+| `stopped` | `bool` | `True`: остановка по бюджету, лимиту или отказу утвердить план. |
+| `message` | `str` | Сообщение для CLI. |
 
 ## 4. `class Orchestrator`
 
 ### `__init__(self, settings: Settings)`
+Проверяет `FREE_ONLY`, создаёт рабочие каталоги, открывает `VaultDB`, пробует создать эмбеддер (`try_create_embedder`), строит два `LLMBudget` и два клиента через `llm/factory.py`. Клиент extraction создаётся с `primary_client=self.llm`: при совпадающей модели он делит `TokenRateLimiter` с основным (`../llm/core.md §3.3`).
 
-**Описание.** Инициализирует всё, что нужно для одного запуска задачи:
-проверяет `FREE_ONLY` (`settings.validate_free_only()`), создаёт рабочие
-директории (`settings.ensure_dirs()`), открывает `VaultDB`, пытается
-создать локальный эмбеддер, строит ДВА `LLMBudget` (`budget.md §3`,
-основной и extraction) и через `llm/factory.py` (`../llm/core.md §3`)
-создаёт два LLM-клиента.
+| Атрибут | Назначение |
+|---|---|
+| `self.db` | `VaultDB`. |
+| `self.embedder` | `LocalEmbedder \| None`. |
+| `self.budget` / `self.llm` | Основной бюджет и клиент: planner, vault_dedup, folder_assignment, annotator. |
+| `self.extraction_budget` / `self.extraction_client` | Бюджет и клиент для Elaborator. |
 
-**Параметры:** `settings: Settings` (см. `../config/settings.md`).
-
-**Возвращаемое значение:** — (конструктор).
-
-**Исключения:**
-- `RuntimeError` — если `settings.free_only=False`.
-- `RuntimeError` — если ключ провайдера пуст (поднимается внутри
-  конструктора конкретного клиента, см. `../llm/groq_client.md`).
-
-**Ключевые атрибуты после инициализации:**
-
-| Атрибут | Тип | Назначение |
-|---|---|---|
-| `self.db` | `VaultDB` | Локальный индекс Vault (`../vault/db.md`). |
-| `self.embedder` | `LocalEmbedder \| None` | Локальные эмбеддинги (`../tools/dedup.md §1`). |
-| `self.budget` | `LLMBudget` | Общий бюджет вызовов основного клиента (`budget.md §3`). |
-| `self.llm` | `LLMClient`-совместимый объект | Основной клиент — planning, критик, vault-dedup, folder assignment, writer. |
-| `self.extraction_budget` | `LLMBudget` | Отдельный бюджет для extraction/elaboration. |
-| `self.extraction_client` | `LLMClient`-совместимый объект | Клиент для `roles/elaborator.py`. |
-
-Оба клиента создаются через `llm/factory.py::create_llm_client` /
-`create_extraction_llm_client` (`../llm/core.md §3`) — конкретный тип
-(`GroqClient`) `Orchestrator` не знает и не должен знать
-(`llm/base.py::LLMClient` Protocol, `../llm/core.md §1`).
+**Исключения:** `RuntimeError` при `free_only=False` или пустом ключе провайдера.
 
 ### `close(self) -> None`
-
-Закрывает соединение с `VaultDB`. Вызывается в `finally` в `cli/main.py`
-(`../cli/main.md`).
+Закрывает `VaultDB` (вызывается в `finally` в `cli/main.py`).
 
 ### `sync_vault_index(self) -> dict`
-
-**Описание.** Инкрементальная переиндексация Vault. Не использует LLM.
-Вызывается в начале `run()` перед любыми LLM-шагами.
-
-**Возвращаемое значение:** `dict` со статистикой (`scanned`, `updated`,
-`unchanged`, `removed`) — см. `vault/index.py::VaultIndexer.sync`,
-`../vault/index.md`.
+Инкрементальная переиндексация Vault без LLM: `VaultIndexer.sync()` + `resolve_wikilink_targets()`. Возвращает статистику `scanned/updated/unchanged/removed`.
 
 ### `run(self, raw_query=None, *, resume_task_id=None, progress_cb=None, plan_confirm_cb=None, merge_confirm_cb=None) -> RunResult`
 
-**Описание.** Главный метод — выполняет весь workflow задачи до этапа
-`staging` включительно. Порядок и содержимое самих шагов (planning →
-elaborating → vault analysis → synthesis → validation → staging) — см.
-`../flows/llm_cycle.md`, здесь описан только сам метод как API.
+Выполняет workflow до staging включительно. Порядок (подробности — `../flows/llm_cycle.md`):
 
-**Параметры:**
+1. индексация Vault (всегда, без LLM);
+2. **planning** → `checkpoint.plan`, `persist("planned")`;
+3. **утверждение плана** `plan_confirm_cb` (один раз на задачу, флаг `plan_approved`); отказ → остановка, `persist("planned")`;
+4. **elaboration** батчами, после каждого `persist("elaborating")`, в конце `elaboration_done`;
+5. **vault analysis** (`vault_analysis_done`);
+6. **annotation** батчами, `persist("annotating")`, в конце `annotation_done`;
+7. **сборка** `build_draft_note` по каждой заметке плана (`mark_source="model-knowledge"`);
+8. **слияние** `merge_confirm_cb(drafts)` и затем `fix_links_after_merge` — только если `settings.enable_draft_merging` **и** колбэк передан;
+9. **inline-ссылки** `apply_inline_links` для каждого черновика;
+10. **MOC** `build_moc(...)`; если вернулся не `None`, ставится первым в список;
+11. **relationships** `build_relationships(drafts)` — после слияния и MOC;
+12. **validation** `run_validation(changeset, db, allow_delete, plan=plan)`;
+13. **staging** `save_changeset`, затем `delete_checkpoint`.
 
-| Имя | Тип | Назначение |
+Шаги 7–13 не имеют состояния и выполняются заново при каждом запуске (в том числе при resume); `DraftNote` в чекпоинте не хранятся.
+
+| Параметр | Тип | Назначение |
 |---|---|---|
-| `raw_query` | `str \| None` | Запрос пользователя. Обязателен, если `resume_task_id is None`. |
-| `resume_task_id` | `str \| None` | `task_id` для продолжения. |
-| `progress_cb` | `Callable[[str], None] \| None` | Вызывается на каждом крупном шаге с человекочитаемой меткой. |
-| `plan_confirm_cb` | `Callable[[Plan], bool] \| None` | Вызывается РОВНО ОДИН РАЗ на задачу (флаг `checkpoint.plan_approved`) сразу после построения/загрузки `Plan`, ДО самого дорогого этапа (elaboration). Если вернул `False` — контролируемая остановка, план (1 дешёвый вызов) уже сохранён. Если не передан — план утверждается автоматически. |
-| `merge_confirm_cb` | `Callable[[list[DraftNote]], list[DraftNote]] \| None` | Вызывается после Writer+Critic, ДО validation/staging, только если `settings.enable_draft_merging=True`. |
+| `raw_query` | `str \| None` | Обязателен без `resume_task_id`. |
+| `resume_task_id` | `str \| None` | Продолжить задачу. |
+| `progress_cb` | `Callable[[str], None] \| None` | Метка прогресса. |
+| `plan_confirm_cb` | `Callable[[Plan], bool] \| None` | Без колбэка план утверждается автоматически. |
+| `merge_confirm_cb` | `Callable[[list[DraftNote]], list[DraftNote]] \| None` | Работает только при `enable_draft_merging=True`. |
 
-**Возвращаемое значение:** `RunResult` (см. §3).
+**Ловятся внутри:** `LLMFreeLimitReached`, `LLMTaskBudgetExceeded`: `persist(checkpoint.last_completed_stage)` и `RunResult(stopped=True)` с командой resume.
 
-**Исключения, которые ловятся ВНУТРИ метода (не всплывают наружу):**
-`LLMFreeLimitReached`, `LLMTaskBudgetExceeded` (`budget.md §1–2`) — в обоих
-случаях сохраняется чекпоинт на последнем успешном шаге и возвращается
-`RunResult(stopped=True, ...)`.
+**Поднимаются наружу:** `OrchestratorStopped` (web-режим или нет чекпоинта), `ValueError` (нет ни `raw_query`, ни `resume_task_id`).
 
-**Исключения, которые поднимаются наружу:**
-- `OrchestratorStopped` — если `settings.research_mode == "web"` (сейчас не
-  поддерживается — миграция на новую структуру плана не завершена), либо
-  если `_load_or_create_state` не нашёл чекпоинт при resume.
-- `ValueError` — если ни `raw_query`, ни `resume_task_id` не переданы.
+**Нюанс:** проверка `research_mode == "web"` выполняется после `_load_or_create_state`, поэтому для новой задачи пустой чекпоинт успевает сохраниться до `OrchestratorStopped`. На работу не влияет (виден в `resumable` как шаг `created`).
 
-**Локальные функции внутри `run`:**
-- `report(stage: str) -> None` — прокси к `progress_cb`, если он передан.
-- `persist(stage_label: str) -> None` — сохраняет `TaskCheckpoint` на диск
-  немедленно после шага (обновляет `last_completed_stage`, `status`,
-  `total_llm_calls_used`). Вызывается очень часто (после каждого батча
-  elaboration, после каждой написанной заметки) — это и есть механизм
-  resume.
+**Локальные функции:** `report(stage)` — прокси к `progress_cb`; `persist(stage_label)` — сохраняет чекпоинт (обновляет `last_completed_stage`, `status`, `total_llm_calls_used`). Вызывается после каждого батча — это и есть механизм resume.
 
 ### `_load_or_create_state(self, *, raw_query, resume_task_id, report) -> tuple[TaskCheckpoint, Task, TaskStatus, int]`
+Загружает чекпоинт (resume) или создаёт `Task`/`TaskStatus`/`TaskCheckpoint` и сразу сохраняет его. Возвращает `(checkpoint, task, status, base_total_calls)`; `status` всегда новый (`llm_calls_used=0`).
 
-**Описание.** Приватный метод: либо загружает существующий `TaskCheckpoint`
-с диска (при resume), либо создаёт новый `Task`/`TaskStatus`/`TaskCheckpoint`
-(при новом запросе).
-
-**Параметры:**
-
-| Имя | Тип | Назначение |
-|---|---|---|
-| `raw_query` | `str \| None` | См. `run()`. |
-| `resume_task_id` | `str \| None` | См. `run()`. |
-| `report` | `Callable[[str], None]` | Локальная функция логирования прогресса из `run()`. |
-
-**Возвращаемое значение:** `(checkpoint, task, status, base_total_calls)`:
-
-| Элемент | Тип | Назначение |
-|---|---|---|
-| `checkpoint` | `TaskCheckpoint` | Персистентное состояние задачи (`../staging/checkpoint.md §2`). |
-| `task` | `Task` | `task_id`, `raw_query`, `language`. |
-| `status` | `TaskStatus` | Счётчик вызовов ТЕКУЩЕЙ сессии — обнуляется даже при resume. |
-| `base_total_calls` | `int` | Сколько вызовов было потрачено во ВСЕХ предыдущих сессиях (только для отчёта). |
-
-**Исключения:**
-- `OrchestratorStopped` — если `resume_task_id` передан, но
-  `load_checkpoint(...)` вернул `None` (не найден/битый/несовместимая
-  версия).
-- `ValueError` — если ни `raw_query`, ни `resume_task_id` не переданы.
+**Исключения:** `OrchestratorStopped` — чекпоинт не найден/повреждён/другой версии; `ValueError` — нет `raw_query`.
 
 ---
 
-## Сводная таблица: какие поля `Settings` читает этот модуль
+## Какие поля `Settings` читает модуль
 
-| Поле `Settings` | Где используется |
+| Поле | Где |
 |---|---|
-| `free_only` | `Orchestrator.__init__` → `validate_free_only()` |
-| `workdir`/`staging_dir`/`checkpoint_dir`/`db_path` | `Orchestrator.__init__` → `ensure_dirs()` |
-| `embedding_model`, `use_local_embeddings` | `Orchestrator.__init__` → `try_create_embedder` |
-| `llm_provider` | `Orchestrator.__init__` → `budget_limits_for_provider`/`create_llm_client` |
-| `max_llm_calls_per_task` | `LLMBudget.__init__` (оба бюджета) |
-| `groq_extraction_model` (через `extraction_budget_limits`) | `Orchestrator.__init__` |
-| `research_mode` | `Orchestrator.run()` — блокирует `"web"` |
-| `enable_draft_merging`, `draft_merge_mode` | `Orchestrator.run()` — вызов `merge_confirm_cb` |
-| `default_notes_folder` | `Orchestrator.run()` — построение `topic_folder` для Vault Analyst |
-| `dedup_high_threshold`, `dedup_low_threshold` | `Orchestrator.run()` → `vault_analyst.resolve_notes_against_vault` |
-| `max_subpoints_per_generation_batch` | `Orchestrator.run()` → `elaborator.elaborate_outline` |
-| `max_critic_rounds` | `Orchestrator.run()` → `critic.run_critic_cycle` |
-| `allow_delete` | `Orchestrator.run()` → `run_validation` |
+| `free_only`, пути (`workdir`, `staging_dir`, `checkpoint_dir`, `db_path`) | `__init__` |
+| `embedding_model`, `use_local_embeddings` | `__init__` |
+| `llm_provider`, `max_llm_calls_per_task`, `groq_*` soft-лимиты | `__init__` (через `llm/factory.py`) |
+| `research_mode` | `run()` — блокирует `"web"`, выбирает `mark_source` |
+| `max_subpoints_per_generation_batch` | `run()` → `elaborate_outline` |
+| `default_notes_folder` | `run()` — папка темы для Vault Analyst и MOC |
+| `dedup_high_threshold`, `dedup_low_threshold` | `run()` → `resolve_notes_against_vault` |
+| `enable_draft_merging` | `run()` — шаг слияния |
+| `allow_delete` | `run()` → `run_validation` |
+| `language` | `_load_or_create_state` |
+| `llm_provider` | подписи прогресса |
 
-Документация по `orchestrator/state_machine.py` завершена. Продолжение
-(workflow одного запроса целиком) — см. `../flows/llm_cycle.md`.
+`max_critic_rounds` модулем больше не используется (Critic удалён). `draft_merge_mode` читает `cli/main.py`.
+
+Документация по `orchestrator/state_machine.py` завершена. Далее — `../flows/llm_cycle.md`.

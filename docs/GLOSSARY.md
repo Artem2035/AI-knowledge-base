@@ -1,52 +1,53 @@
 # Глоссарий
 
-> Короткие определения терминов, которые встречаются во всей документации.
-> Не заменяет reference — для полного контракта смотрите указанный документ.
+> Короткие определения терминов. Не заменяет reference: полный контракт смотрите в указанном документе.
 
-## Данные, летающие между этапами
+## Данные между этапами
 
-| Термин | Что это | Где полный контракт |
+| Термин | Что это | Где контракт |
 |---|---|---|
 | **Task** | Исходный запрос пользователя, нормализованный кодом. | `storage/models.md §1.1` |
-| **Plan** | Дерево заметок (`OutlineNote`) с подпунктами (`OutlineSubpoint`) — результат Planner-а. | `storage/models.md §1.4` |
-| **Evidence** | Одно атомарное утверждение/факт, привязанное к разделу заметки плана. Единый формат для web- и knowledge-режимов. | `storage/models.md §3.1` |
-| **ExistingNote** | Существующая заметка Vault, найденная локальным retrieval-ом как кандидат на дедупликацию. | `storage/models.md §4.1` |
-| **DraftNote** | Черновик одной заметки — итог Writer+Critic, единица staging-changeset-а. | `storage/models.md §5.2` |
-| **Relationship** | Одна связь (wikilink/tag/backlink) между заметками. | `storage/models.md §5.3` |
-| **ValidationIssue / ValidationReport** | Одна найденная проблема / итог полного прогона детерминированной валидации. | `storage/models.md §6.1–6.2` |
-| **StagingChangeset** | То, что предлагается применить к реальному Vault — creates/updates/deletes + validation. | `storage/models.md §6.3` |
-| **TaskStatus** | Счётчик LLM-вызовов ТЕКУЩЕЙ сессии, передаётся по ссылке через весь цикл вызова. | `storage/models.md §7.2` |
-| **TaskCheckpoint** | Персистентный снимок состояния задачи на диске — механизм `resume`. | `staging/checkpoint.md §2` |
+| **Plan** | Тема, домен, абзац-резюме и дерево заметок (`OutlineNote`) с подпунктами (`OutlineSubpoint`). | `storage/models.md §1.4` |
+| **domain** | Область темы: `technical`, `humanities`, `life_management`. Выбирает инструкцию Elaborator и добавляет тег `domain/<домен>`. | `storage/models.md §1.0` |
+| **kind** | Тип раздела (подпункта): допустимые значения зависят от домена, универсальный `other`. | `storage/models.md §1.0` |
+| **SectionDraft** | Готовый markdown одного подпункта (результат Elaborator). | `storage/models.md §2.2` |
+| **NoteAnnotation** | Теги, ссылки и резюме заметки (результат Annotator). | `storage/models.md §2.3` |
+| **DraftNote** | Черновик заметки, собранный кодом из секций и аннотации; единица staging. | `storage/models.md §4.2` |
+| **MOC** | «Map of Content»: заметка-оглавление темы, которую собирает код (`build_moc`), без LLM. | `tools/note_assembly.md §6` |
+| **Relationship** | Связь (wikilink/tag/backlink) между заметками. | `storage/models.md §4.3` |
+| **ValidationIssue / ValidationReport** | Проблема / итог детерминированной валидации. | `storage/models.md §5` |
+| **StagingChangeset** | Что предлагается применить к Vault: creates/updates/deletes + validation. | `storage/models.md §5.3` |
+| **TaskStatus** | Счётчик LLM-вызовов текущей сессии, передаётся по ссылке. | `storage/models.md §6.2` |
+| **TaskCheckpoint** | Снимок состояния задачи на диске (v5), механизм `resume`. | `staging/checkpoint.md` |
+| **Evidence** *(legacy)* | Прежний атомарный факт для цепочки Writer/Critic и web-режима. В активном пути не используется. | `storage/models.md §2.1` |
 
 ## Режимы и флаги
 
 | Термин | Значение |
 |---|---|
-| **FREE_ONLY** | Глобальный флаг: разрешены только бесплатные провайдеры. `False` запрещён в MVP (`config/settings.md §12.2`). |
-| **RESEARCH_MODE=knowledge** | Дефолтный режим: без веб-поиска, Elaborator раскрывает подтемы из знаний модели. Заметки помечаются `frontmatter.source=model-knowledge`. |
-| **RESEARCH_MODE=web** | Прежний путь (веб-поиск + Extractor/Critic по реальному тексту источников) — на момент этой документации явно заблокирован в `Orchestrator.run()`, миграция не завершена. |
-| **MAX_LLM_CALLS_PER_TASK** | Жёсткий потолок вызовов LLM на одну сессию/попытку задачи (`orchestrator/budget.md §3`). |
-| **RPM / RPD / TPM / TPD** | Requests/Tokens per Minute/Day — четыре независимых измерения лимита Groq Free Tier; TPM — самое узкое место (`llm/groq_client.md §5`). |
-| **needs_review** | Пометка `DraftNote`: критик не одобрил заметку после исчерпания `max_critic_rounds` — сигнал пользователю в diff перед `approve`. |
+| **FREE_ONLY** | Только бесплатные провайдеры; `false` запрещён (`config/settings.md §12.2`). |
+| **RESEARCH_MODE=knowledge** | Дефолт: без веб-поиска, Elaborator пишет разделы из знаний модели; заметки помечаются `source: model-knowledge`. |
+| **RESEARCH_MODE=web** | Прежний путь с веб-поиском; заблокирован в `Orchestrator.run()`. |
+| **MAX_LLM_CALLS_PER_TASK** | Жёсткий потолок вызовов LLM на сессию/попытку (`orchestrator/budget.md`). |
+| **RPM / RPD / TPM / TPD** | Лимиты Groq Free Tier; TPM (8000) самый узкий (`llm/groq_client.md §5`). |
+| **needs_check / unverified_sections** | Модель не уверена в деталях раздела: в заметке появляется callout «Требует проверки», в diff перечисляются такие разделы. |
+| **needs_review** *(legacy)* | Прежняя пометка «критик не одобрил»; поле осталось для старых данных. |
+| **enable_draft_merging** | Опциональное слияние готовых заметок без LLM; по умолчанию выключено. |
 
-## Obsidian/Vault-специфичные термины
+## Obsidian и Vault
 
 | Термин | Значение |
 |---|---|
-| **frontmatter** | YAML-блок в начале Markdown-файла с метаданными (`title`/`tags`/`created`/`source`). Состав ограничен кодом, не промптом — `tools/markdown_tools.md §1`. |
-| **wikilink** | Ссылка вида `[[Заголовок заметки]]` — способ Obsidian связывать заметки. |
-| **backlink** | Обратная ссылка — заметка B является backlink для A, если A содержит wikilink на B. |
-| **staging** | Промежуточный слой между "LLM закончил работу" и "изменения попали в реальный Vault" — пользователь видит diff и подтверждает (`approve`) до записи. |
-| **approve / commit** | `approve` — команда CLI, показывающая diff и запрашивающая подтверждение; `commit` — сама запись в реальный Vault после подтверждения (`staging/commit.md`). |
+| **frontmatter** | YAML в начале файла; только `title`, `tags`, `created`, `source` (`tools/markdown_tools.md`). |
+| **wikilink** | Ссылка `[[Заголовок]]`; в Obsidian разрешается по имени файла. |
+| **backlink** | Обратная ссылка. |
+| **callout** | Блок `> [!type] Заголовок` (`abstract`, `warning`, `tip`, `info`). |
+| **staging** | Слой между «LLM закончил» и «изменения попали в Vault». |
+| **approve / commit** | `approve` — команда CLI с подтверждением; `commit` — запись в Vault (`staging/commit.md`). |
 
-## Общие принципы, на которые часто ссылаются reference-доки
+## Принципы
 
-- **"Foreign keys не должны придумываться LLM"** — модель ссылается на
-  элементы по локальному индексу в промпте (`unit_index`, `item.index`), а
-  код-обвязка роли сам подставляет реальные `id`/пути (`llm/schemas.md`,
-  вступление).
-- **"LLM не должен проверять то, что можно проверить кодом"** — вся
-  детерминированная валидация (`validation/`) не использует LLM.
-- **"Bounded retry, не цикл до ok"** — и `orchestrator/budget.py`
-  (soft-throttle), и `roles/critic.py` (`max_critic_rounds`) используют
-  жёсткий потолок попыток, а не бесконечный цикл до успеха.
+- **Внешние ключи не придумывает LLM.** Модель ссылается на элементы по индексу в промпте (`unit_index`, `index`), код подставляет настоящие id.
+- **Что проверяет код, LLM не проверяет.** Валидация, сборка заметки, MOC, слияние, inline-ссылки: детерминированный код.
+- **Ограниченные повторы.** Бюджет вызовов, один повтор за пропавшими разделами Elaborator, деление батча пополам не глубже двух раз; затем placeholder или пустая аннотация, а не бесконечный цикл.
+- **Сбой второстепенного не роняет задачу.** Пустая аннотация и placeholder допустимы; они видны в diff и validation.

@@ -1,118 +1,56 @@
-# Документация: `roles/elaborator.py` — роль Elaborator
+# Документация: `roles/elaborator.py` — роль Elaborator (v2)
 
 > Reference-док. Обзор пакета — `_index.md`.
 
-**Назначение.** Эквивалент Extractor+Critic для `RESEARCH_MODE=knowledge`.
-В отличие от Extractor, здесь НЕТ входного текста источника — модель
-раскрывает каждый подпункт плана (`OutlineSubpoint`) из СОБСТВЕННЫХ знаний.
-Результат — тот же тип объекта `Evidence` (`../storage/models.md §2`), что
-и у Extractor+Critic — это то, что позволяет `vault_analyst`,
-`synthesizer_writer` не знать, в каком режиме работает система. Это САМЫЙ
-ЧАСТЫЙ по числу вызовов шаг в knowledge-режиме — использует отдельный
-клиент `Orchestrator.self.extraction_client`
-(`../orchestrator/state_machine.md §4`).
+**Назначение.** Для каждого подпункта плана (`OutlineSubpoint`) модель пишет **готовый markdown раздела** из собственных знаний (внешних источников нет, `RESEARCH_MODE=knowledge`). Результат — `SectionDraft` (`../storage/models.md`). Заголовок `## …` и сборку заметки добавляет код (`../tools/note_assembly.md`). Промежуточного `Evidence` и отдельных ролей Writer/Critic больше нет.
 
-### `MODEL_KNOWLEDGE_SOURCE_ID: str = "model_knowledge"`
+Самый частый по числу вызовов шаг, поэтому клиент — `Orchestrator.self.extraction_client`. Тег роли: `role="elaborator"`. Системная инструкция зависит от домена: `llm/prompts/elaborator.py::get_system_instruction(plan.domain)` (по одной статичной строке на домен, важно для Groq prompt caching). Схема ответа: `SectionBatchOutput` (`../llm/schemas.md`). Резерв вывода: `groq_reserved_output_by_role["elaborator"]` (2500), `reasoning_effort="low"`.
 
-Константа — значение `Evidence.source_id` для ВСЕХ фактов, произведённых
-этой ролью (т.к. у них нет реального внешнего источника). Совпадает по
-смыслу (но не по написанию) с
-`orchestrator/state_machine.py::KNOWLEDGE_MODE_FRONTMATTER_SOURCE =
-"model-knowledge"` (`../orchestrator/state_machine.md §1`) — первая
-маркирует `Evidence` (внутренний объект), вторая — YAML frontmatter
-итоговой заметки (видимое пользователю значение).
+## 1. Константы
 
-## 1. `class ElaborationUnit` (dataclass)
-
-Единица батчинга — ОДИН подпункт ОДНОЙ заметки плана.
-
-| Имя | Тип | Назначение |
+| Имя | Значение | Назначение |
 |---|---|---|
-| `note` | `OutlineNote` | Заметка плана, к которой принадлежит подпункт. |
-| `subpoint` | `OutlineSubpoint` | Сам подпункт (`heading`, `covers`, `subpoint_id`). |
+| `_MAX_SPLIT_DEPTH` | `2` | Сколько раз делим батч пополам при `LLMSchemaError`. |
+| `_MAX_NEIGHBOR_HEADINGS` | `15` | Сколько заголовков соседних разделов показываем модели («не повторяй их»). |
 
-## 2. `build_elaboration_units(plan: Plan, already_done_subpoint_ids: set[str]) -> list[ElaborationUnit]`
+## 2. `class ElaborationUnit` (dataclass)
 
-**Описание.** ЧИСТЫЙ КОД, без LLM. "Разворачивает" дерево
-`Plan.notes[*].subpoints[*]` в плоский список единиц, исключая уже
-обработанные (`already_done_subpoint_ids`, для resume).
+Единица батчинга — один подпункт одной заметки: `note: OutlineNote`, `subpoint: OutlineSubpoint`.
 
-**Параметры:**
+## 3. Чистый код (без LLM)
 
-| Имя | Тип | Назначение |
-|---|---|---|
-| `plan` | `Plan` | Источник дерева заметок/подпунктов. |
-| `already_done_subpoint_ids` | `set[str]` | `subpoint_id`, уже раскрытые в предыдущих сессиях. |
+### `build_elaboration_units(plan, already_done_subpoint_ids) -> list[ElaborationUnit]`
+Плоский список подпунктов в порядке `plan.notes` → `note.subpoints`, без уже обработанных (resume).
 
-**Возвращаемое значение:** `list[ElaborationUnit]` — в порядке `plan.notes`,
-внутри заметки — в порядке `note.subpoints`.
+### `_render_unit(u, index=None) -> str` (приватная)
+Текст единицы для промпта: `=== Раздел [i] ===`, заметка, заголовок раздела, `kind`, техзадание (`covers`), заголовки остальных разделов этой заметки (до 15).
 
-**Исключения:** не поднимает.
+### `_frame(plan) -> str` (приватная)
+Статичная рамка промпта: тема, домен, требование написать каждый раздел отдельно и указать `unit_index`.
 
-## 3. `elaborate_outline(plan, client, status, already_done_subpoint_ids, on_batch_done, max_subpoints_per_batch) -> None`
+### `_placeholder(u) -> SectionDraft` (приватная)
+Секция с `PLACEHOLDER_MARKDOWN` и `needs_check=True` (с `logger.warning`).
 
-**Описание.** Главная функция роли. Строит единицы (§2), делит их на батчи
-ДВУМЯ независимыми ограничениями одновременно
-(`llm/chunking.py::batch_for_quality_and_budget`, `../llm/chunking.md §2`):
-1. токен-бюджет клиента;
-2. качественный потолок `max_subpoints_per_batch` — НЕ про бюджет, а про
-   то, что при большом числе подпунктов в одном вызове модель даёт
-   поверхностные однострочные ответы.
+### `_accept_sections(output, units, *, final) -> tuple[dict[int, SectionDraft], list[int]]` (приватная)
+Принимает валидные секции из ответа. Отбрасываются: `unit_index` вне диапазона, дубль индекса, пустой текст после `prepare_section`. Приписывать текст «первому разделу» нельзя: это портит содержимое. Секция с незакрытым fence: при `final=False` отбрасывается (попадёт в `missing` и будет повторена), при `final=True` fence закрывается кодом и ставится `needs_check=True`. **Возвращает** `(принятые по индексу, список пропавших индексов)`.
 
-На каждый батч вызывает `_elaborate_batch(...)` (§4) и передаёт результат в
-`on_batch_done`.
+## 4. Вызовы LLM
 
-**Параметры:**
+### `_request_sections(units, plan, client, status, system_instruction) -> SectionBatchOutput` (приватная)
+Нумерованный листинг + `generate_structured(role="elaborator", …)`.
 
-| Имя | Тип | Назначение |
-|---|---|---|
-| `plan` | `Plan` | Источник дерева заметок/подпунктов. |
-| `client` | `LLMClient` | Обычно `Orchestrator.self.extraction_client`. |
-| `status` | `TaskStatus` | Учёт бюджета. |
-| `already_done_subpoint_ids` | `set[str]` | Для resume. |
-| `on_batch_done` | `Callable[[list[str], list[Evidence]], None]` | Вызывающий код (`Orchestrator`) ОБЯЗАН немедленно персистить `subpoint_ids` в чекпоинт (`../staging/checkpoint.md`). |
-| `max_subpoints_per_batch` | `int` | Качественный потолок подпунктов на один вызов. Из `settings.max_subpoints_per_generation_batch` (дефолт `6`, `../config/settings.md §9`). |
+### `_elaborate_batch(units, plan, client, status, system_instruction, *, depth=0, final=False) -> list[SectionDraft]` (приватная)
+Возвращает секцию для **каждой** единицы (при неудаче — placeholder). Логика:
+- `LLMPromptTooLargeError`: одна единица → placeholder; иначе деление пополам;
+- `LLMSchemaError`: при `depth >= 2` или одной единице → placeholders; иначе деление пополам с `depth + 1`;
+- затем `_accept_sections`; если есть пропавшие/битые и `final=False` — **один** повтор только за ними (`final=True`); при `final=True` оставшиеся становятся placeholder'ами.
 
-**Возвращаемое значение:** `None`. Если `units` пуст — выход немедленно,
-без LLM-вызовов.
+Остальные исключения (лимиты) пробрасываются.
 
-**Исключения:** не перехватывает — любая ошибка `client.generate_structured(...)`
-всплывает наружу (в отличие от web-режима, здесь нет автоматической
-бисекции батча при `GroqSchemaError`/`GroqPromptTooLargeError` — только
-токен-бюджетное и качественное деление ДО вызова).
+### `elaborate_outline(plan, client, status, already_done_subpoint_ids, on_batch_done, max_subpoints_per_batch) -> None`
+Строит единицы, делит их `batch_for_quality_and_budget` (токен-бюджет и потолок `max_subpoints_per_batch`, `settings.max_subpoints_per_generation_batch`, дефолт 3), на каждый батч вызывает `_elaborate_batch` и `on_batch_done(subpoint_ids, sections)`. В колбэк уходят **все** подпункты батча, включая placeholder'ы: Orchestrator обязан немедленно персистить их (`../staging/checkpoint.md`), иначе при resume они были бы запрошены заново.
 
-## 4. `_elaborate_batch(units, plan, client, status) -> list[Evidence]` (приватная)
+### `elaborate_outline_sync(plan, client, status, max_subpoints_per_batch=3) -> list[SectionDraft]`
+Без чекпоинтинга: для тестов и прямых вызовов.
 
-**Описание.** Один LLM-вызов на один батч подпунктов (`role="elaborator"`).
-Строит нумерованный листинг (`=== Раздел [i]: {note.title} :: {subpoint.heading} ===\n{subpoint.covers}`),
-парсит `ElaborationOutput` (`../llm/schemas.md §2`), резолвит
-`item.unit_index` → `(note, subpoint)` конкретной единицы батча (при
-индексе вне диапазона — приписывает факт первому подпункту батча, с
-предупреждением в лог).
-
-**Возвращаемое значение:** `list[Evidence]` — пусто, если `units` пуст.
-Каждый `Evidence` получает `note_id`/`subpoint_id` соответствующей
-единицы, `source_id=MODEL_KNOWLEDGE_SOURCE_ID`,
-`statement`/`confidence`/`is_definition`/`critic_note` из ответа модели.
-
-**Исключения:** пробрасывает всё, что поднимет `client.generate_structured(...)`.
-
-**Тег роли для `GroqClient`:** `role="elaborator"`.
-
-## 5. `elaborate_outline_sync(plan: Plan, client: LLMClient, status: TaskStatus, max_subpoints_per_batch: int = 6) -> list[Evidence]`
-
-**Описание.** Обёртка без чекпоинтинга — для тестов/прямых вызовов вне
-`Orchestrator`. Собирает результаты всех батчей в один список через
-локальный callback `_collect` и возвращает целиком.
-
-**Параметры:** те же, что у `elaborate_outline`, минус
-`on_batch_done`/`already_done_subpoint_ids` (внутри используются `set()` и
-локальный сборщик).
-
-**Возвращаемое значение:** `list[Evidence]` — весь накопленный evidence по
-плану.
-
-**Исключения:** те же, что у `elaborate_outline`.
-
-Документация по `roles/elaborator.py` завершена. Обзор пакета —
-`_index.md`. Следующий шаг пайплайна — `vault_analyst.md`.
+Документация по `roles/elaborator.py` завершена. Далее — `vault_analyst.md`.

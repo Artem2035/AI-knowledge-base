@@ -99,5 +99,4 @@ set(existing_folders) | {default_folder}`) — такой заметке при�
 **Тег роли для `GroqClient`:** `role="vault_dedup"`.
 
 Документация по `roles/vault_analyst.py` завершена. Обзор пакета —
-`_index.md`. Следующий шаг пайплайна — `synthesizer_writer.md` /
-`critic.md`.
+`_index.md`. Следующий шаг пайплайна — `annotator.md`.

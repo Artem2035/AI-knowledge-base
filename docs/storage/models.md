@@ -1,305 +1,158 @@
 # Документация: `storage/models.py`
 
-> Reference-док. Обзор пакета — `_index.md`. Единственный модуль со
-> структурированными объектами, которыми обмениваются этапы workflow.
+> Reference-док. Обзор пакета — `_index.md`. Единственный модуль со структурированными объектами, которыми обмениваются этапы workflow.
 
-**Назначение (из докстринга модуля).** Правило проекта: между ролями
-никогда не передаётся длинный "сырой" текст — только эти типизированные
-Pydantic-модели. Это даёт: (1) валидацию на границах между ролями, (2)
-возможность сериализовать в JSON и персистить прогресс на диск
-(`../staging/checkpoint.md` — resume после исчерпания лимита LLM-провайдера),
-(3) предсказуемый contract для structured-output вызовов LLM
-(`../llm/schemas.md` — отдельные "выходные" Pydantic-модели именно под ответы
-LLM, конвертируемые в объекты отсюда кодом ролей — LLM никогда не заполняет
-эти модели напрямую).
+**Назначение.** Между ролями не передаётся длинный «сырой» текст, только эти Pydantic-модели. Это даёт: (1) валидацию на границах, (2) JSON-сериализацию для персистентного прогресса (`../staging/checkpoint.md`), (3) предсказуемый контракт для structured-output (`../llm/schemas.md` — отдельные «выходные» модели, LLM эти не заполняет).
 
----
-
-## 0. Служебные функции модуля
+## 0. Служебные функции
 
 ### `_now() -> str`
-
-Текущее время в UTC, ISO 8601 (`datetime.now(timezone.utc).isoformat()`).
-`default_factory` для полей `created_at`/`timestamp`.
+UTC, ISO 8601. `default_factory` для `created_at`/`timestamp`.
 
 ### `_new_id() -> str`
-
-Генерирует короткий уникальный идентификатор: первые 12 hex-символов UUID4
-(`uuid.uuid4().hex[:12]`). `default_factory` для всех `*_id` полей
-(`task_id`, `note_id`, `subpoint_id`, `source_id`, `evidence_id`,
-`draft_id`). Ключевой архитектурный принцип проекта (см. `../llm/schemas.md`
-вступление): эти ID **всегда** генерируются кодом, никогда не заполняются
-LLM — LLM ссылается на элементы только по локальному индексу в промпте
-(`unit_index`, `item.index`), а код-обвязка роли сам подставляет реальный ID.
+Первые 12 hex-символов UUID4. `default_factory` всех `*_id`. Принцип проекта: id **всегда** генерирует код, модель ссылается на элементы по локальному индексу в промпте.
 
 ---
 
 ## 1. Task / Plan
 
+### 1.0. Домен и тип раздела
+
+| Имя | Что это |
+|---|---|
+| `Domain` | `Literal["technical", "humanities", "life_management"]`. |
+| `Kind` | `Literal[...]` из 18 значений: technical — `definition`, `mechanism`, `parameters`, `example`, `comparison`, `pitfalls`; humanities — `context`, `key_idea`, `interpretations`, `terms_persons`, `critique`, `connections`; life_management — `principle`, `when_to_apply`, `steps`, `scenario`, `mistakes`, `checklist`; универсальный `other`. |
+| `DEFAULT_DOMAIN` | `"technical"`. |
+| `DOMAIN_KINDS` | `dict[str, tuple[str, ...]]` — **единственный источник истины**, какие `kind` допустимы в каком домене (без `other`, он допустим всегда). Используется `roles/outline_planner.py`, `cli/plan_editor.py`. |
+
+#### `normalize_kind(kind: str, domain: str) -> str`
+`kind`, не входящий в набор домена (или неизвестный домен) → `"other"`. Не поднимает.
+
 ### 1.1. `class Task(BaseModel)`
-
-Исходный запрос пользователя, нормализованный кодом (не LLM). Создаётся в
-`Orchestrator._load_or_create_state()` (`../orchestrator/state_machine.md`)
-для новой задачи, либо восстанавливается из `TaskCheckpoint` при resume (с
-уже известным `task_id`).
-
-| Поле | Тип | Назначение |
-|---|---|---|
-| `task_id` | `str` | `default_factory=_new_id`. Ключ каталога в `staging/`, `checkpoints/`. При resume передаётся явно (не генерируется заново). |
-| `raw_query` | `str` | Обязательное — исходный текст запроса пользователя. |
-| `language` | `str` | Дефолт `"ru"`. Из `settings.language`. |
-| `created_at` | `str` | `default_factory=_now`. |
+`task_id` (`_new_id`; при resume передаётся явно), `raw_query: str`, `language = "ru"`, `created_at`.
 
 ### 1.2. `class OutlineSubpoint(BaseModel)`
-
-Один подпункт (будущий заголовок `##`) внутри заметки плана. Единица
-батчинга для `roles/elaborator.py` (`../roles/elaborator.md`).
-
 | Поле | Тип | Назначение |
 |---|---|---|
-| `subpoint_id` | `str` | `default_factory=_new_id`. Стабильный ID для resume. |
-| `heading` | `str` | Текст заголовка `##` в итоговой заметке. |
-| `covers` | `str` | Техзадание для Elaborator/Writer — ЧТО раскрыть, **не сам текст**. |
+| `subpoint_id` | `str` | `_new_id`; стабильный id для resume. |
+| `heading` | `str` | Текст заголовка `##` в заметке. |
+| `covers` | `str` | Техзадание для Elaborator (что раскрыть, не текст). |
+| `kind` | `Kind` | Дефолт `"other"` (старые планы без поля загружаются). Допустимые значения зависят от `Plan.domain`. |
 
 ### 1.3. `class OutlineNote(BaseModel)`
-
-Одна заметка будущего конспекта — узел дерева `Plan.notes`. Поля
-`action`/`existing_path`/`folder` заполняются НЕ Planner-ом, а кодом роли
-`roles/vault_analyst.py::resolve_notes_against_vault` (мутация на месте,
-без отдельного LLM-вызова на само решение "create vs update" — LLM
-привлекается только для "серой зоны", см. `../roles/vault_analyst.md`).
-
-| Поле | Тип | Назначение |
-|---|---|---|
-| `note_id` | `str` | `default_factory=_new_id`. Связывает заметку с её `Evidence` и с `written_note_indices` чекпоинта (там индекс в `plan.notes`, не `note_id` напрямую). |
-| `title` | `str` | Заголовок заметки — зафиксирован планом, Writer его не выбирает. |
-| `subpoints` | `list[OutlineSubpoint]` | `default_factory=list`. |
-| `rationale` | `str` | Дефолт `""`. Обоснование Planner-а, не используется дальше по пайплайну. |
-| `action` | `Literal["create", "update"]` | Дефолт `"create"`. Заполняется `vault_analyst`. |
-| `existing_path` | `str` | Дефолт `""`. Путь существующей заметки при `action="update"` — обязателен (`synthesizer_writer._to_draft_note` поднимет `ValueError`, если пуст). |
-| `folder` | `str` | Дефолт `""`. Для `action="create"` — заполняется `vault_analyst._assign_folders_batch`. |
+`note_id`, `title` (зафиксирован планом), `subpoints`, `rationale = ""`. Поля `action: Literal["create","update"] = "create"`, `existing_path = ""`, `folder = ""` заполняет не Planner, а `roles/vault_analyst.py::resolve_notes_against_vault` (мутация на месте).
 
 ### 1.4. `class Plan(BaseModel)`
-
-Результат работы Planner-а (`roles/outline_planner.py::build_plan`,
-`../roles/outline_planner.md`) — дерево заметок с подпунктами. Дальше
-мутируется `vault_analyst` и читается всеми последующими ролями
-(`elaborator`, `synthesizer_writer`, `critic`).
-
 | Поле | Тип | Назначение |
 |---|---|---|
-| `task_id` | `str` | Обязательное — связь с `Task.task_id`. |
-| `topic_title` | `str` | Обязательное — общее название темы. |
-| `summary` | `str` | Дефолт `""`. Используется в CLI как корень дерева при показе плана. |
-| `notes` | `list[OutlineNote]` | `default_factory=list`. |
-
-**Примечание про `RESEARCH_MODE=web`:** файлы `roles/researcher.py`/
-`extractor_critic.py` (не документируются в этом заходе, см.
-`../CONTRIBUTING.md`) ссылаются на `Plan.subtopics`, которого в ТЕКУЩЕЙ
-версии `Plan` нет (только `notes`) — признак незавершённой миграции
-web-режима на новую структуру `OutlineNote`/`subpoints`.
+| `task_id` | `str` | Связь с `Task`. |
+| `topic_title` | `str` | Название темы; идёт в заголовок MOC и в папку темы. |
+| `summary` | `str` | Абзац-резюме (правило 7 планнера); в MOC выводится как `[!abstract] Кратко`. Дефолт `""`. |
+| `domain` | `Domain` | Определяет планнер, правит пользователь в `cli/plan_editor.py`. Влияет на инструкцию Elaborator, humanities-предупреждение и тег `domain/<домен>`. |
+| `notes` | `list[OutlineNote]` | Дерево плана. |
 
 ---
 
-## 2. Evidence
+## 2. Секции, аннотации и Evidence
 
-### 2.1. `class Evidence(BaseModel)`
+### 2.1. `class Evidence(BaseModel)` — **legacy**
+Атомарное утверждение (`note_id`, `subpoint_id`, `statement`, `source_id`, `confidence`, `is_definition`, `critic_note`, `verified`). В активном пути **не используется** (цепочка Evidence → Writer → Critic заменена на `SectionDraft`); оставлена для сломанных web-ролей и старых данных. Также остаётся `SourceCandidate` (результат веб-поиска, только web-режим).
 
-Одно атомарное утверждение/факт/определение, привязанное к конкретному
-разделу конкретной заметки плана. Единый формат для `RESEARCH_MODE=knowledge`
-(`roles/elaborator.py`, `../roles/elaborator.md`) — это то, что позволяет
-`roles/synthesizer_writer.py`/`roles/critic.py` не знать, в каком режиме
-работает система.
+### 2.2. `class SectionDraft(BaseModel)`
+Готовый markdown одного подпункта (результат Elaborator v2).
 
 | Поле | Тип | Назначение |
 |---|---|---|
-| `evidence_id` | `str` | `default_factory=_new_id`. На него ссылаются другие `Evidence` через списки противоречий, если такие резолвятся кодом роли. |
-| `note_id` | `str` | Обязательное — `OutlineNote.note_id`. По этому полю `synthesizer_writer.write_note`/`critic.run_critic_cycle` фильтруют "только мои факты" из общего списка `evidence` задачи. |
-| `subpoint_id` | `str` | Обязательное — `OutlineSubpoint.subpoint_id`, конкретный раздел внутри заметки. |
-| `statement` | `str` | Обязательное — сам текст утверждения. |
-| `source_id` | `str` | Дефолт `"model_knowledge"`. В knowledge-режиме — всегда константа `roles/elaborator.py::MODEL_KNOWLEDGE_SOURCE_ID`. |
-| `confidence` | `float` | `ge=0.0, le=1.0`, дефолт `0.5`. Оценка достоверности от LLM. |
-| `is_definition` | `bool` | Дефолт `False`. Является ли утверждение определением понятия. |
-| `critic_note` | `str` | Дефолт `""`. Комментарий модели о сомнительности/противоречии (заполняет сам Elaborator в рамках своего вызова — не путать с ролью `roles/critic.py`, `../roles/critic.md`). |
-| `verified` | `bool` | Дефолт `False`. В knowledge-режиме ВСЕГДА `False` — сознательно НЕ выставляется в `True` даже если `roles/critic.py` не нашёл проблем: тот Critic проверяет согласованность/полноту, а не фактическую верность против внешней истины, которой в этом режиме просто нет. |
+| `note_id` | `str` | Заметка плана. |
+| `subpoint_id` | `str` | Подпункт. |
+| `markdown` | `str` | Тело раздела без заголовка `##`. |
+| `needs_check` | `bool` | Модель не уверена в деталях (или раздел — placeholder); попадает в `DraftNote.unverified_sections`, в callout заметки и в diff. |
+
+Хранится в `TaskCheckpoint.sections`.
+
+### 2.3. `class NoteAnnotation(BaseModel)`
+Результат Annotator для одной заметки: `note_id`, `tags`, `links_out`, `abstract = ""` (пусто, если резюме не запрашивалось или модель его не вернула). Хранится в `TaskCheckpoint.annotations`.
 
 ---
 
 ## 3. Vault Analyst
 
 ### 3.1. `class ExistingNote(BaseModel)`
-
-Существующая заметка Vault, найденная локальным retrieval-ом как
-потенциальный дубликат/кандидат на дополнение. В текущем активном пути
-(`roles/vault_analyst.py::resolve_notes_against_vault`) эта модель напрямую
-не строится — используется облегчённый `RetrievalHit` (`retrieval/search.py`)
-вместо неё; `ExistingNote` описана здесь как более полный/архивный формат
-для будущего использования.
-
-| Поле | Тип | Назначение |
-|---|---|---|
-| `path` | `str` | Путь заметки внутри Vault. |
-| `title` | `str` | Заголовок. |
-| `frontmatter` | `dict` | `default_factory=dict`. |
-| `tags` | `list[str]` | `default_factory=list`. |
-| `summary` | `str` | Дефолт `""`. |
-| `content_hash` | `str` | Дефолт `""`. Для сверки с индексом (`../vault/db.md`). |
-| `similarity_score` | `float` | Дефолт `0.0`. |
-| `matched_concept` | `str` | Дефолт `""`. |
-| `decision` | `Literal["reuse", "extend", "distinct", "unknown"]` | Дефолт `"unknown"`. Тот же словарь решений, что у `../llm/schemas.md §3`, `DedupDecisionOutput.decision`. |
+Полный/архивный формат существующей заметки (`path`, `title`, `frontmatter`, `tags`, `summary`, `content_hash`, `similarity_score`, `matched_concept`, `decision`). В активном пути вместо него используется лёгкий `RetrievalHit` (`retrieval/search.py`).
 
 ---
 
-## 4. Synthesizer + Writer
+## 4. Заметки
 
 ### 4.1. `class NoteAction(str, Enum)`
-
-Строковый Enum действия над заметкой Vault: `CREATE = "create"`,
-`UPDATE = "update"`. Используется в `DraftNote.action`,
-`StagingChangeset.creates`/`.updates` (разделение списков по значению),
-`../vault/writer.md::VaultWriter.write_draft`.
+`CREATE = "create"`, `UPDATE = "update"`.
 
 ### 4.2. `class DraftNote(BaseModel)`
-
-Черновик одной заметки — итог работы `synthesizer_writer`/`critic`, единица
-staging-changeset-а, единица, которую видит пользователь в diff
-(`../staging/diff.md`) перед `approve`.
+Черновик одной заметки: результат `tools/note_assembly.py::build_draft_note`, единица staging и diff.
 
 | Поле | Тип | Назначение |
 |---|---|---|
-| `draft_id` | `str` | `default_factory=_new_id`. |
-| `note_id` | `str` | Дефолт `""`. Для traceability и валидации покрытия заголовков (`../validation/markdown_validator.md`) — пусто у объединённых черновиков (`../staging/draft_merge.md`), т.к. исходная заметка-план для объединённой структуры уже не актуальна. |
+| `draft_id` | `str` | `_new_id`. |
+| `note_id` | `str` | Дефолт `""`. Пусто у объединённых черновиков и MOC (для них `validate_headings_coverage` — no-op). |
 | `action` | `NoteAction` | Обязательное. |
-| `path` | `str` | Для `CREATE` — новый путь; для `UPDATE` — путь существующей заметки. |
-| `title` | `str` | Обязательное. |
-| `folder` | `str` | Дефолт `""`. |
-| `frontmatter` | `dict` | `default_factory=dict`. Ограничен на этапе рендера ключами `title`/`tags`/`created`/`source` (`../tools/markdown_tools.md`) — прочие ключи здесь могут временно присутствовать, но не попадут в итоговый Markdown. |
-| `body_md` | `str` | Дефолт `""`. Тело заметки для `action=CREATE`. |
-| `tags` | `list[str]` | `default_factory=list`. |
-| `links_out` | `list[str]` | `default_factory=list`. Заголовки/пути других заметок (не URL) — для секции "## Связанные заметки". |
-| `source_refs` | `list[str]` | `default_factory=list`. URL источников — только web-режим. |
-| `append_section` | `str \| None` | Дефолт `None`. Для `action=UPDATE` — ЧТО именно добавляется, чтобы не перезаписывать весь файл. |
-| `depth_hint` | `str` | Дефолт `"standard"`. Чисто для трассируемости/отладки — не участвует в валидации. |
-| `critic_rounds` | `int` | Дефолт `0`. Сколько раз Critic попросил переписать эту заметку (`../roles/critic.md`). |
-| `needs_review` | `bool` | Дефолт `False`. `True`, если после исчерпания `max_critic_rounds` критик всё ещё просил переписать — сигнал пользователю в `../staging/diff.md`. |
+| `path` | `str` | CREATE — новый путь; UPDATE — путь существующей заметки. |
+| `title`, `folder` | `str` | Заголовок и папка. |
+| `frontmatter` | `dict` | При рендере ограничен ключами `title`/`tags`/`created`/`source` (`../tools/markdown_tools.md`). |
+| `body_md` | `str` | Тело для CREATE. |
+| `tags` | `list[str]` | Включает `domain/<домен>`; diff этот тег не показывает в списке тегов, а выводит отдельной строкой «домен». |
+| `links_out` | `list[str]` | Заголовки/stem других заметок (не URL). |
+| `source_refs` | `list[str]` | URL источников, только web-режим. |
+| `append_section` | `str \| None` | Для UPDATE: что дописывается. |
+| `depth_hint` | `str` | Legacy, для трассируемости. |
+| `critic_rounds` | `int` | **Legacy** (Critic удалён); для старых `changeset.json`. |
+| `needs_review` | `bool` | **Legacy**; diff по-прежнему показывает пометку для старых данных. |
+| `unverified_sections` | `list[str]` | Заголовки разделов с `needs_check`. |
+| `merged_from` | `list[str]` | Заголовки исходных заметок при слиянии (`../staging/draft_merge.md`): по ним `fix_links_after_merge` перенаправляет чужие ссылки. |
+| `is_moc` | `bool` | Заметка-оглавление, собранная `build_moc`: без секции «Связанные заметки», без проверки «слишком короткая», без inline-ссылок. |
 
 ### 4.3. `class Relationship(BaseModel)`
-
-Одна связь (wikilink/tag/backlink) между заметками — плоское представление
-рёбер графа знаний, строится `synthesizer_writer.build_relationships`.
-
-| Поле | Тип | Назначение |
-|---|---|---|
-| `from_note` | `str` | Путь заметки-источника ссылки. |
-| `to_note` | `str` | Путь (или заголовок-fallback) заметки-цели. |
-| `link_type` | `Literal["wikilink", "tag", "backlink"]` | Дефолт `"wikilink"`. |
+`from_note`, `to_note`, `link_type: Literal["wikilink","tag","backlink"] = "wikilink"`. Строит `roles/synthesizer_writer.py::build_relationships`.
 
 ---
 
 ## 5. Validation / Staging
 
 ### 5.1. `class ValidationIssue(BaseModel)`
-
-Одна найденная проблема (детерминированной валидацией, `validation/*.py`,
-без LLM).
-
-| Поле | Тип | Назначение |
-|---|---|---|
-| `level` | `Literal["error", "warning"]` | `"error"` блокирует `approve`, `"warning"` — только информирует. |
-| `code` | `str` | Машиночитаемый код проблемы (напр. `"broken_wikilink"`, `"empty_body"`). |
-| `message` | `str` | Человекочитаемое сообщение (на русском). |
-| `draft_id` | `str \| None` | Дефолт `None`. Ссылка на конкретный `DraftNote.draft_id`, если применимо. |
+`level: Literal["error","warning"]`, `code`, `message`, `draft_id: str | None`. `error` блокирует approve.
 
 ### 5.2. `class ValidationReport(BaseModel)`
-
-Итог полного прогона валидации (`../validation/_index.md::run_validation`).
-
-| Поле | Тип | Назначение |
-|---|---|---|
-| `ok` | `bool` | `True`, если НЕТ ни одной issue уровня `"error"`. Блокирует/разрешает `approve`. |
-| `issues` | `list[ValidationIssue]` | `default_factory=list`. |
-
-`errors` (property) → `list[ValidationIssue]` с `level == "error"`.
-`warnings` (property) → `list[ValidationIssue]` с `level == "warning"`.
+`ok` (нет ни одной `error`), `issues`; свойства `errors`, `warnings`.
 
 ### 5.3. `class StagingChangeset(BaseModel)`
-
-Единица staging — то, что предлагается применить к реальному Vault.
-Сериализуется в `changeset.json` (`../staging/changeset.md`) и читается
-обратно при `approve`.
-
-| Поле | Тип | Назначение |
-|---|---|---|
-| `task_id` | `str` | Обязательное. |
-| `created_at` | `str` | `default_factory=_now`. |
-| `creates` | `list[DraftNote]` | `default_factory=list`. Черновики с `action=CREATE`. |
-| `updates` | `list[DraftNote]` | `default_factory=list`. Черновики с `action=UPDATE`. |
-| `deletes` | `list[str]` | `default_factory=list`. Пути к удалению — в MVP по умолчанию ВСЕГДА пуст. |
-| `relationships` | `list[Relationship]` | `default_factory=list`. |
-| `validation` | `ValidationReport \| None` | Дефолт `None`. `None` означает "changeset не прошёл через `run_validation`" — `../staging/commit.md::commit_changeset` явно проверяет это и поднимает `CommitError`, если так. |
+`task_id`, `created_at`, `creates`, `updates`, `deletes` (в MVP всегда пуст), `relationships`, `validation: ValidationReport | None`. `validation is None` значит «не проходил `run_validation`», `commit_changeset` откажет (`../staging/commit.md`).
 
 ---
 
-## 6. Orchestrator status / бюджет
+## 6. Статус и бюджет
 
 ### 6.1. `class LLMCallLog(BaseModel)`
-
-Одна запись о совершённом (или неудачном) вызове LLM — элемент
-`TaskStatus.llm_calls_log`. Создаётся `../orchestrator/budget.md::LLMBudget.register_call`.
-
-| Поле | Тип | Назначение |
-|---|---|---|
-| `role` | `str` | Тег роли вызова. |
-| `timestamp` | `str` | `default_factory=_now`. |
-| `prompt_tokens_est` | `int` | Дефолт `0`. Не заполняется в текущей реализации `register_call` — зарезервировано. |
-| `ok` | `bool` | Дефолт `True`. |
-| `error` | `str \| None` | Дефолт `None`. |
+`role`, `timestamp`, `prompt_tokens_est = 0` (зарезервировано), `ok`, `error`. Создаётся `LLMBudget.register_call`.
 
 ### 6.2. `class TaskStatus(BaseModel)`
-
-Единственный изменяемый (мутируемый на месте, передаётся ПО ССЫЛКЕ) объект,
-который "путешествует" через весь цикл `Orchestrator → роль → LLMClient →
-GroqClient` (`../flows/llm_cycle.md §3`).
-
-| Поле | Тип | Назначение |
-|---|---|---|
-| `task_id` | `str` | Обязательное. |
-| `stage` | `str` | Дефолт `"created"`. Текущий этап workflow (`"planning"`, `"extracting"`, `"vault_analysis"`, `"synthesizing"`, `"validating"`, `"staged"`, `"stopped"`). |
-| `llm_calls_used` | `int` | Дефолт `0`. Счётчик вызовов **ЭТОЙ СЕССИИ** (обнуляется даже при resume). |
-| `llm_calls_log` | `list[LLMCallLog]` | `default_factory=list`. |
-| `stopped_reason` | `str \| None` | Дефолт `None`. Текст исключения (`LLMFreeLimitReached`/`LLMTaskBudgetExceeded`) при управляемой остановке. |
-| `finished` | `bool` | Дефолт `False`. `True`, если задача успешно дошла до этапа `staged`. |
-
-**Где создаётся:** `Orchestrator._load_or_create_state()` — всегда новый
-объект (`llm_calls_used=0`), даже при `resume_task_id` переданном.
+`task_id`, `stage` (`planning`, `elaborating`, `vault_analysis`, `annotating`, `assembling`, `validating`, `staged`, `stopped`), `llm_calls_used` (только текущая сессия, обнуляется даже при resume), `llm_calls_log`, `stopped_reason`, `finished`. Передаётся по ссылке через весь цикл вызова (`../flows/llm_cycle.md`).
 
 ---
 
-## Сводная схема связей между моделями
+## Сводная схема связей
 
 ```
-Task ──task_id──► Plan ──notes──► OutlineNote ──subpoints──► OutlineSubpoint
-                                       │  note_id/subpoint_id
-                                       ▼
-                                   Evidence (note_id, subpoint_id, source_id)
-                                       │
-                    (Vault Analyst мутирует OutlineNote.action/existing_path/folder)
-                                       │
-                                       ▼
-                                 synthesizer_writer.write_note
-                                       │
-                                       ▼
-                                  DraftNote (note_id, action, path, ...)
-                                       │
-                          build_relationships ──► Relationship
-                                       │
-                                StagingChangeset (creates/updates/deletes/relationships/validation)
-                                       │
-                                run_validation ──► ValidationReport ──► ValidationIssue[]
-                                       │
-                             save_changeset (staging/) ──► approve ──► commit_changeset
-
-TaskStatus — сквозной объект, передаётся во ВСЕ LLM-вызовы, накапливает LLMCallLog[]
+Task ─► Plan(domain, summary) ─► OutlineNote ─► OutlineSubpoint(kind)
+                                      │ note_id/subpoint_id
+              (Vault Analyst мутирует action/existing_path/folder)
+                                      ▼
+   Elaborator ─► SectionDraft ─┐          Annotator ─► NoteAnnotation
+                               ▼                          ▼
+              tools/note_assembly.build_draft_note ─► DraftNote
+                    │ (merge: merged_from)  │ (apply_inline_links)
+                    ▼                       ▼
+                 build_moc ─► DraftNote(is_moc) ─► Relationship
+                                      ▼
+        StagingChangeset ─► run_validation ─► ValidationReport ─► save_changeset ─► approve ─► commit
 ```
 
 Документация по `storage/models.py` завершена. Обзор пакета — `_index.md`.

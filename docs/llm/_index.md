@@ -20,7 +20,7 @@
 | `llm/factory.py` | `core.md` | Выбор провайдера |
 | `llm/groq_client.py` | `groq_client.md` | Единственный реализованный провайдер |
 | `llm/schemas.py` | `schemas.md` | Pydantic-контракты structured-output |
-| `llm/prompts/*.py` | `prompts.md` | **Покрывает весь подпакет `llm/prompts/` целиком** (`outline_planner.py`, `critic.py`, `elaborator.py`, `vault_analyst.py`, `synthesizer_writer.py`) — каждый файл там маленький (только константы текста промпта), отдельный документ на файл избыточен. |
+| `llm/prompts/*.py` | `prompts.md` | **Покрывает весь подпакет** (`common.py`, `outline_planner.py`, `elaborator.py`, `annotator.py`, `vault_analyst.py`). Каждый файл мал (только тексты инструкций), отдельный документ на файл избыточен. |
 | `llm/chunking.py` | `chunking.md` | Батчинг под токен-бюджет |
 | `llm/router.py`, `llm/openrouter_client.py` | — | Намеренно не документируются (второй провайдер, вне текущего фокуса MVP) |
 
@@ -55,10 +55,11 @@ roles/*.py  ──render_item, response_model──►  llm/chunking.py::split_i
 
 ## Порядок чтения
 
-1. `core.md` — контракт и общий фундамент.
-2. `groq_client.md` — единственный провайдер, который реально исполняет контракт.
-3. `schemas.md` → `prompts.md` → `chunking.md` — что именно роли передают в
-   `generate_structured` и как это батчится.
+## Порядок чтения
+
+1. `core.md`: контракт и общий фундамент.
+2. `groq_client.md`: провайдер, лимитер, калибраторы, подсчёт токенов.
+3. `schemas.md` → `prompts.md` → `chunking.md`: что роли передают в `generate_structured` и как это батчится.
 
 Сам процесс одного вызова (что вызывается в каком порядке) — не здесь, а в
 `../flows/llm_cycle.md`.
