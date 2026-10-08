@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.tree import Tree
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -26,6 +27,10 @@ console = Console()
 
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("llm.groq_client").setLevel(logging.INFO)
+
+def _format_msk(iso: str) -> str:
+    """ISO-время (UTC) -> «дд.мм.гггг чч:мм по мск»."""
+    return datetime.fromisoformat(iso).astimezone(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y %H:%M по мск")
 
 def _run_and_report(orch: Orchestrator, *, raw_query: str | None, resume_task_id: str | None, settings) -> None:
     """Общая логика запуска (новая задача или resume) + единый вывод
@@ -78,6 +83,10 @@ def _run_and_report(orch: Orchestrator, *, raw_query: str | None, resume_task_id
     if result.changeset.validation and not result.changeset.validation.ok:
         console.print(
             "[red]Валидация нашла ошибки — approve заблокирован, пока они не исправлены.[/red]"
+        )
+        console.print(
+            "Устраните причину (например, уберите конфликтующий файл из Vault) и выполните: "
+            f"[bold]python -m cli.main resume {result.task_id}[/bold] — LLM-вызовы не тратятся."
         )
         raise typer.Exit(code=1)
 
@@ -193,17 +202,42 @@ def approve(task_id: str):
 def pending():
     """Показать список задач, ожидающих approve в staging."""
     settings = get_settings()
-    tasks = list_pending_tasks(settings.staging_dir)
-    if not tasks:
+    task_ids = list_pending_tasks(settings.staging_dir)
+    if not task_ids:
         console.print("Нет задач, ожидающих подтверждения.")
         return
-    for t in tasks:
-        console.print(f"- {t}")
 
-    # console.print(
-    #     f"- [bold]{cp.task_id}[/bold] "
-    #     f"«{preview}»  {task_date}"
-    # )
+    loaded = []
+    for task_id in task_ids:
+        try:
+            changeset = load_changeset(settings.staging_dir, task_id)
+        except Exception as exc:  # повреждённый changeset.json не должен ронять список
+            console.print(f"- [bold]{task_id}[/bold]  [red]changeset.json не читается: {escape(str(exc))}[/red]")
+            continue
+        if changeset is not None:
+            loaded.append((task_id, changeset))
+    loaded.sort(key=lambda item: item[1].created_at)
+
+    for task_id, cs in loaded:
+        # Запрос есть не у старых changeset.json: запасной вариант — MOC или первая заметка.
+        moc = next((d.title for d in cs.creates if d.is_moc), "")
+        label = cs.raw_query or moc or (cs.creates[0].title if cs.creates else "—")
+        preview = label if len(label) <= 60 else label[:57] + "…"
+        v = cs.validation
+        if v is None:
+            validation = "[yellow]не проверялся[/yellow]"
+        elif v.ok:
+            validation = f"[green]OK[/green] (warnings={len(v.warnings)})"
+        else:
+            validation = f"[red]ЕСТЬ ОШИБКИ[/red] (errors={len(v.errors)}, warnings={len(v.warnings)})"
+        console.print(
+            f"- [bold]{task_id}[/bold]  «{escape(preview)}»  {_format_msk(cs.created_at)}\n"
+            f"    новых: {len(cs.creates)}, дополнений: {len(cs.updates)}, валидация: {validation}"
+        )
+        if v is not None and not v.ok:
+            console.print(f"    исправить и пересобрать: [bold]python -m cli.main resume {task_id}[/bold]")
+
+    console.print("\nПросмотр и применение: [bold]python -m cli.main approve <task_id>[/bold]")
 
 
 @app.command()

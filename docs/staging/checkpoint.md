@@ -2,7 +2,7 @@
 
 > Reference-док. Обзор пакета — `_index.md`.
 
-**Назначение.** Механизм персистентности, отдельный от `StagingChangeset` (`changeset.md`): changeset создаётся только на последнем шаге, а `TaskCheckpoint` перезаписывается **после каждого завершённого шага и каждого батча**. Это делает `resume` возможным, если задача остановилась по лимиту (`MAX_LLM_CALLS_PER_TASK`, 429) задолго до staging.
+**Назначение.** Механизм персистентности, отдельный от `StagingChangeset` (`changeset.md`): changeset создаётся только на последнем шаге, а `TaskCheckpoint` перезаписывается **после каждого завершённого шага и каждого батча**. Это делает `resume` возможным, если задача остановилась по лимиту (`MAX_LLM_CALLS_PER_TASK`, 429) задолго до staging, либо дошла до staging с ошибками валидации.
 
 **Инвариант.** Чекпоинт хранит уже провалидированные структурированные данные (`Plan`, `SectionDraft[]`, `NoteAnnotation[]`), те же Pydantic-модели (`../storage/models.md`), поэтому сериализация тривиальна и не зависит от провайдера. **`DraftNote` в чекпоинте не хранятся**: сборка заметки из секций и аннотаций (`../tools/note_assembly.md::build_draft_note`) детерминирована и дёшева, поэтому выполняется заново при каждом запуске.
 
@@ -10,7 +10,7 @@
 - Planning, Vault analysis — шаг целиком (флаги `plan_approved`, `vault_analysis_done`).
 - Elaboration — отдельный подпункт: `elaborated_subpoint_ids` + `sections`.
 - Annotation — отдельная заметка: `annotated_note_ids` + `annotations`.
-- Сборка, слияние, MOC, relationships, validation, staging — без состояния, всегда заново.
+- Сборка, слияние, автоисправление путей, MOC, relationships, validation, staging — без состояния, всегда заново (поэтому `resume` после `validation_failed` не тратит LLM-вызовов).
 
 ## 1. `CHECKPOINT_VERSION: int = 5`
 
@@ -24,7 +24,7 @@
 |---|---|---|
 | `version` | `int` | Дефолт `CHECKPOINT_VERSION`. |
 | `task_id`, `raw_query`, `language` | `str` | Обязательные. |
-| `last_completed_stage` | `str` | Дефолт `"created"`. Только для отображения; логика resume опирается на флаги. |
+| `last_completed_stage` | `str` | Дефолт `"created"`. Только для отображения; логика resume опирается на флаги. Значения: `created`, `planned`, `plan_approved`, `elaborating`, `elaboration_done`, `vault_analysis_done`, `annotating`, `annotation_done`, `validation_failed` (задача дошла до staging, но валидация нашла ошибки). |
 | `status` | `TaskStatus` | Снимок счётчиков на момент последнего `persist(...)`. |
 | `total_llm_calls_used` | `int` | Накопительный расход по всем попыткам (для отчёта); лимит применяется к сессии. |
 | `plan` | `Plan \| None` | Мутируется Vault Analyst (`action`/`existing_path`/`folder`), поэтому после анализа Vault сохраняется заново. |
@@ -32,7 +32,7 @@
 | `elaboration_done` | `bool` | Все разделы написаны. |
 | `elaborated_subpoint_ids` | `list[str]` | `subpoint_id` обработанных подпунктов, **включая placeholder'ы**. |
 | `sections` | `list[SectionDraft]` | Готовый markdown разделов, копится по батчам. |
-| `vault_analysis_done` | `bool` | Результат живёт в `plan.notes`, отдельного списка нет. |
+| `vault_analysis_done` | `bool` | Результат живёт в `plan.notes`, отдельного списка нет. При resume не пересчитывается. |
 | `annotation_done` | `bool` | Все create-заметки аннотированы. |
 | `annotated_note_ids` | `list[str]` | `note_id` аннотированных заметок (включая получившие пустую аннотацию). |
 | `annotations` | `list[NoteAnnotation]` | Копится по батчам. |
@@ -50,9 +50,9 @@
 `None`, если файла нет; либо с `logger.error`/`warning`, если JSON повреждён, версия отличается от `CHECKPOINT_VERSION` или не прошла валидация Pydantic. Вызывающий код (`Orchestrator._load_or_create_state`) трактует `None` как «resume невозможен» → `OrchestratorStopped`. Сама функция исключений не поднимает.
 
 ## 6. `delete_checkpoint(checkpoint_dir: Path, task_id: str) -> None`
-`unlink(missing_ok=True)`. Вызывается в конце `Orchestrator.run()`, когда задача доведена до staging.
+`unlink(missing_ok=True)`. Вызывается в конце `Orchestrator.run()` **только при `validation.ok`**: тогда дальнейшее состояние живёт в `StagingChangeset`. При ошибках валидации чекпоинт остаётся с `last_completed_stage="validation_failed"`, чтобы `resume` мог пересобрать заметки без LLM-вызовов.
 
 ## 7. `list_resumable_tasks(checkpoint_dir: Path) -> list[TaskCheckpoint]`
-Все незавершённые чекпоинты **текущей версии** (для команды `resumable`). Повреждённые файлы пропускаются с `logger.warning`, файлы других версий пропускаются молча. Сортировка по имени файла. Пустой список, если каталога нет.
+Все незавершённые чекпоинты **текущей версии** (для команды `resumable`), включая задачи с `validation_failed`. Повреждённые файлы пропускаются с `logger.warning`, файлы других версий пропускаются молча. Сортировка по имени файла. Пустой список, если каталога нет.
 
 Документация по `staging/checkpoint.py` завершена. Далее — `changeset.md`.

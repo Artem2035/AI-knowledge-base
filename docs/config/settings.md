@@ -4,7 +4,7 @@
 
 ## 0. `class Settings(BaseSettings)`
 
-`model_config`: `env_file=".env"`, `env_file_encoding="utf-8"`, `extra="ignore"` (лишние переменные не вызывают ошибку, но и не действуют).
+`model_config`: `env_file=".env"`, `env_file_encoding="utf-8"`, `extra="ignore"` (лишние переменные не вызывают ошибку, но и не действуют; так же игнорируются ключи удалённых полей из старых `.env`).
 
 **Поля сложных типов** (`dict`, `list`) из окружения разбираются как JSON.
 
@@ -79,17 +79,16 @@
 
 **`_max_ratio_above_min(cls, v, info)`** — `field_validator` поля `groq_calibration_max_ratio`: значение должно быть строго больше уже проверенного `groq_calibration_min_ratio`. **Исключение:** `ValueError`.
 
-### 3.5. Эвристика оценки токенов
+### 3.5. Подсчёт токенов
 
 | Поле | Тип | Дефолт | Назначение |
 |---|---|---|---|
-| `groq_chars_per_token_cyrillic` | `float` (`gt=0`) | `2.3` | Символов на токен для кириллицы. |
-| `groq_chars_per_token_latin` | `float` (`gt=0`) | `4.0` | Для латиницы. |
-| `groq_cyrillic_ratio_threshold` | `float` (`0..1`) | `0.3` | Порог доли кириллицы. |
+| `groq_use_tiktoken` | `bool` | `True` | Считать токены через `tiktoken` для `openai/gpt-oss-20b/120b` (`../llm/groq_client.md §6.2`). `False` или недоступный `tiktoken` → эвристика по символам. |
+| `groq_chars_per_token_cyrillic` | `float` (`gt=0`) | `2.3` | Символов на токен для кириллицы (эвристика). |
+| `groq_chars_per_token_latin` | `float` (`gt=0`) | `4.0` | Для латиницы (эвристика). |
+| `groq_cyrillic_ratio_threshold` | `float` (`0..1`) | `0.3` | Порог доли кириллицы (эвристика). |
 
-Эвристика используется, только если `tiktoken` недоступен: для `openai/gpt-oss-20b/120b` `GroqClient` считает токены через `tiktoken` (`o200k_harmony`, запасная `o200k_base`).
-
-**Необъявленное поле `groq_use_tiktoken`.** `GroqClient` читает `getattr(settings, "groq_use_tiktoken", True)`, но в `Settings` поля нет: переменная `GROQ_USE_TIKTOKEN` в `.env` игнорируется, всегда действует `True`. Чтобы флаг заработал, добавьте `groq_use_tiktoken: bool = Field(default=True)`.
+Эвристика используется, только если `tiktoken` отключён или недоступен: для `openai/gpt-oss-20b/120b` `GroqClient` считает токены через `tiktoken` (`o200k_harmony`, запасная `o200k_base`).
 
 ---
 
@@ -107,8 +106,7 @@
 | Поле | Тип | Дефолт | Назначение |
 |---|---|---|---|
 | `free_only` | `bool` | `True` | Только бесплатные провайдеры; проверяется `validate_free_only()` (§12.2). |
-| `max_llm_calls_per_task` | `int` (`ge=1`) | `40` | Потолок вызовов на сессию, не зависит от провайдера (`../orchestrator/budget.md`). |
-| `max_llm_retries` | `int` (`ge=0`) | `3` | **Не используется**: повторы заданы декораторами `tenacity` в клиентах. |
+| `max_llm_calls_per_task` | `int` (`ge=1`) | `40` | Потолок вызовов на сессию, не зависит от провайдера (`../orchestrator/budget.md`). Повторы при сетевых сбоях и 429 заданы декораторами `tenacity` в клиентах, отдельной настройки нет. |
 
 ---
 
@@ -157,9 +155,7 @@
 
 ## 10. Critic (удалён)
 
-| Поле | Тип | Дефолт | Назначение |
-|---|---|---|---|
-| `max_critic_rounds` | `int` (`ge=0`) | `1` | **Не используется**: роль Critic удалена. Поле оставлено, чтобы старые `.env` не ломались; можно удалить вместе с упоминаниями. |
+Поле `max_critic_rounds` удалено вместе с ролью Critic. Ключ `MAX_CRITIC_ROUNDS` в старом `.env` игнорируется (`extra="ignore"`).
 
 ---
 
@@ -208,7 +204,7 @@ Orchestrator.run              → research_mode, max_subpoints_per_generation_ba
 
 llm/factory.py                → llm_provider, groq_api_key (в GroqClient), groq_extraction_model/_tpm_limit,
                                  groq_share_limiter_when_same_model, openrouter_* (для openrouter)
-llm/groq_client.py::GroqClient → все groq_* (в т.ч. groq_reserved_output_by_role и необъявленный groq_use_tiktoken)
+llm/groq_client.py::GroqClient → все groq_* (в т.ч. groq_reserved_output_by_role и groq_use_tiktoken)
 
 roles/vault_analyst.py        → пороги dedup и default_notes_folder (через Orchestrator)
 roles/elaborator.py           → max_subpoints_per_generation_batch (через Orchestrator)

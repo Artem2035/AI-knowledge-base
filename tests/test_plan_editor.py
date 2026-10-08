@@ -36,3 +36,12 @@ def test_tree_shows_domain_and_kind():
     root = plan_editor.build_plan_tree(_plan())
     assert "technical" in str(root.label)
     assert "(definition)" in str(root.children[0].children[0].label)
+
+def test_parse_indices_supports_ranges_and_dedup():
+    assert plan_editor._parse_indices("1,3-5,4", 6) == [4, 3, 2, 0]
+    assert plan_editor._parse_indices("4-2", 6) == [3, 2, 1]  # перевёрнутый диапазон
+
+
+def test_parse_indices_rejects_bad_input():
+    for raw in ("", "a", "0", "7", "2-9", "-3", "1-"):
+        assert plan_editor._parse_indices(raw, 6) is None

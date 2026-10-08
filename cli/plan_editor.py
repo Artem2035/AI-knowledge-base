@@ -33,6 +33,9 @@ _DOMAIN_LABELS_RU = {
     "life_management": "life management (навыки, привычки, продуктивность)",
 }
 
+_INDICES_RE = re.compile(r"\s*\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*\s*")
+_INDEX_PART_RE = re.compile(r"(\d+)(?:\s*-\s*(\d+))?")
+
 console = Console()
 
 
@@ -185,26 +188,27 @@ def _select_note_index(plan: Plan, prompt: str) -> int | None:
     return idx - 1
 
 def _parse_indices(raw: str, count: int) -> list[int] | None:
-    """Разбирает строку вида '2,4,5' (1-based номера, как в
-    _select_note_index/_select_subpoint_index) в список 0-based индексов,
-    отсортированный по УБЫВАНИЮ и без дублей — такой порядок позволяет
-    удалять элементы последовательными pop() без пересчёта индексов
-    оставшихся элементов после каждого удаления."""
-    try:
-        if '-' in raw:
-            l = re.findall(r'(\d+-\d+|\d)', raw)
-            console.print(f"номера - {l}")
-        indices = [int(x.strip()) - 1 for x in raw.split(",") if x.strip()]
-    except ValueError:
-        console.print("[red]Не удалось разобрать номера — используйте запятую как разделитель.[/red]")
+    """Разбирает строку вида '2,4,5' или '1,3-5' (1-based номера и
+    диапазоны) в список 0-based индексов по УБЫВАНИЮ без дублей — так
+    элементы можно удалять последовательными pop() без пересчёта."""
+    if not _INDICES_RE.fullmatch(raw):
+        console.print(
+            "[red]Не удалось разобрать номера — используйте запятую как "
+            "разделитель и дефис для диапазонов (например: 1,3-5).[/red]"
+        )
         return None
-    if not indices:
-        console.print("[red]Не указано ни одного номера.[/red]")
-        return None
-    if any(i < 0 or i >= count for i in indices):
-        console.print(f"[red]Номер вне диапазона [1, {count}].[/red]")
-        return None
-    return sorted(set(indices), reverse=True)
+    indices: set[int] = set()
+    for m in _INDEX_PART_RE.finditer(raw):
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else start
+        if start > end:
+            start, end = end, start
+        # границы проверяем ДО раскрытия диапазона
+        if start < 1 or end > count:
+            console.print(f"[red]Номер вне диапазона [1, {count}].[/red]")
+            return None
+        indices.update(range(start - 1, end))
+    return sorted(indices, reverse=True)
 
 def _select_subpoint_index(note: OutlineNote) -> int | None:
     if not note.subpoints:

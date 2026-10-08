@@ -16,27 +16,32 @@
 
 **Описание.** Универсальный батчер по ЧИСТО ТОКЕННОМУ бюджету:
 1. Если `items` пуст — возвращает `[]` немедленно.
-2. `budget_fn = getattr(client, "available_prompt_budget_tokens", None)` —
-   если у клиента НЕТ этого метода — возвращает ОДИН батч со всеми
-   элементами, без деления.
+2. `budget_fn = getattr(client, "available_prompt_budget_tokens", None)` и
+   `count = getattr(client, "estimate_tokens", None) or llm.common.estimate_tokens`.
+   Если у клиента НЕТ `available_prompt_budget_tokens` — возвращает ОДИН
+   батч со всеми элементами, без деления. Если у клиента есть публичный
+   `estimate_tokens` (у `GroqClient`: `tiktoken` для gpt-oss,
+   `groq_client.md §6.2`), этот счётчик применяется и к накладным расходам,
+   и к каждому элементу: батчи считаются тем же способом, что и бюджет
+   самого клиента.
 3. `available_tokens = budget_fn(system_instruction, response_model)` —
    если `None` — также один батч без деления.
-4. `overhead_tokens = estimate_tokens(static_overhead_text)`,
+4. `overhead_tokens = count(static_overhead_text)`,
    `text_budget_tokens = max(available_tokens - overhead_tokens, 0)`.
 5. Если `text_budget_tokens <= 0` — КАЖДЫЙ элемент идёт ОТДЕЛЬНЫМ батчем,
    дальше клиент сам решит (auto-truncate/ошибка), но хотя бы НЕ теряется
    весь список сразу.
 6. Иначе — жадный проход по `items`: накапливает `current` батч, суммируя
-   `estimate_tokens(render_item(item))`; если добавление ОЧЕРЕДНОГО
-   элемента превысило бы `text_budget_tokens` (и текущий батч уже НЕПУСТ) —
-   батч закрывается, начинается новый.
+   `count(render_item(item))`; если добавление ОЧЕРЕДНОГО элемента превысило
+   бы `text_budget_tokens` (и текущий батч уже НЕПУСТ) — батч закрывается,
+   начинается новый.
 
 **Параметры:**
 
 | Имя | Тип | Назначение |
 |---|---|---|
 | `items` | `Sequence[T]` | Элементы для батчинга. |
-| `client` | LLM-клиент (keyword-only) | Источник `available_prompt_budget_tokens(...)`. |
+| `client` | LLM-клиент (keyword-only) | Источник `available_prompt_budget_tokens(...)` и (опционально) `estimate_tokens(...)`. |
 | `system_instruction` | `str` (keyword-only) | Для оценки накладных расходов схемы+системы. |
 | `response_model` | `type[BaseModel]` (keyword-only) | Класс ожидаемого ответа — его JSON Schema тоже занимает токены. |
 | `render_item` | `Callable[[T], str]` (keyword-only) | Как отрендерить ОДИН элемент в текст для оценки размера в токенах. |
@@ -50,7 +55,8 @@
 
 **Кто вызывает:** `roles/vault_analyst.py::_assign_folders_batch`
 (`../roles/vault_analyst.md`), а также §2 ниже (внутри
-`batch_for_quality_and_budget`).
+`batch_for_quality_and_budget`). Прежние вызовы из `roles/researcher.py` и
+`roles/extractor_critic.py` относятся к заблокированному web-режиму.
 
 ## 2. `batch_for_quality_and_budget(items, *, client, system_instruction, response_model, render_item, static_overhead_text, max_items_per_batch) -> list[list[T]]`
 
@@ -75,16 +81,18 @@
 
 | Имя | Тип | Назначение |
 |---|---|---|
-| `max_items_per_batch` | `int` (keyword-only) | Качественный потолок элементов на один вызов. Из `settings.max_subpoints_per_generation_batch` (дефолт `6`). |
+| `max_items_per_batch` | `int` (keyword-only) | Качественный потолок элементов на один вызов. |
 
 **Возвращаемое значение:** `list[list[T]]` — финальные батчи, каждый не
 длиннее `max_items_per_batch` (кроме описанного выше редкого исключения).
 
 **Исключения:** те же, что у `split_items_into_batches` (не поднимает).
 
-**Кто вызывает:** ИСКЛЮЧИТЕЛЬНО `roles/elaborator.py::elaborate_outline`
-(`../roles/elaborator.md`) — единственное место в проекте, где используется
-ДВОЙНОЕ ограничение (токен + качество).
+**Кто вызывает:** `roles/elaborator.py::elaborate_outline` (потолок
+`settings.max_subpoints_per_generation_batch`, дефолт 3) и
+`roles/annotator.py::annotate_notes` (потолок `_MAX_NOTES_PER_BATCH = 6`);
+см. `../roles/elaborator.md`, `../roles/annotator.md`. Двойное ограничение
+(токены и качество) используют оба.
 
 ---
 
@@ -99,31 +107,29 @@ build_elaboration_units(plan, already_done_subpoint_ids)  ── list[Elaboratio
         ▼
 batch_for_quality_and_budget(
     units, client=client,
-    system_instruction=llm/prompts/elaborator.py::SYSTEM_INSTRUCTION,   (см. prompts.md §3)
-    response_model=llm/schemas.py::ElaborationOutput,                  (см. schemas.md §2)
-    render_item=lambda u: f"{u.note.title} :: {u.subpoint.heading}\n{u.subpoint.covers}",
-    static_overhead_text=...,
+    system_instruction=llm/prompts/elaborator.py::get_system_instruction(plan.domain),  (prompts.md §2)
+    response_model=llm/schemas.py::SectionBatchOutput,                                  (schemas.md §2)
+    render_item=_render_unit,
+    static_overhead_text=_frame(plan),
     max_items_per_batch=settings.max_subpoints_per_generation_batch,
 )
         │
         ▼  для каждого батча
-_elaborate_batch(batch, plan, client, status)
+_elaborate_batch(batch, plan, client, status, system_instruction)
         │
         ▼
-client.generate_structured(
-    role="elaborator",
-    prompt=<нумерованный листинг батча>,
-    response_model=llm/schemas.py::ElaborationOutput,
-    status=status,
-    system_instruction=llm/prompts/elaborator.py::SYSTEM_INSTRUCTION,
-)
+client.generate_structured(role="elaborator", response_model=SectionBatchOutput, ...)
         │
         ▼
 GroqClient.generate_structured(...)  ── см. groq_client.md §6.4
         │
         ▼
-ElaborationOutput  →  список storage/models.py::Evidence (через unit_index)
+SectionBatchOutput  →  список storage/models.py::SectionDraft (через unit_index)
 ```
+
+Аннотатор идёт тем же путём: `annotate_notes` → `batch_for_quality_and_budget`
+(`AnnotationBatchOutput`, `_render`, `_frame`, потолок 6) → `_annotate_batch` →
+`NoteAnnotation`.
 
 Документация по `llm/chunking.py` завершена. Весь пакет `llm/` — см.
 `_index.md`.

@@ -201,3 +201,35 @@ def test_merge_callback_runs_before_relationships(tmp_path, monkeypatch):
     paths = {d.path for d in result.changeset.creates}
     assert all(r.from_note in paths for r in result.changeset.relationships)
     assert not any(d.is_moc for d in result.changeset.creates)
+
+def test_failed_validation_keeps_checkpoint_and_resume_costs_no_llm(tmp_path, monkeypatch):
+    import orchestrator.state_machine as sm
+    from storage.models import ValidationIssue, ValidationReport
+
+    settings = _settings(tmp_path)
+    real_validation = sm.run_validation
+    failing = ValidationReport(ok=False, issues=[ValidationIssue(level="error", code="x", message="m")])
+    monkeypatch.setattr(sm, "run_validation", lambda *a, **k: failing)
+
+    orch = _orchestrator(monkeypatch, settings, _MainFake(), _ExtractionFake())
+    try:
+        first = orch.run(raw_query="Изучи тему")
+    finally:
+        orch.close()
+
+    assert not first.stopped and not first.changeset.validation.ok
+    assert first.changeset.raw_query == "Изучи тему"
+    cp = load_checkpoint(settings.checkpoint_dir, first.task_id)
+    assert cp is not None and cp.last_completed_stage == "validation_failed"
+
+    monkeypatch.setattr(sm, "run_validation", real_validation)
+    main2, ext2 = _MainFake(), _ExtractionFake()
+    orch = _orchestrator(monkeypatch, settings, main2, ext2)
+    try:
+        second = orch.run(resume_task_id=first.task_id)
+    finally:
+        orch.close()
+
+    assert second.changeset.validation.ok
+    assert main2.calls == [] and ext2.calls == []
+    assert load_checkpoint(settings.checkpoint_dir, first.task_id) is None

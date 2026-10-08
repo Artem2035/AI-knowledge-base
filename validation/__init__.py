@@ -26,10 +26,11 @@ def validate_no_unauthorized_deletes(
 
 
 def run_validation(
-    changeset: StagingChangeset, db: VaultDB, allow_delete: bool, plan: "Plan | None" = None
+    changeset: StagingChangeset, db: VaultDB, allow_delete: bool,
+    plan: "Plan | None" = None, extra_issues: list[ValidationIssue] | None = None,
 ) -> ValidationReport:
     all_drafts = changeset.creates + changeset.updates
-    issues: list[ValidationIssue] = []
+    issues: list[ValidationIssue] = list(extra_issues or [])
 
     issues += validate_no_unauthorized_deletes(changeset, allow_delete)
     issues += validate_no_path_collisions(all_drafts, db)

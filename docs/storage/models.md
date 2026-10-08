@@ -95,7 +95,7 @@ UTC, ISO 8601. `default_factory` для `created_at`/`timestamp`.
 | `draft_id` | `str` | `_new_id`. |
 | `note_id` | `str` | Дефолт `""`. Пусто у объединённых черновиков и MOC (для них `validate_headings_coverage` — no-op). |
 | `action` | `NoteAction` | Обязательное. |
-| `path` | `str` | CREATE — новый путь; UPDATE — путь существующей заметки. |
+| `path` | `str` | CREATE — новый путь; UPDATE — путь существующей заметки. При конфликте путей `validation/autofix.py` добавляет к нему суффикс « (N)». |
 | `title`, `folder` | `str` | Заголовок и папка. |
 | `frontmatter` | `dict` | При рендере ограничен ключами `title`/`tags`/`created`/`source` (`../tools/markdown_tools.md`). |
 | `body_md` | `str` | Тело для CREATE. |
@@ -124,7 +124,7 @@ UTC, ISO 8601. `default_factory` для `created_at`/`timestamp`.
 `ok` (нет ни одной `error`), `issues`; свойства `errors`, `warnings`.
 
 ### 5.3. `class StagingChangeset(BaseModel)`
-`task_id`, `created_at`, `creates`, `updates`, `deletes` (в MVP всегда пуст), `relationships`, `validation: ValidationReport | None`. `validation is None` значит «не проходил `run_validation`», `commit_changeset` откажет (`../staging/commit.md`).
+`task_id`, `raw_query = ""` (исходный запрос пользователя; пусто у старых `changeset.json`: тогда `pending` показывает заголовок MOC или первой заметки), `created_at`, `creates`, `updates`, `deletes` (в MVP всегда пуст), `relationships`, `validation: ValidationReport | None`. `validation is None` значит «не проходил `run_validation`», `commit_changeset` откажет (`../staging/commit.md`).
 
 ---
 
@@ -148,11 +148,11 @@ Task ─► Plan(domain, summary) ─► OutlineNote ─► OutlineSubpoint(kind
    Elaborator ─► SectionDraft ─┐          Annotator ─► NoteAnnotation
                                ▼                          ▼
               tools/note_assembly.build_draft_note ─► DraftNote
-                    │ (merge: merged_from)  │ (apply_inline_links)
+                    │ (merge: merged_from)  │ (autofix путей, apply_inline_links)
                     ▼                       ▼
                  build_moc ─► DraftNote(is_moc) ─► Relationship
                                       ▼
-        StagingChangeset ─► run_validation ─► ValidationReport ─► save_changeset ─► approve ─► commit
+        StagingChangeset(raw_query) ─► run_validation ─► ValidationReport ─► save_changeset ─► approve ─► commit
 ```
 
 Документация по `storage/models.py` завершена. Обзор пакета — `_index.md`.

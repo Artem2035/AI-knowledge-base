@@ -41,11 +41,12 @@ Pydantic-объект ответа ─► роль конвертирует в �
 | 4 | Annotation | `annotator.annotate_notes` | `self.llm` | `annotator` | ⌈N/6⌉ батчей |
 | 5 | Сборка заметок | `note_assembly.build_draft_note` | — | — | нет |
 | 5.5 | Слияние (опц.) | `merge_confirm_cb` → `fix_links_after_merge` | — | — | нет |
+| 5.7 | Автоисправление путей | `validation.autofix.autofix_drafts` | — | — | нет |
 | 6 | Inline-ссылки | `apply_inline_links` | — | — | нет |
 | 7 | MOC | `build_moc` (при ≥2 create) | — | — | нет |
 | 8 | Связи | `build_relationships` | — | — | нет |
 | 9 | Валидация | `validation.run_validation` | — | — | нет |
-| 10 | Staging | `save_changeset`, `delete_checkpoint` | — | — | нет |
+| 10 | Staging | `save_changeset`, `delete_checkpoint` (только при `validation.ok`) | — | — | нет |
 
 S — число подпунктов плана, N — число create-заметок. Оценка для S=24, N=6: planner 1 + elaborator 8 + folder_assignment 1 + vault_dedup 0–2 + annotator 1 ≈ 10–13 вызовов. Ориентир по реальному прогону: 10 вызовов (planner 1, elaborator 5, vault_dedup 2, folder_assignment 1, annotator 1).
 
@@ -55,6 +56,7 @@ S — число подпунктов плана, N — число create-зам
 - Elaborator возвращает секцию для **каждого** подпункта: неверный или пропавший `unit_index` отбрасывается, один повтор за пропавшими, затем placeholder с `needs_check`; незакрытый fence — повтор, затем закрытие кодом. Чистка текста (`prepare_section`): заголовки `##…####`, омоглифы, U+2011.
 - Annotator при сбое возвращает пустую аннотацию: теги, ссылки и резюме не критичны.
 - Тело заметки, `abstract`-callout (≥8 разделов), humanities-предупреждение и теги `domain/…` добавляет код.
+- Конфликты путей (файл уже есть в Vault или два одинаковых заголовка в задаче) решает автоисправление суффиксом « (2)» и предупреждением `path_autofixed` (`../validation/autofix.md`).
 - `RESEARCH_MODE=web` заблокирован.
 
 ## 5. Путь одного вызова `generate_structured`
@@ -62,22 +64,24 @@ S — число подпунктов плана, N — число create-зам
 1. `LLMBudget`: лимит вызовов на задачу, soft-лимит RPD, локальный throttle RPM.
 2. Формат ответа: strict `json_schema` для `gpt-oss-*`, иначе `json_object` + схема в тексте (`../llm/groq_client.md §6.5`).
 3. Оценка токенов system и схемы; резерв вывода по роли: `groq_reserved_output_by_role` либо накопленная EMA калибратора, не ниже пола.
-4. Если промпт не влезает в TPM-бюджет, `_auto_truncate_prompt` режет его с конца. Для списков этого избегают батчингом ДО вызова (`../llm/chunking.md`).
+4. Если промпт не влезает в TPM-бюджет, `_auto_truncate_prompt` режет его с конца. Для списков этого избегают батчингом ДО вызова (`../llm/chunking.md`), который считает токены тем же счётчиком, что и клиент.
 5. Параметры рассуждений (`include_reasoning`, `reasoning_effort` по роли) для поддерживаемых моделей.
 6. `TokenRateLimiter.wait_and_reserve`: ожидание следующей календарной минуты, если места не хватает.
-7. HTTP-запрос с retry на rate limit и сетевые сбои (`tenacity`); при отказе API от строгой схемы или параметров рассуждений — разовый откат.
+7. HTTP-запрос с retry на rate limit и сетевые сбои (`tenacity`); при отказе API от строгой схемы или параметров рассуждений — разовый откат (при откате схемы параметры рассуждений сохраняются).
 8. `_parse_with_repair`; `LLMBudget.register_call`.
 9. Обучение калибраторов фактическим расходом: вход и вывод калибруются раздельно.
 
 Детали каждого шага — `../llm/groq_client.md`.
 
-## 6. Что происходит при исчерпании лимита
+## 6. Что происходит при исчерпании лимита и при ошибках валидации
 
-Устойчивая 429, `MAX_LLM_CALLS_PER_TASK` или дневной soft-лимит дают `LLMFreeLimitReached` / `LLMTaskBudgetExceeded`. Исключение всплывает до `Orchestrator.run()`, который сохраняет чекпоинт на последнем успешном шаге и возвращает `RunResult(stopped=True)` с командой `resume <task_id>`. Перехода на платный tier нет. При resume пропускаются планирование, утверждённый план и уже написанные разделы и аннотации.
+**Лимит.** Устойчивая 429, `MAX_LLM_CALLS_PER_TASK` или дневной soft-лимит дают `LLMFreeLimitReached` / `LLMTaskBudgetExceeded`. Исключение всплывает до `Orchestrator.run()`, который сохраняет чекпоинт на последнем успешном шаге и возвращает `RunResult(stopped=True)` с командой `resume <task_id>`. Перехода на платный tier нет. При resume пропускаются планирование, утверждённый план и уже написанные разделы и аннотации. При 429 с `retry_after` лимитер дополнительно выдерживает паузу (`force_wait`), прежде чем клиент повторит запрос.
+
+**Ошибки валидации.** При `validation.ok=False` задача всё равно доходит до staging (changeset виден в `pending`), но чекпоинт не удаляется: он сохраняется с меткой `validation_failed`. После устранения причины `resume <task_id>` пересобирает заметки и повторяет валидацию без LLM-вызовов. Простые конфликты путей решает автоисправление (`../validation/autofix.md`), остальные ошибки (`update_missing_target`, `empty_body` и т.п.) требуют вмешательства.
 
 ## Куда идти дальше
 
 - `../orchestrator/state_machine.md`, `../orchestrator/budget.md`
 - `../llm/core.md`, `../llm/groq_client.md`, `../llm/schemas.md`, `../llm/prompts.md`, `../llm/chunking.md`
-- `../roles/_index.md`, `../tools/note_assembly.md`
+- `../roles/_index.md`, `../tools/note_assembly.md`, `../validation/autofix.md`
 - `../storage/models.md`, `../staging/checkpoint.md`

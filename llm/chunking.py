@@ -56,7 +56,7 @@ def split_items_into_batches(
     current_tokens = 0
 
     for item in items:
-        item_tokens = estimate_tokens(render_item(item))
+        item_tokens = count(render_item(item))
         if current and current_tokens + item_tokens > text_budget_tokens:
             batches.append(current)
             current, current_tokens = [], 0

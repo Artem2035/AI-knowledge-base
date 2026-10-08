@@ -6,10 +6,10 @@
 
 - `Settings` (`config/settings.py`) читает переменные окружения и файл `.env` из **текущей рабочей директории** (откуда запускается `python -m cli.main ...`). Файл — UTF-8.
 - Имя переменной = имя поля в верхнем регистре: `groq_api_key` → `GROQ_API_KEY`. Для булевых допустимы `true/false/1/0`.
-- Неизвестные переменные игнорируются (`extra="ignore"`): опечатка в имени **не вызовет ошибки**, параметр просто останется по умолчанию.
+- Неизвестные переменные игнорируются (`extra="ignore"`): опечатка в имени **не вызовет ошибки**, параметр просто останется по умолчанию. Так же игнорируются ключи удалённых полей (`MAX_CRITIC_ROUNDS`, `MAX_LLM_RETRIES`) из старых `.env`.
 - `~` раскрывается автоматически только в `VAULT_PATH`, `WORKDIR`, `STAGING_DIR`, `DB_PATH`. В `CHECKPOINT_DIR` не раскрывается: задавайте абсолютный путь или путь без `~`. Пути в Windows лучше писать с прямыми слэшами.
 - Значение из реальной переменной окружения приоритетнее значения в `.env`.
-- `.env` содержит ключ API и **не должен попадать в Git** (должен быть в `.gitignore`).
+- `.env` содержит ключ API и **не должен попадать в систему контроля версий** (держите его вне публикуемых файлов).
 - Поля-словари и списки (`GROQ_RESERVED_OUTPUT_BY_ROLE`, `OPENROUTER_*_MODELS`) задаются **JSON** (§5, §6).
 
 ## 1. Минимальный `.env` (Groq)
@@ -43,7 +43,7 @@ VAULT_PATH=/абсолютный/путь/к/вашему/Vault
 | `WORKDIR` | `./.obsidian_ai_kb` | Корень рабочих файлов (вне Vault). |
 | `STAGING_DIR` | `./.obsidian_ai_kb/staging` | Предлагаемые изменения до `approve`. |
 | `DB_PATH` | `./.obsidian_ai_kb/vault_index.sqlite3` | SQLite-индекс Vault. |
-| `CHECKPOINT_DIR` | `./.obsidian_ai_kb/checkpoints` | Чекпоинты для `resume` (версия формата 5). |
+| `CHECKPOINT_DIR` | `./.obsidian_ai_kb/checkpoints` | Чекпоинты для `resume` (версия формата 5). Остаются и после задачи с ошибками валидации. |
 
 > Рабочие директории **должны быть вне Vault** (или в скрытой папке: `.`-папки индексатор пропускает). Относительные пути считаются от текущей директории запуска, поэтому запускайте команды всегда из одного места или задайте абсолютные пути.
 
@@ -52,7 +52,7 @@ VAULT_PATH=/абсолютный/путь/к/вашему/Vault
 | Переменная | По умолчанию | За что отвечает |
 |---|---|---|
 | `ALLOW_DELETE` | `false` | Разрешает удаление файлов Vault. В MVP список удалений всегда пуст; оставьте `false`. |
-| `GIT_ENABLED` | `false` | После `approve` делает `git add -A` + `git commit` в `VAULT_PATH`. Нужен git-репозиторий; сбой git не ломает запись. |
+| `GIT_ENABLED` | `false` | После `approve` выполняет автоматическую фиксацию изменений в `VAULT_PATH`. Нужен репозиторий; сбой не ломает запись. |
 
 ## 5. OpenRouter (второй провайдер)
 
@@ -87,6 +87,7 @@ OPENROUTER_PLANNING_MODELS=["nvidia/nemotron-3-ultra-550b-a55b:free","z-ai/glm-5
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | Основная модель (planner, vault_dedup, folder_assignment, annotator). `openai/gpt-oss-20b/120b` используют строгую JSON Schema, считают токены через `tiktoken` и принимают параметры рассуждений; остальные — `json_object`. |
 | `GROQ_TIMEOUT_SECONDS` | `60` | Таймаут одного запроса. |
 | `GROQ_TPM_LIMIT` | `8000` | Реальный TPM основной модели. Обновляйте вручную, если Groq изменит лимит. |
+| `GROQ_USE_TIKTOKEN` | `true` | Считать токены через `tiktoken` (для gpt-oss). `false` → эвристика по символам. |
 | `GROQ_RPM_SOFT_LIMIT` | `25` | Мягкий локальный лимит запросов в минуту (реальный ~30). |
 | `GROQ_RPD_SOFT_LIMIT` | `10000` | Мягкий дневной лимит основного клиента; счётчик только в памяти процесса. |
 | `GROQ_EXTRACTION_MODEL` | `openai/gpt-oss-120b` | Модель Elaborator (самая частая по числу вызовов). |
@@ -94,8 +95,6 @@ OPENROUTER_PLANNING_MODELS=["nvidia/nemotron-3-ultra-550b-a55b:free","z-ai/glm-5
 | `GROQ_EXTRACTION_RPD_SOFT_LIMIT` | `900` | Дневной soft-лимит extraction-клиента (реальный 1000). |
 | `GROQ_SHARE_LIMITER_WHEN_SAME_MODEL` | `true` | Если extraction-модель совпадает с основной, оба клиента делят один TPM-лимитер и калибратор (физически один лимит Groq). |
 | `GROQ_RESERVED_OUTPUT_BY_ROLE` | `{"elaborator": 2500, "outline_planner": 3000, "annotator": 2000}` | Стартовый резерв токенов вывода по ролям (JSON-объект; значение **заменяет словарь целиком**, не дополняет). После нескольких вызовов роли резерв подстраивается по факту. |
-
-> Подсчёт токенов `tiktoken` включён всегда: флаг `GROQ_USE_TIKTOKEN` в `Settings` не объявлен и переменная игнорируется (`settings.md §3.5`).
 
 ## 7. Groq: тонкая настройка лимитера (обычно не трогать)
 
@@ -112,7 +111,7 @@ OPENROUTER_PLANNING_MODELS=["nvidia/nemotron-3-ultra-550b-a55b:free","z-ai/glm-5
 | `GROQ_OUTPUT_CALIBRATION_EMA_ALPHA` | `0.3` | Скорость адаптации резерва под ответ. |
 | `GROQ_CALIBRATION_EMA_ALPHA` | `0.3` | Скорость адаптации оценки токенов промпта. |
 | `GROQ_CALIBRATION_MIN_RATIO` / `GROQ_CALIBRATION_MAX_RATIO` | `0.05` / `1.5` | Границы калибровочного коэффициента. **Max строго больше Min**, иначе `ValidationError`. |
-| `GROQ_CHARS_PER_TOKEN_CYRILLIC` / `_LATIN` | `2.3` / `4.0` | Символов на токен; запасная эвристика, если `tiktoken` недоступен. |
+| `GROQ_CHARS_PER_TOKEN_CYRILLIC` / `_LATIN` | `2.3` / `4.0` | Символов на токен; запасная эвристика, если `tiktoken` отключён или недоступен. |
 | `GROQ_CYRILLIC_RATIO_THRESHOLD` | `0.3` | Доля кириллицы, выше которой текст считается русским (для эвристики). |
 
 ## 8. Качество генерации и объединение заметок
@@ -122,7 +121,8 @@ OPENROUTER_PLANNING_MODELS=["nvidia/nemotron-3-ultra-550b-a55b:free","z-ai/glm-5
 | `MAX_SUBPOINTS_PER_GENERATION_BATCH` | `3` | Сколько подпунктов Elaborator пишет за один вызов. Меньше — глубже разделы, но больше вызовов. |
 | `ENABLE_DRAFT_MERGING` | `false` | Включает шаг объединения готовых заметок (без LLM). |
 | `DRAFT_MERGE_MODE` | `all` | `all` — все новые заметки сливаются в одну автоматически; `select` — вы выбираете группы. Действует только при `ENABLE_DRAFT_MERGING=true`. |
-| `MAX_CRITIC_ROUNDS` | `1` | **Не используется** (роль Critic удалена). Оставлена для совместимости со старыми `.env`. |
+
+Устаревшие ключи `MAX_CRITIC_ROUNDS` и `MAX_LLM_RETRIES` из старых `.env` игнорируются.
 
 ## 9. Поиск дубликатов и эмбеддинги
 
@@ -135,7 +135,7 @@ OPENROUTER_PLANNING_MODELS=["nvidia/nemotron-3-ultra-550b-a55b:free","z-ai/glm-5
 
 ## 10. Параметры web-режима
 
-Действуют только при `RESEARCH_MODE=web` (заблокирован): `MAX_SOURCES_PER_SUBTOPIC` (4), `MAX_SEARCH_RESULTS_PER_QUERY` (6), `MAX_CHUNKS_PER_SOURCE` (3). `MAX_LLM_RETRIES` (3) объявлен, но нигде не используется: повторы заданы в коде.
+Действуют только при `RESEARCH_MODE=web` (заблокирован): `MAX_SOURCES_PER_SUBTOPIC` (4), `MAX_SEARCH_RESULTS_PER_QUERY` (6), `MAX_CHUNKS_PER_SOURCE` (3).
 
 ## 11. Готовый шаблон `.env`
 
@@ -165,6 +165,7 @@ DEFAULT_NOTES_FOLDER=Знания
 GROQ_MODEL=openai/gpt-oss-120b
 GROQ_EXTRACTION_MODEL=openai/gpt-oss-120b
 GROQ_TPM_LIMIT=8000
+GROQ_USE_TIKTOKEN=true
 
 # --- дубликаты ---
 USE_LOCAL_EMBEDDINGS=true
@@ -181,10 +182,10 @@ DEDUP_LOW_THRESHOLD=0.55
 | `OrchestratorStopped` про `RESEARCH_MODE=web` | Web-режим заблокирован: используйте `knowledge`. |
 | Изменение в `.env` «не действует» | Опечатка в имени (неизвестные ключи игнорируются) либо переменная задана в окружении. |
 | Ошибка разбора `OPENROUTER_*_MODELS` или `GROQ_RESERVED_OUTPUT_BY_ROLE` | Значение должно быть JSON (массив или объект). |
-| `GROQ_USE_TIKTOKEN` «не действует» | Поле не объявлено в `Settings`: переменная игнорируется. |
 | Индекс пуст / заметки не находятся | `VAULT_PATH` не указан или указывает на `./vault_placeholder`. |
 | Задача часто останавливается по лимиту | Увеличьте `MAX_LLM_CALLS_PER_TASK`, уменьшите число заметок в плане; TPM Groq (8000) — самое узкое место. |
 | Warning `note_language_mismatch` | Модель написала заметку не на русском: проверьте текст перед `approve`. |
-| `AttributeError: force_wait` при 429 | В `TokenRateLimiter` не добавлен метод `force_wait` (`../llm/groq_client.md §5.9`). |
+| Warning `path_autofixed` | Заметке добавлен суффикс « (2)» из-за конфликта пути (`../validation/autofix.md`): проверьте имя перед `approve`. |
+| `ask` завершился с ошибками валидации | Чекпоинт сохранён: устраните причину и выполните `resume <task_id>`, LLM-вызовы не тратятся. |
 
 Документация по настройке `.env` завершена. Полный справочник по полям — `settings.md`, обзор пакета — `_index.md`.

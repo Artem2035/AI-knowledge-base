@@ -247,6 +247,7 @@ class ValidationReport(BaseModel):
 
 class StagingChangeset(BaseModel):
     task_id: str
+    raw_query: str = ""  # исходный запрос; пусто у старых changeset.json
     created_at: str = Field(default_factory=_now)
     creates: list[DraftNote] = Field(default_factory=list)
     updates: list[DraftNote] = Field(default_factory=list)

@@ -19,10 +19,10 @@
 | Поле | Тип | Назначение |
 |---|---|---|
 | `task_id` | `str` | Идентификатор задачи. |
-| `changeset` | `StagingChangeset \| None` | `None`, если задача остановлена до staging. |
+| `changeset` | `StagingChangeset \| None` | `None`, если задача остановлена до staging. При ошибках валидации заполнен (changeset сохранён, `validation.ok=False`). |
 | `status` | `TaskStatus` | Счётчик вызовов этой сессии. |
-| `stopped` | `bool` | `True`: остановка по бюджету, лимиту или отказу утвердить план. |
-| `message` | `str` | Сообщение для CLI. |
+| `stopped` | `bool` | `True`: остановка по бюджету, лимиту или отказу утвердить план. Ошибки валидации остановкой не считаются. |
+| `message` | `str` | Сообщение для CLI (при ошибках валидации содержит команду `resume`). |
 
 ## 4. `class Orchestrator`
 
@@ -56,13 +56,14 @@
 6. **annotation** батчами, `persist("annotating")`, в конце `annotation_done`;
 7. **сборка** `build_draft_note` по каждой заметке плана (`mark_source="model-knowledge"`);
 8. **слияние** `merge_confirm_cb(drafts)` и затем `fix_links_after_merge` — только если `settings.enable_draft_merging` **и** колбэк передан;
-9. **inline-ссылки** `apply_inline_links` для каждого черновика;
-10. **MOC** `build_moc(...)`; если вернулся не `None`, ставится первым в список;
-11. **relationships** `build_relationships(drafts)` — после слияния и MOC;
-12. **validation** `run_validation(changeset, db, allow_delete, plan=plan)`;
-13. **staging** `save_changeset`, затем `delete_checkpoint`.
+9. **автоисправление путей** `autofix_drafts(drafts, db.get_all_paths())` (`../validation/autofix.md`): суффикс « (2)» при конфликте пути с Vault или другой заметкой задачи; предупреждения `path_autofixed` передаются в `run_validation`;
+10. **inline-ссылки** `apply_inline_links` для каждого черновика;
+11. **MOC** `build_moc(...)`; если вернулся не `None`, ставится первым в список;
+12. **relationships** `build_relationships(drafts)` — после слияния, автоисправления и MOC;
+13. **validation** `run_validation(changeset, db, allow_delete, plan=plan, extra_issues=autofix_issues)`;
+14. **staging** `save_changeset` (с `raw_query`). При `validation.ok` чекпоинт удаляется (`delete_checkpoint`). Иначе он сохраняется с меткой `validation_failed`, а `RunResult.message` содержит команду `resume`: шаги 7–14 не хранят состояния и не вызывают LLM, повторный запуск ничего не тратит.
 
-Шаги 7–13 не имеют состояния и выполняются заново при каждом запуске (в том числе при resume); `DraftNote` в чекпоинте не хранятся.
+Шаги 7–14 не имеют состояния и выполняются заново при каждом запуске (в том числе при resume); `DraftNote` в чекпоинте не хранятся. `vault_analysis_done` при resume не пересчитывается: решения create/update остаются прежними, а конфликты путей закрывает автоисправление.
 
 | Параметр | Тип | Назначение |
 |---|---|---|
@@ -78,7 +79,7 @@
 
 **Нюанс:** проверка `research_mode == "web"` выполняется после `_load_or_create_state`, поэтому для новой задачи пустой чекпоинт успевает сохраниться до `OrchestratorStopped`. На работу не влияет (виден в `resumable` как шаг `created`).
 
-**Локальные функции:** `report(stage)` — прокси к `progress_cb`; `persist(stage_label)` — сохраняет чекпоинт (обновляет `last_completed_stage`, `status`, `total_llm_calls_used`). Вызывается после каждого батча — это и есть механизм resume.
+**Локальные функции:** `report(stage)` — прокси к `progress_cb`; `persist(stage_label)` — сохраняет чекпоинт (обновляет `last_completed_stage`, `status`, `total_llm_calls_used`). Вызывается после каждого батча и при `validation_failed` — это и есть механизм resume.
 
 ### `_load_or_create_state(self, *, raw_query, resume_task_id, report) -> tuple[TaskCheckpoint, Task, TaskStatus, int]`
 Загружает чекпоинт (resume) или создаёт `Task`/`TaskStatus`/`TaskCheckpoint` и сразу сохраняет его. Возвращает `(checkpoint, task, status, base_total_calls)`; `status` всегда новый (`llm_calls_used=0`).
@@ -103,6 +104,6 @@
 | `language` | `_load_or_create_state` |
 | `llm_provider` | подписи прогресса |
 
-`max_critic_rounds` модулем больше не используется (Critic удалён). `draft_merge_mode` читает `cli/main.py`.
+`draft_merge_mode` читает `cli/main.py`.
 
 Документация по `orchestrator/state_machine.py` завершена. Далее — `../flows/llm_cycle.md`.

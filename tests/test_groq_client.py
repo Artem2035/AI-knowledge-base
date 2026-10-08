@@ -526,28 +526,39 @@ class TestConfigurableCharsPerToken:
         )
         assert result == 3.0
 
-    # def test_groq_client_uses_settings_coefficients(self, monkeypatch):
-    #     def fake_create(**kwargs):
-    #         return _make_response('{"value": "ok"}')
-    #
-    #     _install_fake_openai(monkeypatch, fake_create)
-    #
-    #     from llm.groq_client import GroqClient
-    #
-    #     settings = _settings(
-    #         groq_chars_per_token_cyrillic=1.0,  # искусственно занижаем -> оценка токенов растёт
-    #         groq_chars_per_token_latin=1.0,
-    #     )
-    #     client = GroqClient(settings=settings, budget=LLMBudget(10, 100, 100))
-    #
-    #     naive_with_custom = client._estimate_tokens("привет мир, это тестовый текст")
-    #
-    #     default_settings = _settings()
-    #     default_client = GroqClient(settings=default_settings, budget=LLMBudget(10, 100, 100))
-    #     naive_with_default = default_client._estimate_tokens("привет мир, это тестовый текст")
-    #
-    #     # При cyrillic_chars_per_token=1.0 (меньше символов на токен) оценка
-    #     # ДОЛЖНА быть больше, чем при дефолтном 2.3 — прямое подтверждение,
-    #     # что GroqClient реально читает коэффициенты из Settings, а не
-    #     # только полагается на хардкод llm/common.py.
-    #     assert naive_with_custom > naive_with_default
+def test_groq_schema_fallback_keeps_reasoning_params(monkeypatch):
+    captured = []
+
+    def fake_create(**kwargs):
+        captured.append(kwargs)
+        if kwargs["response_format"]["type"] == "json_schema":
+            raise Exception("400 invalid json schema: response_format")
+        return _make_response('{"value": "ok"}')
+
+    _install_fake_openai(monkeypatch, fake_create)
+    from llm.groq_client import GroqClient
+
+    client = GroqClient(settings=_settings(groq_model="openai/gpt-oss-120b"), budget=LLMBudget(5, 100, 100))
+    result = client.generate_structured(
+        role="vault_dedup", prompt="p", response_model=_DummyOutput, status=TaskStatus(task_id="fb1")
+    )
+    assert result.value == "ok"
+    assert captured[0]["response_format"]["type"] == "json_schema"
+    assert captured[1]["response_format"]["type"] == "json_object"
+    assert captured[1]["extra_body"] == {"include_reasoning": False, "reasoning_effort": "low"}
+
+def test_force_wait_sleeps_capped(monkeypatch):
+    from llm.groq_client import TokenRateLimiter
+
+    slept = []
+    monkeypatch.setattr("time.sleep", lambda s: slept.append(s))
+    limiter = TokenRateLimiter(tpm_limit=8000)
+    limiter.force_wait(10.0)
+    limiter.force_wait(9999.0)
+    assert slept == [10.0, 60.0]
+
+def test_groq_use_tiktoken_is_declared_setting():
+    assert "groq_use_tiktoken" in Settings.model_fields
+    assert _settings().groq_use_tiktoken is True
+    assert "max_critic_rounds" not in Settings.model_fields
+    assert "max_llm_retries" not in Settings.model_fields

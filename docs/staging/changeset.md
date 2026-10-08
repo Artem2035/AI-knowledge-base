@@ -2,15 +2,11 @@
 
 > Reference-док. Обзор пакета — `_index.md`.
 
-**Назначение.** `StagingChangeset` (`../storage/models.md §5.3`)
-Orchestrator строит в самом конце workflow и сохраняет на диск ДО показа
-пользователю diff. Ничего не пишет в реальный Vault — файлы лежат ВНЕ
-Vault, в `settings.staging_dir`.
+**Назначение.** `StagingChangeset` (`../storage/models.md §5.3`) Orchestrator строит в самом конце workflow и сохраняет на диск ДО показа пользователю diff. Ничего не пишет в реальный Vault — файлы лежат ВНЕ Vault, в `settings.staging_dir`. Changeset сохраняется и при ошибках валидации (его видно в `pending`), но `approve` для такого changeset заблокирован.
 
 ## 1. `staging_task_dir(staging_dir: Path, task_id: str) -> Path`
 
-Строит путь к каталогу задачи: `staging_dir / task_id` (может не
-существовать). Чистая конкатенация путей, не обращается к ФС.
+Строит путь к каталогу задачи: `staging_dir / task_id` (может не существовать). Чистая конкатенация путей, не обращается к ФС.
 
 | Имя | Тип | Назначение |
 |---|---|---|
@@ -21,9 +17,11 @@ Vault, в `settings.staging_dir`.
 
 **Описание.** Сохраняет ДВА артефакта:
 1. `changeset.json` — машиночитаемый дамп
-   (`changeset.model_dump_json(indent=2)`), из которого читает `approve`;
+   (`changeset.model_dump_json(indent=2)`, включая `raw_query`), из которого читают `approve` и `pending`;
 2. `notes_preview/*.md` — человекочитаемое превью каждого черновика (и
    `creates`, и `updates`) для просмотра в обычном редакторе, ВНЕ Vault.
+
+Перед записью превью каталог `notes_preview/` очищается от `*.md` прошлого запуска: после `resume` имена файлов могут измениться из-за автоисправления путей, и старые превью иначе остались бы рядом с новыми.
 
 Для превью используется `draft.append_section` (для `update`) или полный
 рендер `tools/markdown_tools.py::render_markdown(draft)`
@@ -35,17 +33,17 @@ Vault, в `settings.staging_dir`.
 
 **Исключения:** `OSError` при проблемах записи — не перехватывается.
 
-**Побочные эффекты:** создаёт `task_dir` и `task_dir/"notes_preview"`.
+**Побочные эффекты:** создаёт `task_dir` и `task_dir/"notes_preview"`, удаляет старые `*.md` превью.
 
 ## 3. `load_changeset(staging_dir: Path, task_id: str) -> StagingChangeset | None`
 
 Загружает `changeset.json` обратно в объект. Используется в
-`cli/main.py::approve` (`../cli/_index.md`).
+`cli/main.py::approve` и `pending` (`../cli/main.md`).
 
 **Возвращаемое значение:** `None`, если файла нет.
 
 **Исключения:** `json.JSONDecodeError` (файл повреждён),
-`pydantic.ValidationError` (не соответствует схеме) — не перехватываются.
+`pydantic.ValidationError` (не соответствует схеме) — не перехватываются (`pending` перехватывает их сам и показывает строкой об ошибке).
 
 ## 4. `list_pending_tasks(staging_dir: Path) -> list[str]`
 

@@ -50,6 +50,7 @@ from tools.dedup import try_create_embedder
 from tools.markdown_tools import slugify_filename
 from tools.note_assembly import build_draft_note, apply_inline_links, build_moc
 from validation import run_validation
+from validation.autofix import autofix_drafts
 from vault.db import VaultDB
 from vault.index import VaultIndexer
 
@@ -329,6 +330,9 @@ class Orchestrator:
                 # ссылки других заметок на исходные заголовки -> на объединённую
                 drafts = fix_links_after_merge(drafts)
 
+            # -- Автоисправление конфликтов путей (без LLM, до inline-ссылок
+            # и MOC: они должны видеть итоговые заголовки) -----------------
+            drafts, autofix_issues = autofix_drafts(drafts, self.db.get_all_paths())
             # -- Inline-ссылки по links_out (после слияния и чистки ссылок) --
             drafts = [apply_inline_links(d) for d in drafts]
 
@@ -355,27 +359,42 @@ class Orchestrator:
             updates = [d for d in drafts if d.action.value == "update"]
             changeset = StagingChangeset(
                 task_id=task.task_id,
+                raw_query=task.raw_query,
                 creates=creates,
                 updates=updates,
                 deletes=[],
                 relationships=relationships,
             )
-            changeset.validation = run_validation(changeset, self.db, self.settings.allow_delete, plan=plan)
+            changeset.validation = run_validation(
+                changeset, self.db, self.settings.allow_delete,
+                plan=plan, extra_issues=autofix_issues,
+            )
             report("Сохранение в staging (Vault пока не тронут)…")
             status.stage = "staged"
             save_changeset(self.settings.staging_dir, changeset)
 
-            # Задача доведена до staging — чекпоинт больше не нужен:
-            # дальнейшее состояние живёт в StagingChangeset.
-            delete_checkpoint(self.settings.checkpoint_dir, task.task_id)
-
-            status.finished = True
+            if changeset.validation.ok:
+                # Задача доведена до staging — чекпоинт больше не нужен.
+                delete_checkpoint(self.settings.checkpoint_dir, task.task_id)
+                status.finished = True
+                message = "Изменения подготовлены и ждут вашего approve."
+            else:
+                # Чекпоинт оставляем: resume пересоберёт заметки и заново
+                # проверит их без единого LLM-вызова (шаги сборки, валидации
+                # и staging не хранят состояния, индекс Vault синхронизируется
+                # при каждом запуске).
+                persist("validation_failed")
+                message = (
+                    "Валидация нашла ошибки, approve заблокирован. Прогресс "
+                    "сохранён: устраните причину и выполните "
+                    f"python -m cli.main resume {task.task_id}"
+                )
             return RunResult(
                 task_id=task.task_id,
                 changeset=changeset,
                 status=status,
                 stopped=False,
-                message="Изменения подготовлены и ждут вашего approve.",
+                message=message,
             )
 
         except (LLMFreeLimitReached, LLMTaskBudgetExceeded) as exc:

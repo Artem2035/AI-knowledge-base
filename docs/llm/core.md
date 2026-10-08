@@ -2,9 +2,10 @@
 
 > Reference-док. Эти три файла — провайдер-нейтральный "фундамент" LLM-слоя:
 > общий контракт (`base.py`), общие исключения/утилиты (`common.py`) и
-> единственная точка выбора провайдера (`factory.py`). Конкретные провайдеры
-> (`GroqClient`, `OpenRouterClient`, `RoleRoutingLLMClient`) — в
-> `groq_client.md`. Сам процесс одного вызова — в `../flows/llm_cycle.md`.
+> единственная точка выбора провайдера (`factory.py`). Основной провайдер —
+> `GroqClient` (`groq_client.md`); `RoleRoutingLLMClient` (`llm/router.py`) и
+> `OpenRouterClient` (`llm/openrouter_client.py`) намеренно не документируются
+> (`../CONTRIBUTING.md`). Сам процесс одного вызова — в `../flows/llm_cycle.md`.
 
 ---
 
@@ -27,11 +28,11 @@
 
 | Имя | Тип | Назначение |
 |---|---|---|
-| `role` | `str` | Строковый тег роли/этапа (напр. `"outline_planner"`, `"critic"`). Используется для: логирования (`LLMCallLog`, `../docs_storage_models.md §7.1`); role-специфичной калибровки резерва output-токенов в `GroqClient` (`groq_client.md`); маршрутизации в `RoleRoutingLLMClient` (`groq_client.md`). |
+| `role` | `str` | Строковый тег роли/этапа (напр. `"outline_planner"`, `"annotator"`). Используется для: логирования (`LLMCallLog`, `../storage/models.md §6.1`); role-специфичной калибровки резерва output-токенов и параметров рассуждений в `GroqClient` (`groq_client.md`); маршрутизации в `RoleRoutingLLMClient` (`llm/router.py`, подробно не документируется). |
 | `prompt` | `str` | Динамическая часть запроса — контекст конкретного вызова, собирается в `roles/*.py`. |
-| `response_model` | `type[T]`, `T: BaseModel` | Pydantic-класс из `llm/schemas.py` (`../docs_llm_schemas_prompts_chunking.md §A`), задающий JSON Schema ожидаемого ответа. |
-| `status` | `TaskStatus` | Объект статуса текущей сессии (`../docs_storage_models.md §7.2`) — через него ведётся общий счёт `llm_calls_used`. |
-| `system_instruction` | `str \| None` | Статичная системная инструкция роли (`llm/prompts/*.py`, `../docs_llm_schemas_prompts_chunking.md §B`). Может быть переопределена вызывающим кодом. |
+| `response_model` | `type[T]`, `T: BaseModel` | Pydantic-класс из `llm/schemas.py` (`schemas.md`), задающий JSON Schema ожидаемого ответа. |
+| `status` | `TaskStatus` | Объект статуса текущей сессии (`../storage/models.md §6.2`) — через него ведётся общий счёт `llm_calls_used`. |
+| `system_instruction` | `str \| None` | Статичная системная инструкция роли (`llm/prompts/*.py`, `prompts.md`). Может быть переопределена вызывающим кодом. |
 
 **Возвращаемое значение:** `T` — экземпляр `response_model`.
 
@@ -40,14 +41,24 @@
 `LLMFreeLimitReached`, `LLMSchemaError`, `LLMPromptTooLargeError` и т.д., все
 наследуются от классов ниже, в §2).
 
+### 1.2. Необязательные методы клиента (не часть Protocol)
+
+Два метода клиент МОЖЕТ реализовать; потребитель — `llm/chunking.py`, который
+ищет их через `getattr` и при отсутствии деградирует без ошибок
+(`chunking.md §1`):
+
+| Метод | Назначение |
+|---|---|
+| `available_prompt_budget_tokens(system_instruction, response_model) -> int \| None` | Сколько токенов остаётся под текст промпта. Нет метода (или `None`) — батчинг по бюджету не применяется, все элементы идут одним батчем. |
+| `estimate_tokens(text) -> int` | Счётчик токенов клиента. У `GroqClient` — `tiktoken` для gpt-oss, иначе эвристика (`groq_client.md §6.2`). Нет метода — используется `llm.common.estimate_tokens`. |
+
 ---
 
 ## 2. `llm/common.py` — провайдер-нейтральный фундамент
 
 **Назначение (из докстринга модуля).** Общий код для ВСЕХ провайдеров.
-Правило проекта: роли и общий код (`llm/chunking.py`,
-`../docs_llm_schemas_prompts_chunking.md §C`) должны ловить ТОЛЬКО типы
-исключений отсюда (`LLMRateLimitError`/`LLMSchemaError`/
+Правило проекта: роли и общий код (`llm/chunking.py`, `chunking.md`) должны
+ловить ТОЛЬКО типы исключений отсюда (`LLMRateLimitError`/`LLMSchemaError`/
 `LLMPromptTooLargeError`), никогда провайдер-специфичные классы напрямую
 (`GroqRateLimitError` и т.п.) — это контракт по ошибкам, аналогичный
 `LLMClient` по методам.
@@ -74,8 +85,8 @@ Exception
 уровне клиента. На верхнем уровне оборачивается в
 `orchestrator.budget.LLMFreeLimitReached` (`../orchestrator/budget.md §1`) —
 единственное место, которое остаётся провайдер-специфичным по смыслу
-обработки. Конкретные подклассы: `GroqRateLimitError`,
-`OpenRouterRateLimitError` (`groq_client.md`).
+обработки. Конкретные подклассы: `GroqRateLimitError` (`groq_client.md`),
+`OpenRouterRateLimitError` (не документируется).
 
 **`__init__(self, message: str, retry_after: float | None = None)`**
 
@@ -98,9 +109,9 @@ Exception
 **Описание.** Промпт+система+ожидаемый output превышают доступный бюджет
 контекста/TPM. Поднимается ДО (проактивно) или ВМЕСТО (реактивно, по 413)
 сетевого вызова. **Намеренно НЕ входит** в список триггеров failover в
-`llm/router.py::_FAILOVER_TRIGGERS` (`groq_client.md`) — слишком
-большой промпт не повод пробовать другую модель того же класса задач, это
-должен решать вызывающий код (чанкинг). Конкретные подклассы:
+`llm/router.py::_FAILOVER_TRIGGERS` (роутер подробно не документируется) —
+слишком большой промпт не повод пробовать другую модель того же класса задач,
+это должен решать вызывающий код (чанкинг). Конкретные подклассы:
 `GroqPromptTooLargeError`, `OpenRouterPromptTooLargeError`.
 
 #### `class LLMProviderOverloadedError(LLMError)`
@@ -147,7 +158,8 @@ too large"`.
 
 Извлекает число секунд из фразы вида `"Please try again in 10.02s"`
 (`_RETRY_AFTER_RE = re.compile(r"try again in\s+([\d.]+)\s*s", re.IGNORECASE)`).
-`None`, если паттерн не найден или не парсится как `float`.
+`None`, если паттерн не найден или не парсится как `float`. Результат
+передаётся в `TokenRateLimiter.force_wait` (`groq_client.md §5.9`).
 
 ### 2.5. Оценка числа токенов без внешних зависимостей
 
@@ -168,14 +180,15 @@ too large"`.
 Пустой текст → `0`.
 
 **Где переопределяются коэффициенты:** `GroqClient` читает их из
-`settings.groq_chars_per_token_*` (см. `groq_client.md`,
-`../docs_config_settings.md §3.5`) — дефолты здесь являются "хардкодом на
+`settings.groq_chars_per_token_*` (`groq_client.md`,
+`../config/settings.md §3.5`) — дефолты здесь являются "хардкодом на
 случай отсутствия Settings", не единственным источником истины.
 
-**Кто вызывает `estimate_tokens`:** `llm/chunking.py::split_items_into_batches`
-(`../docs_llm_schemas_prompts_chunking.md §C.1`), `GroqClient._estimate_tokens`,
-`OpenRouterClient.available_prompt_budget_tokens` (с дефолтными
-коэффициентами, не настраивается из Settings для OpenRouter).
+**Кто вызывает эту эвристику:** `GroqClient._estimate_tokens` — как запасной
+вариант, когда `tiktoken` отключён (`groq_use_tiktoken=False`) или недоступен;
+`llm/chunking.py::split_items_into_batches` — только если у клиента нет
+публичного `estimate_tokens` (§1.2); `OpenRouterClient.available_prompt_budget_tokens`
+(с дефолтными коэффициентами, из Settings не настраивается).
 
 ---
 
@@ -195,8 +208,8 @@ too large"`.
 
 **Возвращаемое значение:**
 - `GroqClient` — если `llm_provider == "groq"`.
-- `RoleRoutingLLMClient` — если `llm_provider == "openrouter"` (см.
-  `groq_client.md`).
+- `RoleRoutingLLMClient` — если `llm_provider == "openrouter"` (не
+  документируется).
 
 **Исключения:** `ValueError`, если `llm_provider` не `"groq"` и не
 `"openrouter"` — сообщение прямо указывает, как добавить нового провайдера
@@ -209,11 +222,12 @@ too large"`.
 **Описание.** Строит `RoleRoutingLLMClient` поверх ДВУХ групп
 моделей-кандидатов OpenRouter — planning (`settings.openrouter_planning_models`)
 и writing (`settings.openrouter_writing_models`, замаплена только на роль
-`"synthesizer_write"`). У каждой модели-кандидата свой `LLMBudget`, но один и
-тот же soft-лимит применяется ко всем кандидатам своей группы (упрощение —
-раздельная настройка per-модель добавила бы конфигурационный шум,
-непропорциональный MVP). Все бюджеты пишут в общий `TaskStatus.llm_calls_used`,
-так что `MAX_LLM_CALLS_PER_TASK` остаётся единым потолком на задачу.
+`"synthesizer_write"`, которая в текущем конвейере не вызывается). У каждой
+модели-кандидата свой `LLMBudget`, но один и тот же soft-лимит применяется ко
+всем кандидатам своей группы (упрощение — раздельная настройка per-модель
+добавила бы конфигурационный шум, непропорциональный MVP). Все бюджеты пишут в
+общий `TaskStatus.llm_calls_used`, так что `MAX_LLM_CALLS_PER_TASK` остаётся
+единым потолком на задачу.
 
 **Параметры:** `settings: Settings`.
 
@@ -222,14 +236,13 @@ too large"`.
 `selection_mode=settings.openrouter_selection_mode`).
 
 **Исключения:** пробрасывает то, что поднимет `OpenRouterClient.__init__`
-(см. `groq_client.md`).
+(например, `RuntimeError` при пустом `openrouter_api_key`).
 
 ### 3.3. `create_extraction_llm_client(settings: Settings, budget: LLMBudget, primary_client=None)`
 
-**Описание.** Создаёт ОТДЕЛЬНЫЙ клиент для ролей
-`elaborator`/`extractor_critic` (самые частые по числу вызовов). На Groq
-использует `settings.groq_extraction_model`/`groq_extraction_tpm_limit`
-вместо основных `groq_model`/`groq_tpm_limit`.
+**Описание.** Создаёт ОТДЕЛЬНЫЙ клиент для роли `elaborator` (самая частая
+по числу вызовов). На Groq использует `settings.groq_extraction_model`/
+`groq_extraction_tpm_limit` вместо основных `groq_model`/`groq_tpm_limit`.
 
 **Параметры:**
 
@@ -254,7 +267,7 @@ too large"`.
 выполнены — создаётся полностью независимый `GroqClient`. Подробности этих
 классов — `groq_client.md`.
 
-**Исключения:** не ловит собственных; может поднять то же, что
+**Исключения:** не ловит собственных; может поднять то, что поднимает
 `GroqClient.__init__` (`RuntimeError` при отсутствии `groq_api_key`).
 
 ### 3.4. `budget_limits_for_provider(settings: Settings) -> tuple[int, int]`
@@ -294,5 +307,4 @@ extraction-группы в OpenRouter — planning-модели обслужив
 | `Orchestrator.__init__` | `extraction_budget_limits`, `create_extraction_llm_client(primary_client=self.llm)` | Extraction-клиент/бюджет, с возможным шарингом лимитера. |
 
 Документация по `llm/base.py`, `llm/common.py`, `llm/factory.py` завершена.
-Провайдеры (`GroqClient`, `OpenRouterClient`, `RoleRoutingLLMClient`) — см.
-`groq_client.md`.
+Основной провайдер (`GroqClient`) — см. `groq_client.md`.

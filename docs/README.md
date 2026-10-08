@@ -1,6 +1,6 @@
 # Индекс документации `docs/`
 
-> Карта отвечает на два вопроса: «где документация нужного модуля кода?» и «в каком порядке это читать?». `architecture.md` (исторический обзор Phase 1) в индекс не входит и частично устарел: в нём описаны удалённые роли Writer и Critic и цепочка Evidence.
+> Карта отвечает на два вопроса: «где документация нужного модуля кода?» и «в каком порядке это читать?». `architecture.md` (исторический обзор Phase 1) в индекс не входит и частично устарел: в нём описаны удалённые роли Writer и Critic и цепочка Evidence (в начале файла стоит пометка об этом).
 
 ## Структура
 
@@ -19,7 +19,7 @@ docs/
 ├── staging/       _index, changeset, checkpoint, commit, diff, draft_merge
 ├── vault/         _index, db, reader, index, writer
 ├── tools/         _index, note_assembly, markdown_tools, dedup, web_search, web_fetch
-├── validation/    _index, yaml_validator, markdown_validator, link_validator
+├── validation/    _index, autofix, yaml_validator, markdown_validator, link_validator
 └── cli/           _index, main, plan_editor, draft_merge_editor
 ```
 
@@ -65,6 +65,7 @@ docs/
 | `staging/changeset.py`, `checkpoint.py`, `commit.py`, `diff.py`, `draft_merge.py` | `staging/<имя>.md` |
 | `vault/db.py`, `reader.py`, `index.py`, `writer.py` | `vault/db.md`, `reader.md`, `index.md` (⚠ не `_index.md`), `writer.md` |
 | `validation/__init__.py` (`run_validation`) | `validation/_index.md` |
+| `validation/autofix.py` | `validation/autofix.md` |
 | `validation/yaml_validator.py`, `markdown_validator.py`, `link_validator.py` | `validation/<имя>.md` |
 | `cli/main.py`, `plan_editor.py`, `draft_merge_editor.py` | `cli/<имя>.md` |
 | Обзор продукта (Phase 1, исторический) | `architecture.md` (вне индекса) |
@@ -78,6 +79,4 @@ docs/
 ## Пробелы и отложенное
 
 - `retrieval/search.py` (`VaultSearcher`) активно используется `Orchestrator` и `roles/vault_analyst.py`, но отдельного документа пока нет (кандидат на следующую итерацию).
-- `cli/plan_editor.md` ещё не описывает выбор домена (пункт меню 9), `kind` подпунктов и показ домена в корне дерева плана.
-- Поля `Settings.max_critic_rounds`, `max_llm_retries` и `groq_use_tiktoken` (не объявлено, читается через `getattr`) описаны в `config/settings.md` как неиспользуемые/необъявленные.
 - В документах ссылки на «осознанно не документируемые» модули остаются текстом без перехода.

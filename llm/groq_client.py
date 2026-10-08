@@ -545,6 +545,14 @@ class TokenRateLimiter:
             self._maybe_recover_margin(time.monotonic())
             return self._limit
 
+    def force_wait(self, seconds: float) -> None:
+        """Принудительная пауза после реального 429 с retry_after от API.
+        Сон ПОД блокировкой: пока API просит подождать, ни один клиент с
+        общим лимитером не должен резервировать токены. Потолок 60 с — на
+        случай аномального retry_after."""
+        with self._lock:
+            time.sleep(min(max(seconds, 0.1), 60.0))
+
 
 class GroqClient:
     DEFAULT_TPM_LIMIT = 8000
@@ -649,6 +657,13 @@ class GroqClient:
             base_url="https://api.groq.com/openai/v1",
             http_client=_http_client,
         )
+
+    def estimate_tokens(self, text: str) -> int:
+        """Публичная оценка токенов (tiktoken для gpt-oss, иначе эвристика).
+        llm/chunking.py::split_items_into_batches ищет именно этот метод
+        через getattr, чтобы батчи считались тем же счётчиком, что и
+        бюджет самого клиента."""
+        return self._estimate_tokens(text)
 
     def _estimate_tokens(self, text: str) -> int:
         """Точный подсчёт через tiktoken для gpt-oss; иначе — эвристика из
@@ -1056,10 +1071,13 @@ class GroqClient:
                     "Groq отклонил параметры рассуждений (%s) — разовый повтор без них.", exc
                 )
                 return self._call_with_retry(
-                    prompt=prompt, system_instruction=system_instruction,
-                    estimated_tokens=estimated_tokens, response_format=response_format,
-                    fallback_format=fallback_format, fallback_system=fallback_system,
-                    role=role, naive_estimate=naive_estimate, extra_body=None,
+                    prompt=prompt,
+                    system_instruction=fallback_system,
+                    estimated_tokens=estimated_tokens,
+                    response_format=fallback_format,
+                    role=role,
+                    naive_estimate=naive_estimate,
+                    extra_body=extra_body,
                 )
 
             if (
@@ -1080,6 +1098,7 @@ class GroqClient:
                     response_format=fallback_format,
                     role=role,
                     naive_estimate=naive_estimate,
+                    extra_body=extra_body,
                 )
 
             logger.exception(

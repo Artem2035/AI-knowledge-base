@@ -290,6 +290,11 @@ class Settings(BaseSettings):
     #   apply_merges), остальные остаются отдельными файлами как обычно.
     draft_merge_mode: Literal["all", "select"] = Field(default="all")
 
+    # Подсчёт токенов через tiktoken для gpt-oss (llm/groq_client.py). При
+    # False или недоступном tiktoken клиент использует эвристику по
+    # символам (groq_chars_per_token_*).
+    groq_use_tiktoken: bool = Field(default=True)
+
     @field_validator("groq_calibration_max_ratio")
     @classmethod
     def _max_ratio_above_min(cls, v: float, info) -> float:
@@ -305,7 +310,6 @@ class Settings(BaseSettings):
 
     # Общий бюджет вызовов на задачу — не зависит от того, какой провайдер активен
     max_llm_calls_per_task: int = Field(default=40, ge=1)
-    max_llm_retries: int = Field(default=3, ge=0)
 
     # ---- Vault ----
     vault_path: Path = Field(default=Path("./vault_placeholder"))
@@ -334,14 +338,6 @@ class Settings(BaseSettings):
             "секции) — 2-3: выходные токены растут пропорционально."
         ),
     )
-    # ---- Critic ----
-    # Сколько раз Writer имеет право переписать заметку по замечаниям
-    # Critic-а в рамках одной задачи. Жёсткий bounded retry — не цикл до
-    # "ok", а фиксированный потолок попыток (см. roles/critic.py): после
-    # исчерпания заметка идёт в staging как есть, с пометкой
-    # needs_review=true, а не блокирует всю задачу и не тратит вызовы
-    # бесконечно.
-    max_critic_rounds: int = Field(default=1, ge=0)
 
     # ---- Прочее ----
     language: str = Field(default="ru")
